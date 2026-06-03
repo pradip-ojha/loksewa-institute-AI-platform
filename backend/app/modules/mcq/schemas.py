@@ -1,7 +1,44 @@
 import uuid
 from datetime import datetime
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def normalize_options(options) -> list[dict]:
+    """
+    Normalize MCQ options to the canonical list format regardless of what the AI returned.
+    Handles:
+      - Correct list:  [{"id": "A", "label": "A", "text": "..."}, ...]
+      - Simple dict:   {"A": "text", "B": "text", ...}
+      - Nested dict:   {"A": {"text": "...", ...}, ...}
+    """
+    if isinstance(options, list):
+        normalized = []
+        for item in options:
+            if isinstance(item, dict) and "id" in item and "text" in item:
+                normalized.append({
+                    "id": item["id"],
+                    "label": item.get("label", item["id"]),
+                    "text": str(item["text"]),
+                })
+        return normalized
+
+    if isinstance(options, dict):
+        result = []
+        for key in ("A", "B", "C", "D"):
+            val = options.get(key)
+            if val is None:
+                continue
+            if isinstance(val, str):
+                text = val
+            elif isinstance(val, dict):
+                text = val.get("text", str(val))
+            else:
+                text = str(val)
+            result.append({"id": key, "label": key, "text": text})
+        return result
+
+    return []
 
 
 class MCQOption(BaseModel):
@@ -28,6 +65,11 @@ class MCQQuestionOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    @field_validator("options", mode="before")
+    @classmethod
+    def coerce_options(cls, v):
+        return normalize_options(v)
+
     model_config = {"from_attributes": True}
 
 
@@ -41,6 +83,11 @@ class MCQQuestionCreate(BaseModel):
     subtopic: str | None = None
     complexity: Literal["easy", "medium", "hard"] = "medium"
 
+    @field_validator("options", mode="before")
+    @classmethod
+    def coerce_options(cls, v):
+        return normalize_options(v)
+
 
 class MCQQuestionUpdate(BaseModel):
     question_text: str | None = None
@@ -51,6 +98,13 @@ class MCQQuestionUpdate(BaseModel):
     topic: str | None = None
     subtopic: str | None = None
     complexity: Literal["easy", "medium", "hard"] | None = None
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def coerce_options(cls, v):
+        if v is None:
+            return v
+        return normalize_options(v)
 
 
 class MCQDocumentOut(BaseModel):

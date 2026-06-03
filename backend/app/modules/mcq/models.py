@@ -48,7 +48,7 @@ class MCQQuestion(Base):
     review_batch_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("mcq_review_batches.id", ondelete="SET NULL"), nullable=True)
     origin_type: Mapped[str] = mapped_column(String(50), nullable=False)
     question_text: Mapped[str] = mapped_column(Text, nullable=False)
-    options: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    options: Mapped[list] = mapped_column(JSONB, nullable=False)
     correct_option_ids: Mapped[list] = mapped_column(JSONB, nullable=False)
     explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
     chapter: Mapped[str | None] = mapped_column(String(255), nullable=True)

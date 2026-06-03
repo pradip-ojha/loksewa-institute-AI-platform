@@ -1,4 +1,3 @@
-import json
 import logging
 import uuid
 
@@ -7,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai.model_router import get_provider
 from app.modules.jobs.service import update_job
 from app.modules.mcq.models import MCQDocument, MCQReviewBatch, MCQQuestion
+from app.modules.mcq.schemas import normalize_options
 
 logger = logging.getLogger(__name__)
 
@@ -56,18 +56,119 @@ Return ONLY valid JSON matching this exact structure:
   "extraction_notes": "..."
 }}"""
 
+def _extract_question_text(q_data: dict) -> str:
+    """Return question text regardless of which key the AI used."""
+    for key in ("question_text", "question", "q", "text", "stem", "question_stem", "problem"):
+        val = q_data.get(key)
+        if val and isinstance(val, str) and val.strip():
+            return val.strip()
+    # Log the actual keys returned so mismatches are visible in worker logs
+    logger.warning("Could not extract question_text. Actual keys in q_data: %s", list(q_data.keys()))
+    return ""
+
+
+
+KNOWLEDGE_DOC_TYPES = [
+    ("notes", "Notes"),
+    ("book_content", "Book Content"),
+    ("handout", "Handout"),
+    ("reference_material", "Reference Material"),
+]
+
+CHUNKS_PER_TYPE = 25
+
+
+async def _fetch_knowledge_by_type(
+    db: AsyncSession,
+    topics: set[str],
+    subtopics: set[str],
+) -> str:
+    """
+    Fetch up to CHUNKS_PER_TYPE chunks from each knowledge document_type
+    whose topic or subtopic matches the given sets.
+    Returns a formatted string with a labeled section per document type.
+    """
+    if not topics and not subtopics:
+        return "No matching knowledge content found for this document's topics."
+
+    from sqlalchemy import select, or_
+    from app.modules.knowledge.models import KnowledgeChunk, KnowledgeDocument
+
+    topic_filter = KnowledgeChunk.topic.in_(topics) if topics else False
+    subtopic_filter = KnowledgeChunk.subtopic.in_(subtopics) if subtopics else False
+
+    sections: list[str] = []
+
+    for doc_type, type_label in KNOWLEDGE_DOC_TYPES:
+        stmt = (
+            select(KnowledgeChunk)
+            .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
+            .where(
+                KnowledgeDocument.content_usage_type == "objective",
+                KnowledgeDocument.processing_status == "completed",
+                KnowledgeDocument.document_type == doc_type,
+                or_(topic_filter, subtopic_filter),
+            )
+            .order_by(KnowledgeChunk.topic, KnowledgeChunk.chunk_index)
+            .limit(CHUNKS_PER_TYPE)
+        )
+        result = await db.execute(stmt)
+        chunks = result.scalars().all()
+
+        if not chunks:
+            continue
+
+        lines: list[str] = [f"━━━ {type_label} ━━━"]
+        for chunk in chunks:
+            label_parts = []
+            if chunk.topic:
+                label_parts.append(f"Topic: {chunk.topic}")
+            if chunk.subtopic:
+                label_parts.append(f"Subtopic: {chunk.subtopic}")
+            label = " | ".join(label_parts) if label_parts else "General"
+            lines.append(f"[{label}]\n{chunk.content}")
+
+        sections.append("\n\n".join(lines))
+
+    return "\n\n".join(sections) if sections else "No matching knowledge content found for this document's topics."
+
+
+TOPIC_DETECTION_PROMPT = """Analyze the document content and identify which of the listed syllabus topics it meaningfully covers.
+
+Available objective syllabus topics and subtopics:
+{syllabus_topics}
+
+Document content:
+{document_text}
+
+Return ONLY valid JSON:
+{{
+  "covered_topics": ["exact topic string from the list above", ...],
+  "covered_subtopics": ["exact subtopic string from the list above", ...]
+}}
+
+Rules:
+- Include only topics with substantive coverage (more than a passing mention)
+- Use the exact strings from the list above — never invent new strings
+- If nothing matches clearly, return empty arrays"""
+
 GENERATION_PROMPT = """You are an expert MCQ generation system for competitive exam preparation.
 
-Generate {count} multiple-choice questions based on the provided content.
+Generate {count} multiple-choice questions based on the SOURCE DOCUMENT below.
 
-RULES:
+CRITICAL SOURCE RULE:
+- Questions must be grounded in the SOURCE DOCUMENT content only
+- The KNOWLEDGE CONTEXT is provided as background enrichment — use it to verify facts, deepen explanations, and improve option quality
+- Do NOT generate a question whose content appears only in the knowledge context and not in the source document
+- If knowledge context contradicts the source document, trust the source document
+
+GENERATION RULES:
 1. Each question must have exactly 4 options (A, B, C, D) with one correct answer
 2. Include a clear explanation for each question
-3. All options must be plausible (competitive distractors, not obviously wrong)
+3. All options must be plausible competitive distractors
 4. Match the style and difficulty distribution of the provided example questions
-5. Questions must be relevant to the topic/subtopic specified
-6. Assign complexity: easy/medium/hard based on cognitive demand
-7. Use Nepali language for content if the source material is in Nepali
+5. Assign complexity: easy/medium/hard based on cognitive demand
+6. Use Nepali language for content if the source material is in Nepali
 
 Active skill instructions:
 {skill_instructions}
@@ -79,16 +180,44 @@ Custom instruction: {custom_instruction}
 Example approved questions for style reference:
 {style_examples}
 
-Source content to generate questions from:
-{document_text}
+━━━ KNOWLEDGE CONTEXT (enrichment only — do not generate questions solely from this) ━━━
+{knowledge_context}
+━━━ END KNOWLEDGE CONTEXT ━━━
 
-Return ONLY valid JSON with the same structure as the extraction format."""
+━━━ SOURCE DOCUMENT (generate all questions from this) ━━━
+{document_text}
+━━━ END SOURCE DOCUMENT ━━━
+
+Return ONLY valid JSON in exactly this structure — options MUST be a list, never a dict:
+{{
+  "questions": [
+    {{
+      "question_text": "...",
+      "options": [
+        {{"id": "A", "label": "A", "text": "..."}},
+        {{"id": "B", "label": "B", "text": "..."}},
+        {{"id": "C", "label": "C", "text": "..."}},
+        {{"id": "D", "label": "D", "text": "..."}}
+      ],
+      "correct_option_ids": ["A"],
+      "explanation": "...",
+      "topic": "..." or null,
+      "subtopic": "..." or null,
+      "complexity": "easy" or "medium" or "hard"
+    }}
+  ]
+}}"""
 
 REGENERATION_PROMPT = """You are an expert MCQ regeneration system for competitive exam preparation.
 
 Regenerate the following rejected questions based on admin feedback.
 
 Admin feedback: {feedback}
+
+CRITICAL SOURCE RULE:
+- Replacement questions must be grounded in the SOURCE DOCUMENT below
+- The KNOWLEDGE CONTEXT is provided for enrichment — use it to improve quality and explanations only
+- Do NOT produce questions whose content appears only in the knowledge context
 
 RULES:
 1. Address all feedback points specifically
@@ -106,10 +235,33 @@ Style examples from approved questions:
 Rejected questions to replace:
 {rejected_questions}
 
-Source content:
-{document_text}
+━━━ KNOWLEDGE CONTEXT (enrichment only) ━━━
+{knowledge_context}
+━━━ END KNOWLEDGE CONTEXT ━━━
 
-Return ONLY valid JSON with the same structure as the extraction format."""
+━━━ SOURCE DOCUMENT ━━━
+{document_text}
+━━━ END SOURCE DOCUMENT ━━━
+
+Return ONLY valid JSON in exactly this structure — options MUST be a list, never a dict:
+{{
+  "questions": [
+    {{
+      "question_text": "...",
+      "options": [
+        {{"id": "A", "label": "A", "text": "..."}},
+        {{"id": "B", "label": "B", "text": "..."}},
+        {{"id": "C", "label": "C", "text": "..."}},
+        {{"id": "D", "label": "D", "text": "..."}}
+      ],
+      "correct_option_ids": ["A"],
+      "explanation": "...",
+      "topic": "..." or null,
+      "subtopic": "..." or null,
+      "complexity": "easy" or "medium" or "hard"
+    }}
+  ]
+}}"""
 
 
 class MCQExtractionAgent:
@@ -181,14 +333,15 @@ class MCQExtractionAgent:
         await self.db.flush()
 
         for q_data in questions_data:
-            options = q_data.get("options", [])
-            if len(options) < 4:
+            options = normalize_options(q_data.get("options", []))
+            question_text = _extract_question_text(q_data)
+            if len(options) < 4 or not question_text:
                 continue
             question = MCQQuestion(
                 source_document_id=self.document.id,
                 review_batch_id=batch.id,
                 origin_type="uploaded_extracted",
-                question_text=q_data.get("question_text", ""),
+                question_text=question_text,
                 options=options,
                 correct_option_ids=q_data.get("correct_option_ids", []),
                 explanation=q_data.get("explanation"),
@@ -242,13 +395,19 @@ class MCQGenerationAgent:
         from app.processing.document_text import extract_text_from_bytes
         document_text = extract_text_from_bytes(file_bytes, file_record.mime_type)
 
-        await update_job(self.db, self.job_id, progress=30, step="Retrieving style examples")
+        await update_job(self.db, self.job_id, progress=30, step="Detecting covered topics")
+        covered_topics, covered_subtopics = await self._detect_covered_topics(document_text)
+
+        await update_job(self.db, self.job_id, progress=42, step="Fetching knowledge layer enrichment")
+        knowledge_context = await self._fetch_knowledge_context(covered_topics, covered_subtopics)
+
+        await update_job(self.db, self.job_id, progress=52, step="Retrieving style examples")
         style_examples = await self._get_style_examples()
 
-        await update_job(self.db, self.job_id, progress=40, step="Retrieving active skill")
+        await update_job(self.db, self.job_id, progress=60, step="Retrieving active skill")
         skill_instructions = await self._get_skill()
 
-        await update_job(self.db, self.job_id, progress=55, step="Generating MCQs with AI")
+        await update_job(self.db, self.job_id, progress=68, step="Generating MCQs with AI")
 
         prompt = GENERATION_PROMPT.format(
             count=self.count,
@@ -257,6 +416,7 @@ class MCQGenerationAgent:
             subtopic=self.document.subtopic or "general",
             custom_instruction=self.document.custom_instruction or "none",
             style_examples=style_examples,
+            knowledge_context=knowledge_context,
             document_text=document_text[:30000],
         )
 
@@ -273,7 +433,7 @@ class MCQGenerationAgent:
         except Exception as exc:
             raise RuntimeError(f"AI generation failed: {exc}") from exc
 
-        await update_job(self.db, self.job_id, progress=80, step="Saving generated questions")
+        await update_job(self.db, self.job_id, progress=88, step="Saving generated questions")
 
         questions_data = result.get("questions", []) if isinstance(result, dict) else []
 
@@ -289,14 +449,15 @@ class MCQGenerationAgent:
         await self.db.flush()
 
         for q_data in questions_data:
-            options = q_data.get("options", [])
-            if len(options) < 4:
+            options = normalize_options(q_data.get("options", []))
+            question_text = _extract_question_text(q_data)
+            if len(options) < 4 or not question_text:
                 continue
             question = MCQQuestion(
                 source_document_id=self.document.id,
                 review_batch_id=batch.id,
                 origin_type="ai_generated",
-                question_text=q_data.get("question_text", ""),
+                question_text=question_text,
                 options=options,
                 correct_option_ids=q_data.get("correct_option_ids", []),
                 explanation=q_data.get("explanation"),
@@ -314,6 +475,73 @@ class MCQGenerationAgent:
         await self.db.refresh(batch)
         await update_job(self.db, self.job_id, progress=100, step="Generation complete")
         return batch
+
+    async def _detect_covered_topics(self, document_text: str) -> tuple[list[str], list[str]]:
+        """Identify which objective syllabus topics this document covers."""
+        from sqlalchemy import select
+        from app.modules.syllabus.models import SyllabusItem, SyllabusType
+
+        rows = await self.db.execute(
+            select(SyllabusItem).where(
+                SyllabusItem.syllabus_type == SyllabusType.objective,
+                SyllabusItem.is_active == True,
+            )
+        )
+        items = rows.scalars().all()
+
+        if not items:
+            return [], []
+
+        # Build a compact topic/subtopic listing for the prompt
+        topic_lines: list[str] = []
+        seen_topics: set[str] = set()
+        for item in items:
+            if item.topic and item.topic not in seen_topics:
+                topic_lines.append(f"Topic: {item.topic}")
+                seen_topics.add(item.topic)
+            if item.subtopic:
+                topic_lines.append(f"  Subtopic: {item.subtopic}")
+
+        syllabus_topics_text = "\n".join(topic_lines) if topic_lines else "No syllabus topics defined."
+
+        prompt = TOPIC_DETECTION_PROMPT.format(
+            syllabus_topics=syllabus_topics_text,
+            document_text=document_text[:15000],
+        )
+
+        audit_ctx = {
+            "db": self.db,
+            "agent_type": "MCQGenerationAgent",
+            "task_type": "topic_detection",
+            "entity_type": "mcq_document",
+            "entity_id": self.document.id,
+        }
+
+        try:
+            result = await self.provider.generate_text(prompt, schema={}, audit_ctx=audit_ctx)
+            covered_topics = result.get("covered_topics", []) if isinstance(result, dict) else []
+            covered_subtopics = result.get("covered_subtopics", []) if isinstance(result, dict) else []
+            # Validate against known topics to prevent hallucinated strings
+            valid_topics = {item.topic for item in items if item.topic}
+            valid_subtopics = {item.subtopic for item in items if item.subtopic}
+            covered_topics = [t for t in covered_topics if t in valid_topics]
+            covered_subtopics = [s for s in covered_subtopics if s in valid_subtopics]
+            return covered_topics, covered_subtopics
+        except Exception as exc:
+            logger.warning("Topic detection failed, proceeding without enrichment: %s", exc)
+            return [], []
+
+    async def _fetch_knowledge_context(
+        self,
+        covered_topics: list[str],
+        covered_subtopics: list[str],
+    ) -> str:
+        """Fetch 25 chunks per document type for the detected topics."""
+        return await _fetch_knowledge_by_type(
+            self.db,
+            topics=set(covered_topics),
+            subtopics=set(covered_subtopics),
+        )
 
     async def _get_style_examples(self) -> str:
         from sqlalchemy import select
@@ -377,6 +605,9 @@ class MCQRegenerationAgent:
         await update_job(self.db, self.job_id, progress=20, step="Loading source document")
 
         document_text = ""
+        doc_topic: str | None = None
+        doc_subtopic: str | None = None
+
         if self.batch.document_id:
             from app.modules.mcq.models import MCQDocument as MCQDoc
             from app.modules.files.models import File
@@ -385,14 +616,20 @@ class MCQRegenerationAgent:
 
             doc_r = await self.db.execute(select(MCQDoc).where(MCQDoc.id == self.batch.document_id))
             doc = doc_r.scalar_one_or_none()
-            if doc and doc.file_id:
-                file_r = await self.db.execute(select(File).where(File.id == doc.file_id))
-                file_record = file_r.scalar_one_or_none()
-                if file_record:
-                    file_bytes = get_r2().download_fileobj(file_record.r2_key)
-                    document_text = extract_text_from_bytes(file_bytes, file_record.mime_type)[:20000]
+            if doc:
+                doc_topic = doc.topic
+                doc_subtopic = doc.subtopic
+                if doc.file_id:
+                    file_r = await self.db.execute(select(File).where(File.id == doc.file_id))
+                    file_record = file_r.scalar_one_or_none()
+                    if file_record:
+                        file_bytes = get_r2().download_fileobj(file_record.r2_key)
+                        document_text = extract_text_from_bytes(file_bytes, file_record.mime_type)[:20000]
 
-        await update_job(self.db, self.job_id, progress=35, step="Loading style examples")
+        await update_job(self.db, self.job_id, progress=35, step="Fetching knowledge enrichment")
+        knowledge_context = await self._fetch_knowledge_context(rejected, doc_topic, doc_subtopic)
+
+        await update_job(self.db, self.job_id, progress=45, step="Loading style examples")
 
         from app.modules.mcq.models import MCQQuestion
         style_r = await self.db.execute(
@@ -412,13 +649,14 @@ class MCQRegenerationAgent:
 
         skill_instructions = await self._get_skill()
 
-        await update_job(self.db, self.job_id, progress=50, step="Regenerating with AI")
+        await update_job(self.db, self.job_id, progress=55, step="Regenerating with AI")
 
         prompt = REGENERATION_PROMPT.format(
             feedback=self.feedback,
             skill_instructions=skill_instructions,
             style_examples=style_text,
             rejected_questions=rejected_text,
+            knowledge_context=knowledge_context,
             document_text=document_text,
         )
 
@@ -435,15 +673,16 @@ class MCQRegenerationAgent:
         except Exception as exc:
             raise RuntimeError(f"AI regeneration failed: {exc}") from exc
 
-        await update_job(self.db, self.job_id, progress=80, step="Replacing rejected questions")
+        await update_job(self.db, self.job_id, progress=85, step="Replacing rejected questions")
 
         questions_data = result.get("questions", []) if isinstance(result, dict) else []
 
         for i, (old_q, new_q_data) in enumerate(zip(rejected, questions_data)):
-            options = new_q_data.get("options", [])
-            if len(options) < 4:
+            options = normalize_options(new_q_data.get("options", []))
+            new_text = _extract_question_text(new_q_data)
+            if len(options) < 4 or not new_text:
                 continue
-            old_q.question_text = new_q_data.get("question_text", old_q.question_text)
+            old_q.question_text = new_text
             old_q.options = options
             old_q.correct_option_ids = new_q_data.get("correct_option_ids", old_q.correct_option_ids)
             old_q.explanation = new_q_data.get("explanation", old_q.explanation)
@@ -458,6 +697,21 @@ class MCQRegenerationAgent:
 
         await update_job(self.db, self.job_id, progress=100, step="Regeneration complete")
         return self.batch
+
+    async def _fetch_knowledge_context(
+        self,
+        rejected_questions: list,
+        doc_topic: str | None,
+        doc_subtopic: str | None,
+    ) -> str:
+        """Fetch 25 chunks per document type for topics present in the rejected questions."""
+        topics = {q.topic for q in rejected_questions if q.topic}
+        subtopics = {q.subtopic for q in rejected_questions if q.subtopic}
+        if doc_topic:
+            topics.add(doc_topic)
+        if doc_subtopic:
+            subtopics.add(doc_subtopic)
+        return await _fetch_knowledge_by_type(self.db, topics=topics, subtopics=subtopics)
 
     async def _get_skill(self) -> str:
         try:

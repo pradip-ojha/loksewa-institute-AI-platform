@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { JobStatusPoller } from "../../components/JobStatusPoller";
 import type { JobState } from "../../components/JobStatusPoller";
 import { mcqService } from "../../services/mcq";
 import type { MCQQuestion, MCQReviewBatch, MCQBatchWithQuestions, MCQOption } from "../../services/mcq";
+import { syllabusService } from "../../services/syllabus";
+import type { ChapterNode } from "../../services/syllabus";
 
 type Tab = "upload" | "generate" | "batches" | "review" | "bank" | "manual";
 
@@ -20,11 +22,21 @@ const STATUS_BADGE: Record<string, string> = {
 
 // ── Upload Existing MCQ Tab ───────────────────────────────────────────────────
 
-function UploadTab({ onJobStart }: { onJobStart: (jobId: string, batchMode: "extract") => void }) {
+function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batchMode: "extract") => void; chapters: ChapterNode[] }) {
   const [form, setForm] = useState({ display_name: "", topic: "", subtopic: "", custom_instruction: "" });
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  const allTopics = useMemo(() => chapters.flatMap(c => c.topics), [chapters]);
+  const availableSubtopics = useMemo(
+    () => allTopics.find(t => t.topic === form.topic)?.subtopics ?? [],
+    [form.topic, allTopics]
+  );
+
+  function handleTopicChange(value: string) {
+    setForm(p => ({ ...p, topic: value, subtopic: "" }));
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -60,11 +72,35 @@ function UploadTab({ onJobStart }: { onJobStart: (jobId: string, batchMode: "ext
       <div className="grid grid-cols-2 gap-3">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Topic (optional)</label>
-          <input className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.topic} onChange={e => setForm(p => ({ ...p, topic: e.target.value }))} />
+          <select
+            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
+            value={form.topic}
+            onChange={e => handleTopicChange(e.target.value)}
+          >
+            <option value="">— Auto-detect —</option>
+            {allTopics.map(t => (
+              <option key={t.topic} value={t.topic}>{t.topic}</option>
+            ))}
+          </select>
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Subtopic (optional)</label>
-          <input className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.subtopic} onChange={e => setForm(p => ({ ...p, subtopic: e.target.value }))} />
+          {availableSubtopics.length > 0 ? (
+            <select
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
+              value={form.subtopic}
+              onChange={e => setForm(p => ({ ...p, subtopic: e.target.value }))}
+            >
+              <option value="">— Auto-detect —</option>
+              {availableSubtopics.map(s => (
+                <option key={s.id} value={s.subtopic}>{s.subtopic}</option>
+              ))}
+            </select>
+          ) : (
+            <select className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white" disabled>
+              <option value="">{form.topic ? "No subtopics" : "Select topic first"}</option>
+            </select>
+          )}
         </div>
       </div>
       <div>
@@ -81,11 +117,21 @@ function UploadTab({ onJobStart }: { onJobStart: (jobId: string, batchMode: "ext
 
 // ── Generate from Content Tab ─────────────────────────────────────────────────
 
-function GenerateTab({ onJobStart }: { onJobStart: (jobId: string, mode: "generate") => void }) {
+function GenerateTab({ onJobStart, chapters }: { onJobStart: (jobId: string, mode: "generate") => void; chapters: ChapterNode[] }) {
   const [form, setForm] = useState({ display_name: "", topic: "", subtopic: "", custom_instruction: "", count: "10" });
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  const allTopics = useMemo(() => chapters.flatMap(c => c.topics), [chapters]);
+  const availableSubtopics = useMemo(
+    () => allTopics.find(t => t.topic === form.topic)?.subtopics ?? [],
+    [form.topic, allTopics]
+  );
+
+  function handleTopicChange(value: string) {
+    setForm(p => ({ ...p, topic: value, subtopic: "" }));
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -126,11 +172,35 @@ function GenerateTab({ onJobStart }: { onJobStart: (jobId: string, mode: "genera
       <div className="grid grid-cols-2 gap-3">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Topic (optional)</label>
-          <input className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.topic} onChange={e => setForm(p => ({ ...p, topic: e.target.value }))} />
+          <select
+            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
+            value={form.topic}
+            onChange={e => handleTopicChange(e.target.value)}
+          >
+            <option value="">— Auto-detect —</option>
+            {allTopics.map(t => (
+              <option key={t.topic} value={t.topic}>{t.topic}</option>
+            ))}
+          </select>
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Subtopic (optional)</label>
-          <input className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.subtopic} onChange={e => setForm(p => ({ ...p, subtopic: e.target.value }))} />
+          {availableSubtopics.length > 0 ? (
+            <select
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
+              value={form.subtopic}
+              onChange={e => setForm(p => ({ ...p, subtopic: e.target.value }))}
+            >
+              <option value="">— Auto-detect —</option>
+              {availableSubtopics.map(s => (
+                <option key={s.id} value={s.subtopic}>{s.subtopic}</option>
+              ))}
+            </select>
+          ) : (
+            <select className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white" disabled>
+              <option value="">{form.topic ? "No subtopics" : "Select topic first"}</option>
+            </select>
+          )}
         </div>
       </div>
       <div>
@@ -182,7 +252,11 @@ function QuestionCard({
   return (
     <div className={`rounded-xl bg-white p-5 shadow-sm ring-1 ${question.status === "approved" ? "ring-green-200" : question.status === "rejected" ? "ring-red-200" : "ring-gray-100"}`}>
       <div className="mb-3 flex items-start justify-between gap-2">
-        <p className="text-sm font-medium text-gray-900 leading-relaxed">{question.question_text}</p>
+        {question.question_text ? (
+          <p className="text-sm font-medium text-gray-900 leading-relaxed flex-1">{question.question_text}</p>
+        ) : (
+          <p className="text-sm italic text-red-400 flex-1">[Question text missing — regenerate this batch]</p>
+        )}
         <div className="flex gap-1 shrink-0">
           <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${COMPLEXITY_BADGE[question.complexity] || "bg-gray-100 text-gray-600"}`}>{question.complexity}</span>
           <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_BADGE[question.status] || "bg-gray-100 text-gray-600"}`}>{question.status}</span>
@@ -374,12 +448,14 @@ function BatchesTab({ onOpenBatch }: { onOpenBatch: (id: string) => void }) {
 
 // ── Question Bank Tab ─────────────────────────────────────────────────────────
 
-function QuestionBankTab() {
+function QuestionBankTab({ chapters }: { chapters: ChapterNode[] }) {
   const [questions, setQuestions] = useState<MCQQuestion[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [filters, setFilters] = useState({ status: "approved", topic: "", complexity: "" });
   const [loading, setLoading] = useState(true);
+
+  const allTopics = useMemo(() => chapters.flatMap(c => c.topics), [chapters]);
 
   async function load() {
     setLoading(true);
@@ -422,7 +498,16 @@ function QuestionBankTab() {
           <option value="medium">Medium</option>
           <option value="hard">Hard</option>
         </select>
-        <input className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm" placeholder="Filter by topic" value={filters.topic} onChange={e => setFilters(p => ({ ...p, topic: e.target.value }))} />
+        <select
+          className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm bg-white"
+          value={filters.topic}
+          onChange={e => { setPage(1); setFilters(p => ({ ...p, topic: e.target.value })); }}
+        >
+          <option value="">All Topics</option>
+          {allTopics.map(t => (
+            <option key={t.topic} value={t.topic}>{t.topic}</option>
+          ))}
+        </select>
         <span className="ml-auto text-sm text-gray-500 self-center">{total} questions</span>
       </div>
 
@@ -473,7 +558,7 @@ const EMPTY_OPTIONS: MCQOption[] = [
   { id: "D", label: "D", text: "" },
 ];
 
-function ManualAddTab({ onCreated }: { onCreated: () => void }) {
+function ManualAddTab({ onCreated, chapters }: { onCreated: () => void; chapters: ChapterNode[] }) {
   const [form, setForm] = useState({
     question_text: "",
     explanation: "",
@@ -487,6 +572,22 @@ function ManualAddTab({ onCreated }: { onCreated: () => void }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState(false);
+
+  const chapterTopics = useMemo(
+    () => chapters.find(c => c.chapter === form.chapter)?.topics ?? [],
+    [form.chapter, chapters]
+  );
+  const topicSubtopics = useMemo(
+    () => chapterTopics.find(t => t.topic === form.topic)?.subtopics ?? [],
+    [form.topic, chapterTopics]
+  );
+
+  function handleChapterChange(value: string) {
+    setForm(p => ({ ...p, chapter: value, topic: "", subtopic: "" }));
+  }
+  function handleTopicChange(value: string) {
+    setForm(p => ({ ...p, topic: value, subtopic: "" }));
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -541,23 +642,50 @@ function ManualAddTab({ onCreated }: { onCreated: () => void }) {
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div>
           <label className="block text-xs font-medium text-gray-600 mb-1">Difficulty</label>
-          <select className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm" value={form.complexity} onChange={e => setForm(p => ({ ...p, complexity: e.target.value as any }))}>
+          <select className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.complexity} onChange={e => setForm(p => ({ ...p, complexity: e.target.value as any }))}>
             <option value="easy">Easy</option>
             <option value="medium">Medium</option>
             <option value="hard">Hard</option>
           </select>
         </div>
         <div>
+          <label className="block text-xs font-medium text-gray-600 mb-1">Chapter</label>
+          <select className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.chapter} onChange={e => handleChapterChange(e.target.value)}>
+            <option value="">— None —</option>
+            {chapters.map(c => (
+              <option key={c.chapter} value={c.chapter}>{c.chapter}</option>
+            ))}
+          </select>
+        </div>
+        <div>
           <label className="block text-xs font-medium text-gray-600 mb-1">Topic</label>
-          <input className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm" value={form.topic} onChange={e => setForm(p => ({ ...p, topic: e.target.value }))} />
+          {chapterTopics.length > 0 ? (
+            <select className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.topic} onChange={e => handleTopicChange(e.target.value)}>
+              <option value="">— None —</option>
+              {chapterTopics.map(t => (
+                <option key={t.topic} value={t.topic}>{t.topic}</option>
+              ))}
+            </select>
+          ) : (
+            <select className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" disabled>
+              <option value="">{form.chapter ? "No topics" : "Select chapter first"}</option>
+            </select>
+          )}
         </div>
         <div>
           <label className="block text-xs font-medium text-gray-600 mb-1">Subtopic</label>
-          <input className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm" value={form.subtopic} onChange={e => setForm(p => ({ ...p, subtopic: e.target.value }))} />
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-gray-600 mb-1">Chapter</label>
-          <input className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm" value={form.chapter} onChange={e => setForm(p => ({ ...p, chapter: e.target.value }))} />
+          {topicSubtopics.length > 0 ? (
+            <select className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.subtopic} onChange={e => setForm(p => ({ ...p, subtopic: e.target.value }))}>
+              <option value="">— None —</option>
+              {topicSubtopics.map(s => (
+                <option key={s.id} value={s.subtopic}>{s.subtopic}</option>
+              ))}
+            </select>
+          ) : (
+            <select className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" disabled>
+              <option value="">{form.topic ? "No subtopics" : "Select topic first"}</option>
+            </select>
+          )}
         </div>
       </div>
       {error && <p className="text-sm text-red-600">{error}</p>}
@@ -575,6 +703,11 @@ export function AdminMCQ() {
   const [tab, setTab] = useState<Tab>("upload");
   const [activeJobId, setActiveJobId] = useState("");
   const [reviewBatchId, setReviewBatchId] = useState("");
+  const [syllabusChapters, setSyllabusChapters] = useState<ChapterNode[]>([]);
+
+  useEffect(() => {
+    syllabusService.getObjective().then(tree => setSyllabusChapters(tree.chapters)).catch(() => {});
+  }, []);
 
   const TABS: { key: Tab; label: string }[] = [
     { key: "upload", label: "Upload Existing MCQs" },
@@ -621,12 +754,12 @@ export function AdminMCQ() {
 
       {!activeJobId && (
         <>
-          {tab === "upload" && <UploadTab onJobStart={handleJobStart} />}
-          {tab === "generate" && <GenerateTab onJobStart={handleJobStart} />}
+          {tab === "upload" && <UploadTab onJobStart={handleJobStart} chapters={syllabusChapters} />}
+          {tab === "generate" && <GenerateTab onJobStart={handleJobStart} chapters={syllabusChapters} />}
           {tab === "batches" && !reviewBatchId && <BatchesTab onOpenBatch={id => setReviewBatchId(id)} />}
           {tab === "batches" && reviewBatchId && <BatchReview batchId={reviewBatchId} onBack={() => setReviewBatchId("")} />}
-          {tab === "bank" && <QuestionBankTab />}
-          {tab === "manual" && <ManualAddTab onCreated={() => {}} />}
+          {tab === "bank" && <QuestionBankTab chapters={syllabusChapters} />}
+          {tab === "manual" && <ManualAddTab onCreated={() => {}} chapters={syllabusChapters} />}
         </>
       )}
     </div>

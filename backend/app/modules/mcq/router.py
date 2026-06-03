@@ -71,8 +71,9 @@ async def upload_mcq_document(
     await db.commit()
     await db.refresh(doc)
 
-    from workers.tasks.mcq_tasks import extract_mcqs
-    task = extract_mcqs.apply_async(
+    from app.core.celery_client import get_celery
+    task = get_celery().send_task(
+        "workers.tasks.mcq_tasks.extract_mcqs",
         args=[str(job.id), str(doc.id)],
         queue="kvi_ai_mcq",
     )
@@ -125,8 +126,9 @@ async def generate_mcqs_from_content(
     await db.commit()
     await db.refresh(doc)
 
-    from workers.tasks.mcq_tasks import generate_mcqs
-    task = generate_mcqs.apply_async(
+    from app.core.celery_client import get_celery
+    task = get_celery().send_task(
+        "workers.tasks.mcq_tasks.generate_mcqs",
         args=[str(job.id), str(doc.id), count],
         queue="kvi_ai_mcq",
     )
@@ -279,8 +281,9 @@ async def regenerate_batch(
         input_reference={"batch_id": str(batch_id)},
     )
 
-    from workers.tasks.mcq_tasks import regenerate_rejected_mcqs
-    task = regenerate_rejected_mcqs.apply_async(
+    from app.core.celery_client import get_celery
+    task = get_celery().send_task(
+        "workers.tasks.mcq_tasks.regenerate_rejected_mcqs",
         args=[str(job.id), str(batch_id), payload.feedback],
         queue="kvi_ai_mcq",
     )

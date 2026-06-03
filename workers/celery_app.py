@@ -2,6 +2,8 @@ import os
 import ssl
 import sys
 
+from kombu import Queue
+
 # Make backend/app importable from the workers directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
@@ -43,6 +45,15 @@ celery_app.conf.update(
     broker_connection_retry=True,
     broker_connection_retry_on_startup=True,
     broker_connection_max_retries=None,  # retry forever
+    task_default_queue="kvi_ai_default",
+    task_queues=[
+        Queue("kvi_ai_default"),
+        Queue("kvi_ai_mcq"),
+        Queue("kvi_ai_knowledge"),
+        Queue("kvi_ai_subjective"),
+        Queue("kvi_ai_video"),
+        Queue("kvi_ai_skill"),
+    ],
     # Upstash closes idle TCP connections — these settings keep the connection
     # alive and recover quickly when it drops.
     broker_transport_options={
