@@ -295,6 +295,19 @@ Test Name, Total Time, Number of Sets, Custom Instruction, Topic/Subtopic Distri
 ### Set Management
 Status: draft / active / archived. Admin: Preview / Activate / Deactivate / Delete.
 
+### Implementation notes (`backend/app/modules/mcq_tests/`)
+Implemented in Stage 2. Module layout mirrors `mcq/`: `models.py`, `schemas.py`, `service.py`, `router.py`; tables in migration `009_mcq_tests`.
+
+- **Blueprint** carries `topic_distribution` (`[{topic, subtopic|null, count}]`, count = questions per set), optional `difficulty_distribution` (`{easy, medium, hard}`), `num_sets`, `total_time_minutes`, `custom_instruction`, a `status` lifecycle (`draft → generating → generated | shortage`), and `generation_result` (JSONB; sets_created or the shortage breakdown).
+- **Generation runs as a Celery job** `mcq_test_set_generation` on `kvi_ai_mcq` (`workers/tasks/mcq_test_tasks.py`), driven by `service.generate_sets`. Created via `POST /blueprints` (returns a `JobOut`); re-runnable via `POST /blueprints/{id}/regenerate`.
+- **Planning:** topic_distribution is authoritative for counts; difficulty_distribution is split *within* each topic bucket proportionally (never adds questions). Validation rejects a difficulty total exceeding the per-set total.
+- **Cross-set uniqueness:** per leaf bucket `(topic, subtopic, complexity)` the generator pulls `count × num_sets` distinct approved questions, shuffles, and deals them round-robin into the sets, so no question repeats across sets. Questions claimed by an earlier bucket are excluded from later buckets.
+- **Shortage:** if any bucket can't supply `count × num_sets` approved questions, NOTHING is created — blueprint status becomes `shortage` and `generation_result.shortages` lists `{topic, subtopic, complexity, required, available, shortage}`. The job still completes (a reported shortage is a valid outcome, not a failure). No auto-borrow.
+- **Student attempts:** one attempt per `(set, student)` enforced by a DB unique constraint (`no retake`). `start` (`get_or_create_attempt`) is **race-safe**: a duplicate/concurrent start that loses the unique-constraint insert is caught (`IntegrityError` → rollback → re-fetch) and resumes the same attempt instead of 500ing. `start` returns questions with NO answers/explanations; a submitted attempt cannot be re-started (409). An in-progress attempt can always be resumed (Continue) even if the set was later deactivated. `submit` grades (no negative marking, score = correct count), is idempotent (a second submit returns the stored result), and returns the full result with correct answers + explanations.
+- **Student endpoints (own data only, `require_student`):** `GET /student/mcq-tests` returns each test with the student's own `attempt_status` (`none` | `in_progress` | `submitted`) → Start / Continue / View Result; `GET /student/mcq-tests/attempts/{id}/result` (ownership-checked); `GET /student/mcq-tests/history` (submitted attempts, newest first); `GET /student/mcq-tests/analytics` (overall accuracy, average/best score, per-topic performance, weak topics <60% — all scoped to the calling student).
+- Multi-step writes use the flush-then-single-`commit()` pattern (atomic), matching the rest of the codebase; the unused `database.transaction()` helper is avoided because it conflicts with the session's autobegun read transaction.
+- Frontend: admin `pages/admin/MCQTests.tsx` (Create Blueprint / Generated Sets / Active Tests + Attempts/Analytics placeholders for Stage 7), student `pages/student/StudentMCQTests.tsx` (Tests / Results / Analytics tabs; Start/Continue/View-Result buttons with duplicate-start guard; timer with auto-submit, question palette, immediate result + answer review). Service: `frontend/src/services/mcqTests.ts`.
+
 ---
 
 ## 11. Subjective System
@@ -504,6 +517,7 @@ System-level backstop so **no job is ever stuck forever**, even if a terminal wr
 ```
 knowledge_processing          → kvi_ai_knowledge
 mcq_extraction/generation     → kvi_ai_mcq
+mcq_test_set_generation       → kvi_ai_mcq
 subjective/answer checking    → kvi_ai_subjective
 video/transcription           → kvi_ai_video
 skill_builder_update          → kvi_ai_skill
@@ -821,3 +835,4 @@ celery -A workers.celery_app.celery_app beat -l info
 ./start-worker.ps1
 
 uvicorn app.main:app --reload --port 8000
+alembic upgrade head

@@ -9,7 +9,7 @@
 
 - [x] **Stage 0 — Foundation Hardening** (implemented + static checks pass; run the live smoke test below to confirm)
 - [x] Stage 1 — MCQ System: finish & harden (implemented + static checks pass; run the live review flow to confirm)
-- [ ] Stage 2 — MCQ Test Sets & Student Attempts
+- [x] Stage 2 — MCQ Test Sets & Student Attempts (implemented + static checks pass; run a live blueprint→generate→attempt to confirm)
 - [ ] Stage 3 — Subjective Test Management & Question-Specific Skills
 - [ ] Stage 4 — Answer-Sheet Checking Pipeline
 - [ ] Stage 5 — Video Tutor

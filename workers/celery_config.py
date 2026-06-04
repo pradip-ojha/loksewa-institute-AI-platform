@@ -33,6 +33,7 @@ DEFAULT_QUEUE = "kvi_ai_default"
 TASK_ROUTES = {
     "workers.tasks.knowledge_tasks.*": {"queue": "kvi_ai_knowledge"},
     "workers.tasks.mcq_tasks.*": {"queue": "kvi_ai_mcq"},
+    "workers.tasks.mcq_test_tasks.*": {"queue": "kvi_ai_mcq"},
     "workers.tasks.skill_tasks.*": {"queue": "kvi_ai_skill"},
     "workers.tasks.maintenance.*": {"queue": "kvi_ai_default"},
     "workers.tasks.keepalive.*": {"queue": "kvi_ai_default"},

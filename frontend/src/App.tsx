@@ -10,7 +10,9 @@ import { AdminSyllabus } from "./pages/admin/Syllabus";
 import { AdminKnowledge } from "./pages/admin/Knowledge";
 import { AdminFileUploadTest } from "./pages/admin/FileUploadTest";
 import { AdminMCQ } from "./pages/admin/MCQ";
+import { AdminMCQTests } from "./pages/admin/MCQTests";
 import { StudentDashboard } from "./pages/student/Dashboard";
+import { StudentMCQTests } from "./pages/student/StudentMCQTests";
 import { StudentProfile } from "./pages/student/Profile";
 import { AdminPlaceholder } from "./pages/admin/Placeholder";
 import { StudentPlaceholder } from "./pages/student/Placeholder";
@@ -34,7 +36,7 @@ function App() {
               <Route path="knowledge" element={<AdminKnowledge />} />
               <Route path="file-test" element={<AdminFileUploadTest />} />
               <Route path="mcq" element={<AdminMCQ />} />
-              <Route path="mcq-tests" element={<AdminPlaceholder title="MCQ Tests" description="Create and manage MCQ test sets — available in Stage 6" />} />
+              <Route path="mcq-tests" element={<AdminMCQTests />} />
               <Route path="video-tutor" element={<AdminPlaceholder title="Video Tutor" description="Upload and process lecture videos — available in Stage 8" />} />
               <Route path="subjective" element={<AdminPlaceholder title="Subjective Tests" description="Create and manage subjective tests — available in Stage 7" />} />
               <Route path="skill-layer" element={<AdminPlaceholder title="Skill Layer" description="Improve AI agent behavior — available in Stage 9" />} />
@@ -47,7 +49,7 @@ function App() {
             <Route path="/student" element={<StudentLayout />}>
               <Route index element={<Navigate to="dashboard" replace />} />
               <Route path="dashboard" element={<StudentDashboard />} />
-              <Route path="mcq-tests" element={<StudentPlaceholder title="MCQ Tests" />} />
+              <Route path="mcq-tests" element={<StudentMCQTests />} />
               <Route path="video-tutor" element={<StudentPlaceholder title="Video Tutor" />} />
               <Route path="subjective-tests" element={<StudentPlaceholder title="Subjective Tests" />} />
               <Route path="results" element={<StudentPlaceholder title="Results" />} />
