@@ -1,4 +1,4 @@
-import api from "./api";
+import api, { UPLOAD_TIMEOUT } from "./api";
 
 export interface KnowledgeDocument {
   id: string;
@@ -46,6 +46,7 @@ export const knowledgeService = {
   async upload(form: FormData): Promise<KnowledgeDocumentWithJob> {
     const { data } = await api.post<KnowledgeDocumentWithJob>("/api/admin/knowledge/documents", form, {
       headers: { "Content-Type": "multipart/form-data" },
+      timeout: UPLOAD_TIMEOUT,
     });
     return data;
   },

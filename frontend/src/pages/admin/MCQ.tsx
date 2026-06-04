@@ -5,6 +5,7 @@ import { mcqService } from "../../services/mcq";
 import type { MCQQuestion, MCQReviewBatch, MCQBatchWithQuestions, MCQOption } from "../../services/mcq";
 import { syllabusService } from "../../services/syllabus";
 import type { ChapterNode } from "../../services/syllabus";
+import { getErrorMessage } from "../../utils/error";
 
 type Tab = "upload" | "generate" | "batches" | "review" | "bank" | "manual";
 
@@ -53,7 +54,7 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
       const result = await mcqService.uploadDocument(fd);
       onJobStart(result.job_id, "extract");
     } catch (err: any) {
-      setError(err?.response?.data?.detail?.message || "Upload failed.");
+      setError(getErrorMessage(err, "Upload failed."));
     } finally {
       setLoading(false);
     }
@@ -67,12 +68,13 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
       </div>
       <div>
         <label className="block text-sm font-medium text-gray-700 mb-1">PDF or Word File *</label>
-        <input type="file" accept=".pdf,.doc,.docx" className="w-full text-sm" onChange={e => setFile(e.target.files?.[0] || null)} />
+        <input aria-label="PDF or Word File" type="file" accept=".pdf,.doc,.docx" className="w-full text-sm" onChange={e => setFile(e.target.files?.[0] || null)} />
       </div>
       <div className="grid grid-cols-2 gap-3">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Topic (optional)</label>
           <select
+            aria-label="Topic"
             className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
             value={form.topic}
             onChange={e => handleTopicChange(e.target.value)}
@@ -87,6 +89,7 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
           <label className="block text-sm font-medium text-gray-700 mb-1">Subtopic (optional)</label>
           {availableSubtopics.length > 0 ? (
             <select
+              aria-label="Subtopic"
               className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
               value={form.subtopic}
               onChange={e => setForm(p => ({ ...p, subtopic: e.target.value }))}
@@ -97,7 +100,7 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
               ))}
             </select>
           ) : (
-            <select className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white" disabled>
+            <select aria-label="Subtopic" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white" disabled>
               <option value="">{form.topic ? "No subtopics" : "Select topic first"}</option>
             </select>
           )}
@@ -105,7 +108,7 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
       </div>
       <div>
         <label className="block text-sm font-medium text-gray-700 mb-1">Custom Extraction Instruction (optional)</label>
-        <textarea rows={3} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.custom_instruction} onChange={e => setForm(p => ({ ...p, custom_instruction: e.target.value }))} placeholder="e.g. Focus on questions about monetary policy" />
+        <textarea aria-label="Custom Extraction Instruction" rows={3} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.custom_instruction} onChange={e => setForm(p => ({ ...p, custom_instruction: e.target.value }))} placeholder="e.g. Focus on questions about monetary policy" />
       </div>
       {error && <p className="text-sm text-red-600">{error}</p>}
       <button type="submit" disabled={loading} className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white hover:bg-brand-700 disabled:opacity-50">
@@ -149,7 +152,7 @@ function GenerateTab({ onJobStart, chapters }: { onJobStart: (jobId: string, mod
       const result = await mcqService.generateFromContent(fd);
       onJobStart(result.job_id, "generate");
     } catch (err: any) {
-      setError(err?.response?.data?.detail?.message || "Generation failed.");
+      setError(getErrorMessage(err, "Generation failed."));
     } finally {
       setLoading(false);
     }
@@ -163,16 +166,17 @@ function GenerateTab({ onJobStart, chapters }: { onJobStart: (jobId: string, mod
       </div>
       <div>
         <label className="block text-sm font-medium text-gray-700 mb-1">Content File (PDF or Word) *</label>
-        <input type="file" accept=".pdf,.doc,.docx" className="w-full text-sm" onChange={e => setFile(e.target.files?.[0] || null)} />
+        <input aria-label="Content File" type="file" accept=".pdf,.doc,.docx" className="w-full text-sm" onChange={e => setFile(e.target.files?.[0] || null)} />
       </div>
       <div>
         <label className="block text-sm font-medium text-gray-700 mb-1">Number of MCQs to Generate</label>
-        <input type="number" min={1} max={100} className="w-32 rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.count} onChange={e => setForm(p => ({ ...p, count: e.target.value }))} />
+        <input aria-label="Number of MCQs to Generate" type="number" min={1} max={100} className="w-32 rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.count} onChange={e => setForm(p => ({ ...p, count: e.target.value }))} />
       </div>
       <div className="grid grid-cols-2 gap-3">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Topic (optional)</label>
           <select
+            aria-label="Topic"
             className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
             value={form.topic}
             onChange={e => handleTopicChange(e.target.value)}
@@ -187,6 +191,7 @@ function GenerateTab({ onJobStart, chapters }: { onJobStart: (jobId: string, mod
           <label className="block text-sm font-medium text-gray-700 mb-1">Subtopic (optional)</label>
           {availableSubtopics.length > 0 ? (
             <select
+              aria-label="Subtopic"
               className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
               value={form.subtopic}
               onChange={e => setForm(p => ({ ...p, subtopic: e.target.value }))}
@@ -197,7 +202,7 @@ function GenerateTab({ onJobStart, chapters }: { onJobStart: (jobId: string, mod
               ))}
             </select>
           ) : (
-            <select className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white" disabled>
+            <select aria-label="Subtopic" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white" disabled>
               <option value="">{form.topic ? "No subtopics" : "Select topic first"}</option>
             </select>
           )}
@@ -205,7 +210,7 @@ function GenerateTab({ onJobStart, chapters }: { onJobStart: (jobId: string, mod
       </div>
       <div>
         <label className="block text-sm font-medium text-gray-700 mb-1">Custom Instruction (optional)</label>
-        <textarea rows={3} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.custom_instruction} onChange={e => setForm(p => ({ ...p, custom_instruction: e.target.value }))} />
+        <textarea aria-label="Custom Instruction" rows={3} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.custom_instruction} onChange={e => setForm(p => ({ ...p, custom_instruction: e.target.value }))} />
       </div>
       {error && <p className="text-sm text-red-600">{error}</p>}
       <button type="submit" disabled={loading} className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white hover:bg-brand-700 disabled:opacity-50">
@@ -320,6 +325,10 @@ function BatchReview({ batchId, onBack }: { batchId: string; onBack: () => void 
     try {
       const b = await mcqService.getBatch(batchId);
       setBatch(b);
+    } catch {
+      // Batch was deleted or is unreachable — fall back to the "not found"
+      // state instead of leaving a stale batch or an unhandled rejection.
+      setBatch(null);
     } finally { setLoading(false); }
   }
 
@@ -486,19 +495,20 @@ function QuestionBankTab({ chapters }: { chapters: ChapterNode[] }) {
   return (
     <div>
       <div className="mb-4 flex gap-3 flex-wrap">
-        <select className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm" value={filters.status} onChange={e => setFilters(p => ({ ...p, status: e.target.value }))}>
+        <select aria-label="Filter by Status" className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm" value={filters.status} onChange={e => setFilters(p => ({ ...p, status: e.target.value }))}>
           <option value="">All Status</option>
           <option value="approved">Approved</option>
           <option value="draft">Draft</option>
           <option value="rejected">Rejected</option>
         </select>
-        <select className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm" value={filters.complexity} onChange={e => setFilters(p => ({ ...p, complexity: e.target.value }))}>
+        <select aria-label="Filter by Difficulty" className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm" value={filters.complexity} onChange={e => setFilters(p => ({ ...p, complexity: e.target.value }))}>
           <option value="">All Difficulty</option>
           <option value="easy">Easy</option>
           <option value="medium">Medium</option>
           <option value="hard">Hard</option>
         </select>
         <select
+          aria-label="Filter by Topic"
           className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm bg-white"
           value={filters.topic}
           onChange={e => { setPage(1); setFilters(p => ({ ...p, topic: e.target.value })); }}
@@ -610,7 +620,7 @@ function ManualAddTab({ onCreated, chapters }: { onCreated: () => void; chapters
       setSuccess(true);
       onCreated();
     } catch (err: any) {
-      setError(err?.response?.data?.detail?.message || "Failed to create question.");
+      setError(getErrorMessage(err, "Failed to create question."));
     } finally { setLoading(false); }
   }
 
@@ -618,7 +628,7 @@ function ManualAddTab({ onCreated, chapters }: { onCreated: () => void; chapters
     <form onSubmit={handleSubmit} className="max-w-2xl space-y-4">
       <div>
         <label className="block text-sm font-medium text-gray-700 mb-1">Question Text *</label>
-        <textarea rows={3} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.question_text} onChange={e => setForm(p => ({ ...p, question_text: e.target.value }))} />
+        <textarea aria-label="Question Text" rows={3} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.question_text} onChange={e => setForm(p => ({ ...p, question_text: e.target.value }))} />
       </div>
       <div className="space-y-2">
         <label className="block text-sm font-medium text-gray-700">Options *</label>
@@ -637,12 +647,12 @@ function ManualAddTab({ onCreated, chapters }: { onCreated: () => void; chapters
       </div>
       <div>
         <label className="block text-sm font-medium text-gray-700 mb-1">Explanation</label>
-        <textarea rows={2} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.explanation} onChange={e => setForm(p => ({ ...p, explanation: e.target.value }))} />
+        <textarea aria-label="Explanation" rows={2} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.explanation} onChange={e => setForm(p => ({ ...p, explanation: e.target.value }))} />
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div>
           <label className="block text-xs font-medium text-gray-600 mb-1">Difficulty</label>
-          <select className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.complexity} onChange={e => setForm(p => ({ ...p, complexity: e.target.value as any }))}>
+          <select aria-label="Difficulty" className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.complexity} onChange={e => setForm(p => ({ ...p, complexity: e.target.value as any }))}>
             <option value="easy">Easy</option>
             <option value="medium">Medium</option>
             <option value="hard">Hard</option>
@@ -650,7 +660,7 @@ function ManualAddTab({ onCreated, chapters }: { onCreated: () => void; chapters
         </div>
         <div>
           <label className="block text-xs font-medium text-gray-600 mb-1">Chapter</label>
-          <select className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.chapter} onChange={e => handleChapterChange(e.target.value)}>
+          <select aria-label="Chapter" className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.chapter} onChange={e => handleChapterChange(e.target.value)}>
             <option value="">— None —</option>
             {chapters.map(c => (
               <option key={c.chapter} value={c.chapter}>{c.chapter}</option>
@@ -660,14 +670,14 @@ function ManualAddTab({ onCreated, chapters }: { onCreated: () => void; chapters
         <div>
           <label className="block text-xs font-medium text-gray-600 mb-1">Topic</label>
           {chapterTopics.length > 0 ? (
-            <select className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.topic} onChange={e => handleTopicChange(e.target.value)}>
+            <select aria-label="Topic" className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.topic} onChange={e => handleTopicChange(e.target.value)}>
               <option value="">— None —</option>
               {chapterTopics.map(t => (
                 <option key={t.topic} value={t.topic}>{t.topic}</option>
               ))}
             </select>
           ) : (
-            <select className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" disabled>
+            <select aria-label="Topic" className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" disabled>
               <option value="">{form.chapter ? "No topics" : "Select chapter first"}</option>
             </select>
           )}
@@ -675,14 +685,14 @@ function ManualAddTab({ onCreated, chapters }: { onCreated: () => void; chapters
         <div>
           <label className="block text-xs font-medium text-gray-600 mb-1">Subtopic</label>
           {topicSubtopics.length > 0 ? (
-            <select className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.subtopic} onChange={e => setForm(p => ({ ...p, subtopic: e.target.value }))}>
+            <select aria-label="Subtopic" className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.subtopic} onChange={e => setForm(p => ({ ...p, subtopic: e.target.value }))}>
               <option value="">— None —</option>
               {topicSubtopics.map(s => (
                 <option key={s.id} value={s.subtopic}>{s.subtopic}</option>
               ))}
             </select>
           ) : (
-            <select className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" disabled>
+            <select aria-label="Subtopic" className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" disabled>
               <option value="">{form.topic ? "No subtopics" : "Select topic first"}</option>
             </select>
           )}
@@ -721,7 +731,7 @@ export function AdminMCQ() {
     setActiveJobId(jobId);
   }
 
-  function handleJobComplete(job: JobState) {
+  function handleJobComplete(_job: JobState) {
     setActiveJobId("");
     setTab("batches");
   }

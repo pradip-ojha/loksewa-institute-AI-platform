@@ -20,6 +20,7 @@ from app.modules.jobs.models import ProcessingJob  # noqa: F401
 from app.modules.ai_audit.models import AIRequest, AIOutput  # noqa: F401
 from app.modules.knowledge.models import KnowledgeDocument, KnowledgeChunk  # noqa: F401
 from app.modules.mcq.models import MCQDocument, MCQReviewBatch, MCQQuestion, MCQRejectionFeedback  # noqa: F401
+from app.modules.skill_layer.models import AgentCoreSkill, AgentSkillVersion  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:

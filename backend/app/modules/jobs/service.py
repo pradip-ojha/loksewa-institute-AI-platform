@@ -1,12 +1,15 @@
-import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import AsyncSessionLocal
 from app.modules.jobs.models import JobStatus, ProcessingJob
+
+# How long a job may sit queued before we assume the worker never picked it up.
+QUEUED_GRACE_SECONDS = 600        # 10 minutes
+# Extra grace on top of the task hard-timeout before we declare a processing job dead.
+PROCESSING_GRACE_SECONDS = 300    # 5 minutes
 
 
 async def create_job(
@@ -64,25 +67,43 @@ async def update_job(
     await db.commit()
 
 
-def update_job_sync(
-    job_id: str,
-    *,
-    status: str | None = None,
-    progress: int | None = None,
-    step: str | None = None,
-    error: str | None = None,
-    output: dict | None = None,
-) -> None:
-    """Sync wrapper for use inside Celery tasks (asyncio.run)."""
-    async def _run():
-        async with AsyncSessionLocal() as db:
-            await update_job(
-                db,
-                uuid.UUID(job_id),
-                status=JobStatus(status) if status else None,
-                progress=progress,
-                step=step,
-                error=error,
-                output=output,
-            )
-    asyncio.run(_run())
+async def reap_stale_jobs(db: AsyncSession, *, task_timeout_seconds: int) -> int:
+    """Fail jobs that can never finish — the system-level backstop for stuck jobs.
+
+    Two cases, both detected from existing timestamps (no schema change):
+      • `queued` longer than QUEUED_GRACE_SECONDS  → worker never picked it up
+        (e.g. an orphaned/misrouted message). started_at is still NULL.
+      • `processing` longer than the hard task timeout + grace → the worker died
+        or wedged without recording a terminal state (covers the Windows case
+        where Celery's hard time limit can't fire).
+
+    This guarantees the UI poller always reaches a terminal state even if a
+    terminal write was lost. Returns the number of jobs reaped.
+    """
+    now = datetime.now(timezone.utc)
+    queued_cutoff = now - timedelta(seconds=QUEUED_GRACE_SECONDS)
+    processing_cutoff = now - timedelta(seconds=task_timeout_seconds + PROCESSING_GRACE_SECONDS)
+
+    stale_queued = (ProcessingJob.status == JobStatus.queued) & (
+        ProcessingJob.created_at < queued_cutoff
+    )
+    stale_processing = (ProcessingJob.status == JobStatus.processing) & (
+        ProcessingJob.started_at < processing_cutoff
+    )
+
+    result = await db.execute(
+        select(ProcessingJob).where(or_(stale_queued, stale_processing))
+    )
+    stale = result.scalars().all()
+    if not stale:
+        return 0
+
+    for job in stale:
+        job.status = JobStatus.failed
+        job.completed_at = now
+        if job.started_at is None:
+            job.error_message = "Worker did not pick up this task (timed out in queue)."
+        else:
+            job.error_message = "Exceeded maximum processing time; the worker did not finish."
+    await db.commit()
+    return len(stale)

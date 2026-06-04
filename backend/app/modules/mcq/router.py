@@ -1,3 +1,4 @@
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Query, UploadFile, File as FastAPIFile, Form
@@ -21,7 +22,37 @@ from app.modules.mcq.schemas import (
 )
 from app.modules.users.models import User
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["mcq"])
+
+
+async def _dispatch_skill_update(
+    db: AsyncSession,
+    created_by: uuid.UUID,
+    feedback: str,
+    samples: list[dict],
+) -> None:
+    """Queue a tracked skill-refinement job on kvi_ai_skill.
+
+    Replaces the old untracked FastAPI BackgroundTask (which ran an AI call in
+    the web process and swallowed failures). Now it's a real job the admin can
+    see succeed or fail.
+    """
+    job = await create_job(
+        db,
+        job_type="skill_builder_update",
+        created_by=created_by,
+        input_reference={"trigger": "mcq_rejection", "sample_count": len(samples)},
+    )
+    await db.commit()
+
+    from app.core.celery_client import get_celery
+    task = get_celery().send_task(
+        "workers.tasks.skill_tasks.update_mcq_skill_from_rejection",
+        args=[str(job.id), feedback, samples],
+        queue="kvi_ai_skill",
+    )
+    await update_job(db, job.id, status=JobStatus.processing, celery_task_id=task.id)
 
 
 # ── Document uploads ──────────────────────────────────────────────────────────
@@ -220,13 +251,21 @@ async def reject_question(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    if not payload.feedback.strip():
+    feedback = payload.feedback.strip()
+    if not feedback:
         raise AppException(422, "feedback_required", "Rejection feedback is required.")
-    q = await mcq_service.reject_question(db, question_id, payload.feedback.strip())
+    q, changed = await mcq_service.reject_question(db, question_id, feedback)
     if not q:
         raise AppException(404, "not_found", "Question not found.")
-    db.add(MCQRejectionFeedback(batch_id=batch_id, feedback_text=payload.feedback, created_by=current_user.id))
-    await db.commit()
+    # Only record feedback + queue a skill update when this call actually
+    # transitioned the question to rejected — a retry of the same request is a no-op.
+    if changed:
+        db.add(MCQRejectionFeedback(batch_id=batch_id, feedback_text=feedback, created_by=current_user.id))
+        await db.commit()
+        await _dispatch_skill_update(
+            db, current_user.id, feedback,
+            [{"topic": q.topic, "feedback": q.review_feedback}],
+        )
     return MCQQuestionOut.model_validate(q)
 
 
@@ -245,11 +284,17 @@ async def reject_all(
     batch_id: uuid.UUID,
     payload: RejectAllRequest,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
-    if not payload.feedback.strip():
+    feedback = payload.feedback.strip()
+    if not feedback:
         raise AppException(422, "feedback_required", "Rejection feedback is required.")
-    count = await mcq_service.bulk_reject_batch(db, batch_id, payload.feedback.strip())
+    rejected_qs, count = await mcq_service.bulk_reject_batch(db, batch_id, feedback)
+    if count > 0:
+        await _dispatch_skill_update(
+            db, current_user.id, feedback,
+            [{"topic": q.topic, "feedback": feedback} for q in rejected_qs],
+        )
     return {"rejected": count}
 
 

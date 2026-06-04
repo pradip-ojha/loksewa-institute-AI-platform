@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
+import axios from "axios";
 import { authService } from "../services/auth";
 import type { User } from "../types";
 
@@ -20,9 +21,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const token = authService.getToken();
     if (stored && token) {
       setUser(stored);
-      authService.getMe().then(setUser).catch(() => {
-        authService.logout();
-        setUser(null);
+      authService.getMe().then(setUser).catch((err) => {
+        // Only drop the session when the token is actually rejected (401).
+        // On a network blip or server error, keep the stored session so the
+        // user isn't logged out mid-work.
+        if (axios.isAxiosError(err) && err.response?.status === 401) {
+          authService.logout();
+          setUser(null);
+        }
       }).finally(() => setIsLoading(false));
     } else {
       setIsLoading(false);

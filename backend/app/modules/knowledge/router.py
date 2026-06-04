@@ -82,6 +82,7 @@ async def upload_knowledge_document(
     task = get_celery().send_task(
         "workers.tasks.knowledge_tasks.process_knowledge_document",
         args=[str(job.id), str(doc.id)],
+        queue="kvi_ai_knowledge",
     )
     await update_job(db, job.id, celery_task_id=task.id, status=JobStatus.queued)
 
@@ -169,6 +170,7 @@ async def reprocess_document(
     task = get_celery().send_task(
         "workers.tasks.knowledge_tasks.process_knowledge_document",
         args=[str(job.id), str(doc.id)],
+        queue="kvi_ai_knowledge",
     )
     await update_job(db, job.id, celery_task_id=task.id, status=JobStatus.queued)
 

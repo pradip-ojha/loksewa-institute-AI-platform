@@ -15,17 +15,38 @@ from app.modules.knowledge.router import router as knowledge_router
 from app.modules.mcq.router import router as mcq_router
 from app.seeds.admin_seed import create_default_admin
 from app.seeds.syllabus_seed import seed_syllabus
+from app.modules.skill_layer.service import seed_default_skills
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+logger = logging.getLogger("neurafix")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await create_default_admin()
-    await seed_syllabus()
+    missing = settings.missing_required()
+    if missing:
+        logger.error(
+            "Missing or placeholder required settings: %s. "
+            "Features depending on these will fail until they are configured in backend/.env.",
+            ", ".join(missing),
+        )
+
+    # Run seeds one at a time so a failure names the exact step instead of a
+    # cryptic stack trace at startup.
+    seeds = (
+        ("admin account", create_default_admin),
+        ("syllabus", seed_syllabus),
+        ("default skills", seed_default_skills),
+    )
+    for name, fn in seeds:
+        try:
+            await fn()
+        except Exception:
+            logger.exception("Startup seed failed: %s", name)
+            raise
     yield
 
 

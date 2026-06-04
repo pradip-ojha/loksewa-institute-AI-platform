@@ -1,0 +1,28 @@
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ── Virtual environments ──────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Celery beat schedule (shelve DB written at runtime) ───────────────────
+celerybeat-schedule
+celerybeat-schedule-*
+celerybeat.pid
+
+# ── Secrets / local env ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Editor / OS ───────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

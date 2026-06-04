@@ -55,7 +55,7 @@ Neon managed. Driver must be `asyncpg` (not plain `psycopg2`). Separate project 
 ```env
 REDIS_URL=rediss://default:<token>@<host>.upstash.io:6379
 ```
-Celery queue names are hardcoded in `workers/celery_app.py`:
+Celery queue names + routing are defined once in `workers/celery_config.py` (`QUEUES` + `TASK_ROUTES`), applied by both the worker and the FastAPI sender:
 `kvi_ai_default`, `kvi_ai_mcq`, `kvi_ai_subjective`, `kvi_ai_knowledge`, `kvi_ai_video`, `kvi_ai_skill`
 
 ### Pinecone
@@ -129,8 +129,10 @@ project-root/
 │   │   │               document_text, chunking, file_validation)
 │   │   └── seeds/
 ├── workers/
-│   ├── celery_app.py
-│   └── tasks/ (knowledge, mcq, subjective, video, skill, analytics tasks)
+│   ├── celery_app.py     (worker app: loads shared conf + beat schedule + task includes)
+│   ├── celery_config.py  (single source of truth: QUEUES, TASK_ROUTES, build_common_conf — shared by worker + FastAPI sender)
+│   ├── runtime.py        (persistent event loop per worker + run_task helper)
+│   └── tasks/ (keepalive, maintenance/reaper, knowledge, mcq, subjective, video, skill, analytics tasks)
 ├── infra/ (docker-compose, Dockerfiles, env.example)
 └── CLAUDE.md
 ```
@@ -250,6 +252,11 @@ Admin can: Accept / Reject (with feedback) / Edit / Delete. Bulk: Accept All / R
 Rejection → admin provides feedback → system regenerates only rejected → admin reviews again.
 
 Regeneration uses: source content + admin feedback + style examples + active MCQ skill.
+
+Hardening notes:
+- Accept/reject are idempotent: a retried request does not double-apply or re-fire side effects, and batch accepted/rejected counts are derived from actual question states (never reset to 0 on a re-run).
+- Rejection queues a **tracked** `skill_builder_update` job on `kvi_ai_skill` (not an untracked web-process background task); a failed skill refinement now surfaces on that job.
+- Extraction/generation/regeneration validate the AI's `questions` payload shape and report `saved`/`skipped` (with reasons) in the job's `output_reference`; malformed questions are no longer silently dropped. A generation/regeneration that yields zero usable questions fails the job instead of completing empty. `GET /api/jobs/{id}` now returns `output_reference`.
 
 ### 9.4 Manual Management
 Admin can add/edit/delete/approve/unapprove MCQs manually.
@@ -475,14 +482,32 @@ Total views, total questions, most asked questions, unclear concepts, student-wi
 
 All heavy tasks run in Celery workers. API returns job_id. UI shows live status.
 
-### Queue Routing
+### Celery config — single source of truth (`workers/celery_config.py`)
+Both the worker app (`workers/celery_app.py`) and the FastAPI sender app (`backend/app/core/celery_client.py`) apply `build_common_conf()` from this one module, so their queues / routing / serialization / transport / TLS **can never drift** (drift between the two apps is what silently misrouted tasks). It exports:
+- `QUEUES` — the only place queue names are listed (`kvi_ai_default`, `kvi_ai_mcq`, `kvi_ai_knowledge`, `kvi_ai_subjective`, `kvi_ai_video`, `kvi_ai_skill`).
+- `TASK_ROUTES` — maps each task name → its queue. **Routing is by task name**, so a `send_task` that omits `queue=` still routes correctly instead of vanishing into an unconsumed queue. Explicit `queue=` args in routers are kept only as redundant agreement.
+- Shared transport opts (`health_check_interval=15`, `visibility_timeout=21600`, keepalive), `task_acks_late=True`, `worker_prefetch_multiplier=1`, `task_ignore_result=True` (status is tracked in the DB `processing_jobs` row, never via `AsyncResult`, so no result keys are written to Upstash), and hard time limits `task_soft_time_limit=TASK_TIMEOUT_SECONDS` / `task_time_limit=TASK_TIMEOUT_SECONDS+120`.
+
+The worker is started **without `-Q`** — with `task_queues` declared it consumes ALL declared queues automatically, so the consumed set can't drift from the declared set. The FastAPI sender app has **no result backend** (it never reads results).
+
+### Worker Runtime (`workers/runtime.py`)
+Every Celery task body delegates to `run_task(work, *, job_id, task=self)`:
+- Runs `work(db)` on ONE persistent event loop per worker process (created lazily by `get_loop()`), not a fresh `asyncio.run()` per task. The async DB engine is disposed once on `worker_shutdown`, not per task. This removes the old per-task `engine.dispose()` hack and the "event loop is closed" failures on retry. **Supported pools: `solo` (Windows/dev) and `prefork` (Linux/prod) only — never threaded/gevent/eventlet** (multiple threads on the one shared loop would corrupt it).
+- Opens a single `AsyncSession` for the task, sets the job to `processing` at start, and **guarantees a terminal state**: `completed` (progress 100) on success, or `failed`/`retrying` with a sanitized `error_message` on any exception (recorded in a fresh session so a poisoned transaction can't hide the failure).
+- **Redelivery idempotency:** because `task_acks_late=True` can redeliver a task if a worker died after finishing but before acking, `run_task` skips work if the job is already `completed` (avoids duplicate embeddings/questions).
+- Enforces a hard per-task timeout (`TASK_TIMEOUT_SECONDS`) via `asyncio.wait_for`.
+
+### Stuck-job reaper (`workers/tasks/maintenance.py`, beat every 2 min)
+System-level backstop so **no job is ever stuck forever**, even if a terminal write was lost. `reap_stale_jobs` (in `jobs/service.py`) fails: jobs `queued` > 10 min (worker never picked it up — covers misrouted/orphaned messages), and jobs `processing` past `TASK_TIMEOUT_SECONDS` + 5 min grace (worker died/wedged). This is the cross-platform timeout backstop — **Celery's hard `task_time_limit` does NOT fire under `--pool=solo` on Windows** (no signals), so on Windows the in-task `wait_for` + the reaper are the real timeouts; on Linux/prefork the hard limit also applies.
+
+### Queue Routing (defined in `TASK_ROUTES`)
 ```
 knowledge_processing          → kvi_ai_knowledge
 mcq_extraction/generation     → kvi_ai_mcq
 subjective/answer checking    → kvi_ai_subjective
 video/transcription           → kvi_ai_video
 skill_builder_update          → kvi_ai_skill
-analytics_recalculation       → kvi_ai_default
+analytics / reaper / keepalive→ kvi_ai_default
 ```
 
 ### Job Types
@@ -634,7 +659,7 @@ Structured JSON output required for: MCQ extraction/generation, checking skill g
 ## 23. Environment Variables
 
 Variable names match exactly what `backend/app/core/config.py` reads via pydantic-settings.
-Celery queue names are hardcoded in `workers/celery_app.py` (not env vars).
+Celery queue names + routing live in `workers/celery_config.py` (not env vars), shared by the worker and the FastAPI sender app.
 
 ```env
 # ── Database (Neon managed PostgreSQL — asyncpg driver required) ─────────
@@ -678,6 +703,11 @@ MODEL_REASONING=gpt-5.5
 MODEL_EMBEDDING=text-embedding-3-large
 MODEL_TRANSCRIPTION=gpt-4o-transcribe
 
+# ── AI / worker timeouts (seconds) ────────────────────────────────────────
+AI_REQUEST_TIMEOUT_SECONDS=180   # per Azure OpenAI call
+AI_MAX_RETRIES=3                 # transient-error retries per AI call
+TASK_TIMEOUT_SECONDS=1800        # hard ceiling for a single Celery job
+
 # ── URLs ──────────────────────────────────────────────────────────────────
 FRONTEND_URL=http://localhost:5173
 BACKEND_URL=http://localhost:8000
@@ -692,7 +722,7 @@ DEFAULT_ADMIN_NAME=Institute Admin
 - `R2_PUBLIC_OR_ENDPOINT_URL` is the config.py field name (maps to the R2 endpoint in `.env`)
 - `REDIS_URL` must use `rediss://` (with double-s) for Upstash TLS connections
 - `PINECONE_INDEX_HOST` is required for Pinecone SDK v3+ (get it from Pinecone console → Index → Host)
-- Celery queue isolation (`kvi_ai_mcq`, `kvi_ai_subjective`, etc.) is configured in `workers/celery_app.py`, not via env vars
+- Celery queue isolation + routing (`kvi_ai_mcq`, `kvi_ai_subjective`, etc.) is configured in `workers/celery_config.py` (shared by worker + sender), not via env vars
 
 ---
 
@@ -776,3 +806,18 @@ Phase 12: Hardening (error handling, security, logging, deployment)
 ## 27. Build Principle
 
 Build as a serious production system with limited chapter coverage. Clean module design so expanding from one chapter to full syllabus is straightforward. Azure OpenAI credits used strategically. Model abstraction maintained so another provider can be added later.
+
+##  28. commands 
+
+# Worker + beat in one process (no -Q: the worker consumes all queues declared
+# in workers/celery_config.py automatically). --pool=solo on Windows.
+celery -A workers.celery_app.celery_app worker -B -l info --pool=solo
+
+# Or run beat separately:
+celery -A workers.celery_app.celery_app worker -l info --pool=solo
+celery -A workers.celery_app.celery_app beat -l info
+
+# Convenience (Windows): starts worker + beat in separate windows
+./start-worker.ps1
+
+uvicorn app.main:app --reload --port 8000

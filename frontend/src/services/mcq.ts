@@ -1,4 +1,4 @@
-import api from "./api";
+import api, { UPLOAD_TIMEOUT } from "./api";
 
 export interface MCQOption {
   id: string;
@@ -65,6 +65,7 @@ export const mcqService = {
   async uploadDocument(form: FormData): Promise<{ document_id: string; job_id: string }> {
     const { data } = await api.post("/api/admin/mcq/documents/upload", form, {
       headers: { "Content-Type": "multipart/form-data" },
+      timeout: UPLOAD_TIMEOUT,
     });
     return data;
   },
@@ -72,6 +73,7 @@ export const mcqService = {
   async generateFromContent(form: FormData): Promise<{ document_id: string; job_id: string }> {
     const { data } = await api.post("/api/admin/mcq/generate", form, {
       headers: { "Content-Type": "multipart/form-data" },
+      timeout: UPLOAD_TIMEOUT,
     });
     return data;
   },

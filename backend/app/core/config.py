@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     MODEL_TRANSCRIPTION: str = "whisper"
     EMBEDDING_DIMENSIONS: int = 3072
 
+    # AI / worker timeouts (seconds)
+    AI_REQUEST_TIMEOUT_SECONDS: int = 180   # per Azure OpenAI call
+    AI_MAX_RETRIES: int = 3                  # transient-error retries per AI call
+    TASK_TIMEOUT_SECONDS: int = 1800         # hard ceiling for a single Celery job
+
     # URLs
     FRONTEND_URL: str = "http://localhost:5173"
     BACKEND_URL: str = "http://localhost:8000"
@@ -51,6 +56,24 @@ class Settings(BaseSettings):
     DEFAULT_ADMIN_EMAIL: str = "admin@neurafix.ai"
     DEFAULT_ADMIN_PASSWORD: str = "Admin@123"
     DEFAULT_ADMIN_NAME: str = "Institute Admin"
+
+    def missing_required(self) -> list[str]:
+        """Return names of critical settings still left at an empty/placeholder
+        value. Used at startup to fail fast with a readable message instead of
+        crashing deep inside a request or background task."""
+        checks: dict[str, bool] = {
+            "DATABASE_URL": bool(self.DATABASE_URL) and "@localhost" not in self.DATABASE_URL,
+            "JWT_SECRET": bool(self.JWT_SECRET) and self.JWT_SECRET != "change-this-secret",
+            "REDIS_URL": bool(self.REDIS_URL) and self.REDIS_URL != "redis://localhost:6379/0",
+            "AZURE_OPENAI_ENDPOINT": bool(self.AZURE_OPENAI_ENDPOINT),
+            "AZURE_OPENAI_API_KEY": bool(self.AZURE_OPENAI_API_KEY),
+            "PINECONE_API_KEY": bool(self.PINECONE_API_KEY),
+            "PINECONE_INDEX_HOST": bool(self.PINECONE_INDEX_HOST),
+            "R2_ACCOUNT_ID": bool(self.R2_ACCOUNT_ID),
+            "R2_ACCESS_KEY_ID": bool(self.R2_ACCESS_KEY_ID),
+            "R2_SECRET_ACCESS_KEY": bool(self.R2_SECRET_ACCESS_KEY),
+        }
+        return [name for name, ok in checks.items() if not ok]
 
 
 @lru_cache

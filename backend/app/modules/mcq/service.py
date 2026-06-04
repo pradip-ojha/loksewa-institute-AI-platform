@@ -70,10 +70,22 @@ async def list_questions(
     return result.scalars().all(), total
 
 
+async def _count_in_batch(db: AsyncSession, batch_id: uuid.UUID, status: str) -> int:
+    r = await db.execute(
+        select(func.count()).select_from(MCQQuestion).where(
+            MCQQuestion.review_batch_id == batch_id,
+            MCQQuestion.status == status,
+        )
+    )
+    return r.scalar_one()
+
+
 async def accept_question(db: AsyncSession, question_id: uuid.UUID) -> MCQQuestion | None:
     result = await db.execute(select(MCQQuestion).where(MCQQuestion.id == question_id))
     q = result.scalar_one_or_none()
-    if q:
+    # Idempotent: re-accepting an already-approved question is a no-op so a
+    # retried request doesn't churn updated_at or counts.
+    if q and q.status != "approved":
         q.status = "approved"
         q.updated_at = datetime.utcnow()
         await db.commit()
@@ -81,16 +93,24 @@ async def accept_question(db: AsyncSession, question_id: uuid.UUID) -> MCQQuesti
     return q
 
 
-async def reject_question(db: AsyncSession, question_id: uuid.UUID, feedback: str) -> MCQQuestion | None:
+async def reject_question(
+    db: AsyncSession, question_id: uuid.UUID, feedback: str
+) -> tuple[MCQQuestion | None, bool]:
+    """Returns (question, changed). `changed` is True only when this call moved
+    the question into the rejected state, so the caller can avoid double-firing
+    side effects (feedback rows, skill-update jobs) on retries."""
     result = await db.execute(select(MCQQuestion).where(MCQQuestion.id == question_id))
     q = result.scalar_one_or_none()
-    if q:
+    if not q:
+        return None, False
+    changed = q.status != "rejected"
+    if changed or q.review_feedback != feedback:
         q.status = "rejected"
         q.review_feedback = feedback
         q.updated_at = datetime.utcnow()
         await db.commit()
         await db.refresh(q)
-    return q
+    return q, changed
 
 
 async def bulk_accept_batch(db: AsyncSession, batch_id: uuid.UUID) -> int:
@@ -101,17 +121,18 @@ async def bulk_accept_batch(db: AsyncSession, batch_id: uuid.UUID) -> int:
     for q in questions:
         q.status = "approved"
         q.updated_at = datetime.utcnow()
-    # update batch counts
     batch_r = await db.execute(select(MCQReviewBatch).where(MCQReviewBatch.id == batch_id))
     batch = batch_r.scalar_one_or_none()
     if batch:
-        batch.accepted_count = len(questions)
+        # Derive the count from actual approved rows (autoflush makes the changes
+        # above visible) so a re-run can't reset the count to 0.
+        batch.accepted_count = await _count_in_batch(db, batch_id, "approved")
         batch.status = "completed"
     await db.commit()
     return len(questions)
 
 
-async def bulk_reject_batch(db: AsyncSession, batch_id: uuid.UUID, feedback: str) -> int:
+async def bulk_reject_batch(db: AsyncSession, batch_id: uuid.UUID, feedback: str) -> tuple[list[MCQQuestion], int]:
     result = await db.execute(
         select(MCQQuestion).where(MCQQuestion.review_batch_id == batch_id, MCQQuestion.status == "draft")
     )
@@ -123,13 +144,15 @@ async def bulk_reject_batch(db: AsyncSession, batch_id: uuid.UUID, feedback: str
     batch_r = await db.execute(select(MCQReviewBatch).where(MCQReviewBatch.id == batch_id))
     batch = batch_r.scalar_one_or_none()
     if batch:
-        batch.rejected_count = len(questions)
-        batch.rejection_feedback = feedback
-        batch.status = "in_review"
-        # save feedback record
-        db.add(MCQRejectionFeedback(batch_id=batch_id, feedback_text=feedback, created_by=batch.created_by))
+        batch.rejected_count = await _count_in_batch(db, batch_id, "rejected")
+        # Only record feedback + flip status when this call actually rejected
+        # something; a retried reject-all (0 drafts left) leaves no duplicate row.
+        if questions:
+            batch.rejection_feedback = feedback
+            batch.status = "in_review"
+            db.add(MCQRejectionFeedback(batch_id=batch_id, feedback_text=feedback, created_by=batch.created_by))
     await db.commit()
-    return len(questions)
+    return questions, len(questions)
 
 
 async def approve_question(db: AsyncSession, question_id: uuid.UUID) -> MCQQuestion | None:

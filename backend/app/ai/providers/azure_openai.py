@@ -1,18 +1,30 @@
+import asyncio
 import base64
 import io
 import json
 import logging
 import time
 
-from openai import AsyncAzureOpenAI
+from openai import (
+    AsyncAzureOpenAI,
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    RateLimitError,
+)
 
 from app.core.config import settings
+from app.core.exceptions import AIResponseError, ExternalServiceError
 from app.ai.providers.base import AIModelProvider
 
 logger = logging.getLogger(__name__)
 
 _reasoning_client: AsyncAzureOpenAI | None = None
 _embedding_client: AsyncAzureOpenAI | None = None
+
+# Errors worth retrying: the call did not complete but may succeed if repeated.
+# A malformed JSON body is NOT here — that call completed, the content is just unusable.
+_TRANSIENT_ERRORS = (APITimeoutError, APIConnectionError, RateLimitError, InternalServerError)
 
 
 def _get_reasoning_client() -> AsyncAzureOpenAI:
@@ -39,6 +51,65 @@ def _get_embedding_client() -> AsyncAzureOpenAI:
             api_version=settings.AZURE_OPENAI_API_VERSION_EMBEDDING,
         )
     return _embedding_client
+
+
+def _strip_code_fences(text: str) -> str:
+    """Models sometimes wrap JSON in ```json ... ``` fences despite json_object mode."""
+    t = text.strip()
+    if t.startswith("```"):
+        first_newline = t.find("\n")
+        if first_newline != -1:
+            t = t[first_newline + 1 :]
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[: t.rstrip().rfind("```")]
+    return t.strip()
+
+
+def _response_text(response) -> str:
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise AIResponseError("model returned no choices")
+    content = choices[0].message.content
+    return (content or "").strip()
+
+
+def _parse_json(text: str, *, agent_type: str | None, task_type: str | None) -> dict:
+    cleaned = _strip_code_fences(text)
+    if not cleaned:
+        raise AIResponseError("model returned empty content")
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        logger.error(
+            "AI returned invalid JSON (agent=%s task=%s): %s",
+            agent_type, task_type, cleaned[:300],
+        )
+        raise AIResponseError(f"invalid JSON in model response: {exc}") from exc
+    if not isinstance(data, dict):
+        raise AIResponseError("model JSON was not an object")
+    return data
+
+
+async def _create_with_retry(client: AsyncAzureOpenAI, **kwargs):
+    """chat.completions.create with a hard per-call timeout and bounded retry on
+    transient errors (rate-limit / timeout / connection / 5xx)."""
+    attempts = max(1, settings.AI_MAX_RETRIES)
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return await client.chat.completions.create(
+                timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
+                **kwargs,
+            )
+        except _TRANSIENT_ERRORS as exc:
+            last_exc = exc
+            if attempt == attempts - 1:
+                break
+            backoff = min(2 ** attempt, 10)
+            logger.warning("Azure OpenAI transient error (attempt %d/%d): %s — retrying in %ss",
+                           attempt + 1, attempts, exc, backoff)
+            await asyncio.sleep(backoff)
+    raise ExternalServiceError("azure_openai", f"request failed after {attempts} attempts: {last_exc}")
 
 
 async def _audit(audit_ctx: dict | None, *, model: str, api_version: str, input_tokens: int | None, output_tokens: int | None, latency_ms: int, status: str = "success", error_message: str | None = None) -> None:
@@ -78,7 +149,8 @@ class AzureOpenAIProvider(AIModelProvider):
 
         t0 = time.monotonic()
         try:
-            response = await client.chat.completions.create(
+            response = await _create_with_retry(
+                client,
                 model=settings.MODEL_REASONING,
                 messages=[{"role": "user", "content": prompt}],
                 **kwargs,
@@ -91,9 +163,9 @@ class AzureOpenAIProvider(AIModelProvider):
             await _audit(audit_ctx, model=settings.MODEL_REASONING, api_version=settings.AZURE_OPENAI_API_VERSION_REASONING, input_tokens=None, output_tokens=None, latency_ms=latency, status="error", error_message=str(exc))
             raise
 
-        text = (response.choices[0].message.content or "").strip()
+        text = _response_text(response)
         if schema is not None:
-            return json.loads(text)
+            return _parse_json(text, agent_type=(audit_ctx or {}).get("agent_type"), task_type=(audit_ctx or {}).get("task_type"))
         return {"text": text}
 
     async def generate_with_file(self, prompt: str, file_bytes: bytes, mime_type: str, schema: dict | None = None, audit_ctx: dict | None = None) -> dict:
@@ -113,7 +185,8 @@ class AzureOpenAIProvider(AIModelProvider):
 
         t0 = time.monotonic()
         try:
-            response = await client.chat.completions.create(
+            response = await _create_with_retry(
+                client,
                 model=settings.MODEL_REASONING,
                 messages=[{"role": "user", "content": content}],
                 **kwargs,
@@ -126,9 +199,9 @@ class AzureOpenAIProvider(AIModelProvider):
             await _audit(audit_ctx, model=settings.MODEL_REASONING, api_version=settings.AZURE_OPENAI_API_VERSION_REASONING, input_tokens=None, output_tokens=None, latency_ms=latency, status="error", error_message=str(exc))
             raise
 
-        text = (response.choices[0].message.content or "").strip()
+        text = _response_text(response)
         if schema is not None:
-            return json.loads(text)
+            return _parse_json(text, agent_type=(audit_ctx or {}).get("agent_type"), task_type=(audit_ctx or {}).get("task_type"))
         return {"text": text}
 
     async def generate_with_image(self, prompt: str, image_bytes: bytes, schema: dict | None = None, audit_ctx: dict | None = None) -> dict:
@@ -145,7 +218,8 @@ class AzureOpenAIProvider(AIModelProvider):
 
         t0 = time.monotonic()
         try:
-            response = await client.chat.completions.create(
+            response = await _create_with_retry(
+                client,
                 model=settings.MODEL_REASONING,
                 messages=[{"role": "user", "content": content}],
                 **kwargs,
@@ -158,9 +232,9 @@ class AzureOpenAIProvider(AIModelProvider):
             await _audit(audit_ctx, model=settings.MODEL_REASONING, api_version=settings.AZURE_OPENAI_API_VERSION_REASONING, input_tokens=None, output_tokens=None, latency_ms=latency, status="error", error_message=str(exc))
             raise
 
-        text = (response.choices[0].message.content or "").strip()
+        text = _response_text(response)
         if schema is not None:
-            return json.loads(text)
+            return _parse_json(text, agent_type=(audit_ctx or {}).get("agent_type"), task_type=(audit_ctx or {}).get("task_type"))
         return {"text": text}
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
@@ -170,11 +244,15 @@ class AzureOpenAIProvider(AIModelProvider):
         batch_size = 100
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
-            response = await client.embeddings.create(
-                model=settings.MODEL_EMBEDDING,
-                input=batch,
-                dimensions=settings.EMBEDDING_DIMENSIONS,
-            )
+            try:
+                response = await client.embeddings.create(
+                    model=settings.MODEL_EMBEDDING,
+                    input=batch,
+                    dimensions=settings.EMBEDDING_DIMENSIONS,
+                    timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
+                )
+            except _TRANSIENT_ERRORS as exc:
+                raise ExternalServiceError("azure_openai", f"embedding request failed: {exc}") from exc
             for item in sorted(response.data, key=lambda x: x.index):
                 embeddings.append(item.embedding)
 
@@ -194,6 +272,7 @@ class AzureOpenAIProvider(AIModelProvider):
                 model=settings.MODEL_TRANSCRIPTION,
                 file=audio_file,
                 response_format="verbose_json",
+                timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
             )
             latency = int((time.monotonic() - t0) * 1000)
             await _audit(audit_ctx, model=settings.MODEL_TRANSCRIPTION, api_version=settings.AZURE_OPENAI_API_VERSION_TRANSCRIPTION, input_tokens=None, output_tokens=None, latency_ms=latency)
