@@ -20,7 +20,9 @@ import app.modules.knowledge.models      # noqa: F401
 import app.modules.ai_audit.models       # noqa: F401
 import app.modules.mcq.models            # noqa: F401
 import app.modules.mcq_tests.models      # noqa: F401
+import app.modules.subjective.models     # noqa: F401
 import app.modules.skill_layer.models   # noqa: F401
+import app.modules.video.models          # noqa: F401
 
 celery_app = Celery(
     "neurafix",
@@ -33,7 +35,9 @@ celery_app = Celery(
         "workers.tasks.knowledge_tasks",
         "workers.tasks.mcq_tasks",
         "workers.tasks.mcq_test_tasks",
+        "workers.tasks.subjective_tasks",
         "workers.tasks.skill_tasks",
+        "workers.tasks.video_tasks",
     ],
 )
 

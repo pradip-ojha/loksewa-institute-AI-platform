@@ -14,6 +14,8 @@ from app.modules.jobs.router import router as jobs_router
 from app.modules.knowledge.router import router as knowledge_router
 from app.modules.mcq.router import router as mcq_router
 from app.modules.mcq_tests.router import router as mcq_tests_router
+from app.modules.subjective.router import router as subjective_router
+from app.modules.video.router import router as video_router
 from app.seeds.admin_seed import create_default_admin
 from app.seeds.syllabus_seed import seed_syllabus
 from app.modules.skill_layer.service import seed_default_skills
@@ -76,6 +78,8 @@ app.include_router(jobs_router, prefix="/api")
 app.include_router(knowledge_router, prefix="/api")
 app.include_router(mcq_router, prefix="/api")
 app.include_router(mcq_tests_router, prefix="/api")
+app.include_router(subjective_router, prefix="/api")
+app.include_router(video_router, prefix="/api")
 
 
 @app.get("/health")

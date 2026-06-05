@@ -11,8 +11,12 @@ import { AdminKnowledge } from "./pages/admin/Knowledge";
 import { AdminFileUploadTest } from "./pages/admin/FileUploadTest";
 import { AdminMCQ } from "./pages/admin/MCQ";
 import { AdminMCQTests } from "./pages/admin/MCQTests";
+import { AdminSubjectiveTests } from "./pages/admin/SubjectiveTests";
+import { AdminVideoTutor } from "./pages/admin/VideoTutor";
 import { StudentDashboard } from "./pages/student/Dashboard";
 import { StudentMCQTests } from "./pages/student/StudentMCQTests";
+import { StudentSubjectiveTests } from "./pages/student/StudentSubjectiveTests";
+import { StudentVideoTutor } from "./pages/student/StudentVideoTutor";
 import { StudentProfile } from "./pages/student/Profile";
 import { AdminPlaceholder } from "./pages/admin/Placeholder";
 import { StudentPlaceholder } from "./pages/student/Placeholder";
@@ -37,8 +41,8 @@ function App() {
               <Route path="file-test" element={<AdminFileUploadTest />} />
               <Route path="mcq" element={<AdminMCQ />} />
               <Route path="mcq-tests" element={<AdminMCQTests />} />
-              <Route path="video-tutor" element={<AdminPlaceholder title="Video Tutor" description="Upload and process lecture videos — available in Stage 8" />} />
-              <Route path="subjective" element={<AdminPlaceholder title="Subjective Tests" description="Create and manage subjective tests — available in Stage 7" />} />
+              <Route path="video-tutor" element={<AdminVideoTutor />} />
+              <Route path="subjective" element={<AdminSubjectiveTests />} />
               <Route path="skill-layer" element={<AdminPlaceholder title="Skill Layer" description="Improve AI agent behavior — available in Stage 9" />} />
               <Route path="analytics" element={<AdminPlaceholder title="Analytics" description="View platform analytics — available in Stage 10" />} />
             </Route>
@@ -50,8 +54,8 @@ function App() {
               <Route index element={<Navigate to="dashboard" replace />} />
               <Route path="dashboard" element={<StudentDashboard />} />
               <Route path="mcq-tests" element={<StudentMCQTests />} />
-              <Route path="video-tutor" element={<StudentPlaceholder title="Video Tutor" />} />
-              <Route path="subjective-tests" element={<StudentPlaceholder title="Subjective Tests" />} />
+              <Route path="video-tutor" element={<StudentVideoTutor />} />
+              <Route path="subjective-tests" element={<StudentSubjectiveTests />} />
               <Route path="results" element={<StudentPlaceholder title="Results" />} />
               <Route path="profile" element={<StudentProfile />} />
             </Route>

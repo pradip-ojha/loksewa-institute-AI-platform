@@ -87,7 +87,7 @@ Key prefixes: `knowledge/`, `mcq-documents/`, `subjective-tests/`, `answer-sheet
 
 **Queue:** Redis + Celery
 
-**PDF/Image:** PyMuPDF, OpenCV, Pillow. Audio: FFmpeg.
+**PDF/Image:** PyMuPDF, OpenCV, Pillow. Audio: FFmpeg (via `ffmpeg-python`; the `ffmpeg` binary must be on PATH).
 
 **AI:** Azure OpenAI (primary, all tasks). No Gemini in this version.
 
@@ -312,8 +312,20 @@ Implemented in Stage 2. Module layout mirrors `mcq/`: `models.py`, `schemas.py`,
 
 ## 11. Subjective System
 
+Admin creates and configures every test. The answer-sheet checking workflow is driven **entirely** by
+the admin-configured test — the question paper, question-wise marks, rubric, and checking rules are
+**never hardcoded** inside the checking pipeline (see §12).
+
 ### 11.1 Test Creation Fields
-Test Display Name, Total Time, Number of Questions, Total Marks, Question Paper (PDF/Word), Ideal/Model Answer, Sample Marked Answer (optional), Marking Rubric, Custom Checking Instruction.
+Test Display Name, Total Time, Number of Questions, Total Marks, Question Paper (PDF/Word), Ideal/Model
+Answer, Sample Marked Answer (**optional**), Marking Rubric file (**optional**), Custom Checking
+Instruction (**optional**).
+
+- **Question-wise marks are the source of truth for maximum marks.** The AI may award partial marks but
+  may NEVER exceed the configured full marks for a question (or the configured total).
+- **Marking Rubric** is an optional per-test file (`rubric_file_id`). There is no central rubric library
+  in this version. If no rubric file is selected, the checker uses the **default general rubric** (§11.5).
+- **Custom Checking Instruction** is optional, test-specific guidance for the AI checker.
 
 Status: draft / active / archived.
 
@@ -321,28 +333,64 @@ Status: draft / active / archived.
 Must have: clear question numbering + marks per question. Example: `Q1. ... [8 marks]` or `प्रश्न नं. १ ... [८ अंक]`
 
 ### 11.3 Question-Specific Checking Skills
-Generated automatically when test is created. No admin approval needed.
+Generated automatically when test is created. No admin approval needed. These are a **pre-computed
+checking guide per question**, cached and used by the checker as enrichment on top of the live admin
+test config at check time (not a replacement for it).
 
-Inputs: question paper, model answer, sample marked answer (if any), rubric, subjective notes, book content, subjective syllabus, custom instruction, active copy-checking skill.
+Inputs: question paper, model answer, sample marked answer (if any), rubric (or default), subjective
+notes, book content, subjective syllabus, custom instruction, active copy-checking skill.
 
-Output per question: required points, marks distribution, partial marking rules, expected keywords, common mistakes, feedback style, annotation rules, confidence hints.
+Output per question: required points, marks distribution, partial marking rules, expected keywords,
+common mistakes, feedback style, annotation rules, confidence hints.
+
+### 11.4 Checking Inputs & Priority
+The checker always reads the live admin-configured test. When guidance conflicts, priority is:
+
+```
+admin test-specific checking instructions  >  selected rubric file  >  default general rubric
+```
+
+Above all of these, the **question-wise configured full marks are a hard cap** that no instruction,
+rubric, or AI judgement may exceed.
+
+### 11.5 Default Rubric
+Used only when no rubric file is selected for the test:
+- **Theory answers:** judge concept accuracy, completeness, relevance, examples, structure, explanation depth.
+- **Numerical answers:** judge formula, steps, calculation, final answer, and units where relevant.
+- Award **partial marks** for partially correct answers; accept correct ideas in the student's own words.
+- Do not over-penalize spelling/grammar unless meaning is unclear.
+- Never exceed the configured full marks.
 
 ---
 
 ## 12. Answer-Sheet Checking Pipeline
 
+**No hardcoding:** the pipeline always loads the admin-configured test (question paper, question-wise
+marks, optional rubric or default, optional admin instructions) plus the pre-computed question-specific
+checking guide. The question paper, marks, rubric, and rules are never embedded in the checking code.
+
 ```
-Student uploads PDF/image
+Student uploads handwritten answer-sheet PDF/image
 → Quality check (blur, brightness, tilt, resolution, orientation)
 → If low quality: ask reupload (max 2 attempts), then continue with warning
-→ Extract text + layout coordinates (Azure OpenAI vision reasoning)
-→ Split answers question-wise
-→ Retrieve question-specific checking skills
-→ Evaluate each answer → marks + feedback + annotation instructions (compact JSON)
-→ Python annotates PDF (PyMuPDF + Pillow)
+→ Convert pages to HIGH-QUALITY images for GPT-5.5 vision
+→ Full line-level extraction (GPT-5.5 vision): per-line text + coordinates
+→ Question-wise reconstruction (backend groups lines by question number + page context)
+→ Load admin test config (paper, marks, rubric/default, admin instructions) + question-specific guide
+→ Evaluate each reconstructed answer → marks (capped at full marks) + feedback + annotation instructions
+→ Reviewer / verification pass (second GPT-5.5 call): fix fairness, enforce max marks, prune annotations
+→ Python annotates PDF (PyMuPDF + Pillow) from the reviewed instructions
 → Store checked PDF in R2
 → Student sees result + checked PDF immediately
 ```
+
+### Extraction (full line-level, used from the start for demo quality)
+The extractor captures, per line: page number, question number (if visible/inferable), extracted
+handwritten text, line-level coordinates. It supports **Nepali / English / mixed** answers, and captures
+formulas, tables, diagrams, and numerical work where visible.
+
+The extractor MUST NOT: check answers, correct grammar, rewrite text, or summarize student answers — it
+only transcribes what is on the page with coordinates. Checking happens later.
 
 ### Extraction Output (per question)
 ```json
@@ -368,14 +416,53 @@ Student uploads PDF/image
 }
 ```
 
+### Reviewer / Verification Pass
+A second GPT-5.5 pass runs after evaluation for demo-quality reliability. The reviewer:
+- checks that marks are fair and consistent across questions,
+- verifies that max marks follow the admin configuration (never exceeded),
+- removes unnecessary annotations,
+- corrects unfair or inconsistent checking,
+- keeps feedback concise and useful.
+
+The reviewed evaluation is what produces the checked PDF and result. Both the initial and reviewed
+evaluation are persisted for audit (see §19).
+
 ### Annotation Rules
-- AI outputs instructions; Python draws (PyMuPDF + Pillow)
-- Identifiable wrong line → underline using bbox coordinates
-- General feedback → find blank space using layout coords, place there
-- Low confidence → region-level feedback + warning, no fake word-level marking
-- Style: red handwritten-style marks/comments
+- AI decides what to mark; Python draws it (PyMuPDF + Pillow). Style: red handwritten-style marks/comments.
+- **Normal/general feedback does NOT create line annotations.**
+- Use visible line annotations (underline / circle / comment) **only** for a specific wrong written item:
+  wrong sentence, wrong formula, wrong calculation step, wrong keyword, contradictory statement, irrelevant line.
+- **Do NOT** line-annotate for: missing points, short answer, weak explanation, missing examples, poor
+  structure, or general improvement feedback. Place those as marks + short feedback near the question
+  area or in the result summary.
+- Low confidence → region-level feedback + warning, no fake word-level marking.
+- **Do not overcrowd the PDF** — prefer fewer meaningful annotations over many noisy comments.
+
+### Checked PDF Contents
+Question-wise marks, total marks, concise feedback, underlines/circles/comments only for specific wrong
+lines, an overall summary — clean, teacher-like presentation.
+
+### Result Page
+Shows: total marks, question-wise marks, question-wise feedback, checked PDF preview/download, and
+processing status. Internal JSON (extraction/evaluation payloads) is not exposed to normal users
+(debug-only).
+
+### Production Note
+This demo is intentionally **quality-first**: full line-level extraction + a reviewer pass on every
+sheet. A later production optimization may switch to question-level extraction first, falling back to
+line-level only when exact annotation is needed, and fewer AI calls for lower cost. For this demo,
+prioritize quality and client presentation.
 
 No follow-up chat after checking.
+
+### Implementation notes (`backend/app/modules/subjective/`, Stage 3)
+Module mirrors `mcq_tests/` (`models.py`, `schemas.py`, `service.py`, `router.py`); tables in migration `010_subjective`. Two orchestrated Celery jobs on `kvi_ai_subjective` (`workers/tasks/subjective_tasks.py`):
+- **`generate_test_skills`** (`subjective_test_processing`) — created by `POST /admin/subjective/tests` (multipart: paper required; model answer / sample / rubric optional). Extracts questions+marks from the paper (`QuestionPaperAgent`, with a vision-OCR fallback for scanned papers via `_resolve_text`), persists `subjective_questions` (their `marks` are the full-marks source of truth; `total_marks` is derived from them when the paper has marks), then generates one `question_specific_checking_skills` row per question (`CheckingSkillAgent`). Sets `skill_generation_status=completed`; a test can only be **activated** once skills are completed and it has ≥1 question.
+- **`check_answer_sheet`** (`answer_sheet_checking`) — created by `POST /student/subjective/tests/{id}/upload-answer` (context `answer-sheets`; re-upload increments `upload_attempt_number`, capped at 2). One job runs: render pages to PNG (`processing/pdf_tools`) → quality gate (`processing/image_quality`, OpenCV; **poor + attempt<2 ⇒ status `needs_reupload`, job completes, no AI spent**) → full line-level extraction per page (`AnswerExtractionAgent.extract_page`, vision, pixel bboxes) → question-wise reconstruction (`service.reconstruct_questionwise`, digit-tolerant qid match + unlabeled-line carry-forward) → evaluation against live test config + per-question guide (`AnswerEvaluationAgent`, default rubric constant when no rubric file) → **reviewer/verification pass** (`AnswerReviewerAgent`) → annotate pages (`processing/annotation`, Pillow) + assemble checked PDF (`pdf_tools.build_pdf_from_images`) → upload to `answer-sheets/checked/`. `service.clamp_marks` hard-caps each question at its full marks after BOTH the eval and review passes. `answer_evaluations` stores reviewed `evaluation_data` + `initial_evaluation_data` + `reviewed`/`review_notes`.
+- **Uniform rasterization:** every page (PDF or image) becomes a high-DPI PNG so extraction coords, evaluation line refs, and annotation drawing share one pixel space; the checked PDF is rebuilt from annotated PNGs.
+- **Agents** (`backend/app/ai/agents/`): `question_paper_agent`, `checking_skill_agent`, `answer_extraction_agent`, `answer_evaluation_agent`, `answer_reviewer_agent` — all use `get_provider("reasoning")` (GPT-5.5), `audit_ctx`, and an active skill via `get_active_skill_text` (defaults seeded in `skill_layer/service._DEFAULT_SKILLS`).
+- **Result/UX:** student result (`GET /student/subjective/tests/{id}/result`) returns total + per-question marks + feedback + checked-PDF signed URL, never internal JSON. Frontend: admin `pages/admin/SubjectiveTests.tsx` (Create Test / Test List / Submissions / Analytics-placeholder), student `pages/student/StudentSubjectiveTests.tsx` (list → upload → result, with quality-driven re-upload), service `frontend/src/services/subjectiveTests.ts`.
+- Knowledge-layer enrichment is intentionally NOT used for subjective checking in this stage — checking is grounded in the admin-configured test (paper, model answer, rubric/default, instruction).
 
 ---
 
@@ -411,6 +498,60 @@ Uses: transcript, timeline, slide labels, summary. Fallback to notes only if vid
 
 Include timestamp/slide reference only when useful. Student can also watch the video.
 
+### Q&A architecture — TIMELINE-FIRST (not vector search over transcript)
+This is the decisive design rule. Student Q&A is **never** a random vector search over transcript
+chunks. Lecture transcripts are NOT embedded into Pinecone. The flow per question is:
+```
+question (+ current_video_time) → SegmentRouter (picks 1–3 timeline segments by label/description;
+  uses current_video_time for vague questions) → fetch selected segment summary + original transcript
+  → TopicSubtopicRouter (picks from the live syllabus tree only) → fetch supporting approved knowledge
+  chunks (vector search ONLY inside that filtered topic/subtopic set) → AnswerAgent
+```
+- The **full lecture summary is passed into EVERY question** for global context — deliberately not dropped
+  for token savings in this slice (quality over cost).
+- Grounding priority: selected-segment transcript > segment summary > full lecture summary > knowledge chunks.
+- Lecture is PRIMARY; notes are SECONDARY. Never attribute note-only content to the teacher
+  ("लेक्चरमा teacher ले…" only for lecture content; "थप बुझ्नको लागि note अनुसार…" for notes). Include a
+  timestamp when the answer is lecture-based. If neither lecture nor notes cover it, say so honestly.
+
+### Implementation notes (`backend/app/modules/video/`, Phase 9)
+Module mirrors `subjective/` (`models.py`, `schemas.py`, `service.py`, `router.py`); tables in migration
+`011_video`. Tables: `videos`, `video_audio_chunks`, `video_transcripts`, `video_timeline_segments`,
+`video_summaries`, `video_support_slides`, `video_slide_labels`, `video_chat_sessions`,
+`video_chat_messages`, `video_views`. Segment times stored in **seconds** (float) for precise seeking.
+- **Admin picks `content_usage_type`** (`objective`|`subjective`) per video — no subject/chapter picker
+  (fixed-slice). That choice drives both the syllabus tree used for topic/subtopic routing/mapping and the
+  knowledge set used for supporting chunks.
+- **One orchestrated Celery job** `process_video` on `kvi_ai_video` (`workers/tasks/video_tasks.py`), created
+  by `POST /admin/videos` (multipart: media required; support-slides PDF optional). Pipeline + the
+  `videos.processing_status` lifecycle: `uploaded → extracting_audio → chunking_audio → transcribing →
+  merging_transcript → cleaning_transcript → generating_timeline → mapping_topics → generating_summary →
+  processing_slides → completed | failed`. Steps: extract audio (`processing/audio_tools.extract_audio`,
+  FFmpeg via `ffmpeg-python`, mono 16 kHz mp3, stored to R2 `audio/`) → chunk (≈8 min, 12 s overlap, global
+  offsets preserved) → transcribe each chunk (`provider.transcribe`, gpt-4o-transcribe) → merge (absolute
+  timestamps) → clean (`VideoTranscriptCleanerAgent`) → timeline (`VideoTimelineAgent`) → map segments to
+  syllabus (`VideoSegmentTopicMapperAgent`, validated against the live tree) → full summary
+  (`VideoSummaryAgent`) → slide labels if a slides PDF (`VideoSlideLabelAgent`, per-page PDF text aligned to
+  timeline). Admin can **activate** only once `processing_status=completed`; `POST /admin/videos/{id}/retry`
+  re-runs the job (replaces prior children).
+- **Q&A is synchronous in the router** (`POST /student/videos/{id}/ask` → `service.run_qa_chain`), NOT a job:
+  `VideoSegmentRouterAgent` → `VideoTopicRouterAgent` → `service.fetch_supporting_knowledge` (Pinecone query
+  filtered by `content_usage_type` + routed `topic`/`subtopic`, mapped back to `knowledge_chunks` by
+  `pinecone_vector_id`; best-effort — Q&A still answers lecture-only if Pinecone is unavailable) →
+  `VideoTutorAgent`. Each turn is persisted to `video_chat_messages` (segments, topic, sources, confidence,
+  follow-ups). Response shape: `{answer, language, chat_session_id, selected_segments, detected_topic,
+  detected_subtopic_ids, supporting_knowledge_used, confidence, follow_up_suggestions}`.
+- **Agents** (`backend/app/ai/agents/video_*`): `video_transcript_cleaner_agent`, `video_timeline_agent`,
+  `video_segment_topic_mapper_agent`, `video_summary_agent`, `video_slide_label_agent`,
+  `video_segment_router_agent`, `video_topic_router_agent`, `video_tutor_agent` — all use
+  `get_provider("reasoning")` (GPT-5.5), `audit_ctx` (`entity_type="video"`), and `get_active_skill_text`
+  (defaults seeded in `skill_layer/service._DEFAULT_SKILLS`).
+- **Frontend:** admin `pages/admin/VideoTutor.tsx` (Upload / Library / Details: summary, timeline,
+  key/exam points, slides, possible questions; activate/retry/delete with `JobStatusPoller`), student
+  `pages/student/StudentVideoTutor.tsx` (player + tabs सारांश / समयरेखा / मुख्य बुँदा / AI Tutor;
+  timeline + tutor source timestamps seek the player; follow-up chips), service
+  `frontend/src/services/videoTutor.ts`.
+
 ---
 
 ## 14. Skill Layer
@@ -418,7 +559,12 @@ Include timestamp/slide reference only when useful. Student can also watch the v
 Real behavior-control system. Approved skill updates affect future agent executions.
 
 ### Agents Requiring Default Skills (seeded from JSON)
-Knowledge Processing, MCQ Extraction, MCQ Generation, MCQ Review/Regeneration, MCQ Test Set Generation, Copy Checking, PDF Annotation, Video Processing, Video Tutor, Skill Builder, Analytics.
+Knowledge Processing, MCQ Extraction, MCQ Generation, MCQ Review/Regeneration, MCQ Test Set Generation,
+Question-Specific Skill Generation, Answer Extraction, Answer Evaluation (Copy Checking), Answer
+Reviewer/Verification, PDF Annotation, Skill Builder, Analytics. Video Tutor agents (seeded in
+`_DEFAULT_SKILLS`): `VideoTranscriptCleanerAgent`, `VideoTimelineAgent`, `VideoSegmentTopicMapperAgent`,
+`VideoSummaryAgent`, `VideoSlideLabelAgent`, `VideoSegmentRouterAgent`, `VideoTopicRouterAgent`,
+`VideoTutorAgent`.
 
 ### Skill Scopes
 Global agent skill / Objective chapter / Subjective chapter / Test-specific / Question-specific.
@@ -519,13 +665,17 @@ knowledge_processing          → kvi_ai_knowledge
 mcq_extraction/generation     → kvi_ai_mcq
 mcq_test_set_generation       → kvi_ai_mcq
 subjective/answer checking    → kvi_ai_subjective
-video/transcription           → kvi_ai_video
+video_tasks.* (process_video) → kvi_ai_video
 skill_builder_update          → kvi_ai_skill
 analytics / reaper / keepalive→ kvi_ai_default
 ```
 
 ### Job Types
-knowledge_processing, mcq_extraction, mcq_generation, mcq_regeneration, mcq_test_set_generation, subjective_test_processing, question_specific_skill_generation, answer_sheet_quality_check, answer_sheet_extraction, answer_evaluation, pdf_annotation, video_audio_extraction, video_transcription, video_processing, video_timeline_generation, skill_builder_update, analytics_recalculation.
+knowledge_processing, mcq_extraction, mcq_generation, mcq_regeneration, mcq_test_set_generation, subjective_test_processing, question_specific_skill_generation, answer_sheet_quality_check, answer_sheet_extraction, answer_evaluation, answer_review (reviewer/verification pass), pdf_annotation, video_audio_extraction, video_transcription, video_processing, video_timeline_generation, skill_builder_update, analytics_recalculation.
+
+The exact job decomposition for answer-sheet checking (one orchestrated job running the steps vs. chained jobs) is decided during the build; the **reviewer/verification pass must be a tracked step**. Subjective tasks live in `workers/tasks/subjective_tasks.py`, routed `workers.tasks.subjective_tasks.* → kvi_ai_subjective`.
+
+Video Tutor uses ONE orchestrated job `video_processing` (`workers.tasks.video_tasks.process_video`, routed `workers.tasks.video_tasks.* → kvi_ai_video`) running all pipeline steps (extract/chunk/transcribe/merge/clean/timeline/map/summary/slides) with incremental progress. Student Q&A is synchronous (a fast multi-agent chat call in the router), NOT a tracked job.
 
 ### Job Fields
 job_id, job_type, status (queued/processing/completed/failed/retrying/cancelled), progress_percent, current_step, input_reference (JSONB), output_reference (JSONB), error_message, celery_task_id, created_at, started_at, completed_at, created_by.
@@ -566,23 +716,28 @@ job_id, job_type, status (queued/processing/completed/failed/retrying/cancelled)
 `mcq_attempt_answers`: id, attempt_id, question_id, selected_option_id, is_correct
 
 ### Subjective
-`subjective_tests`: id, display_name, total_time_minutes, num_questions, total_marks, question_paper_file_id, model_answer_file_id, sample_marked_file_id, rubric_file_id, custom_instruction, status, skill_generation_status, skill_generation_job_id, created_by, created_at
+`subjective_tests`: id, display_name, total_time_minutes, num_questions, total_marks, question_paper_file_id, model_answer_file_id, sample_marked_file_id, rubric_file_id (optional per-test rubric file; default rubric used when null), custom_instruction, status, skill_generation_status, skill_generation_job_id, created_by, created_at
 `subjective_questions`: id, test_id, question_number, question_text, marks, question_order
 `question_specific_checking_skills`: id, test_id, question_id, skill_json (JSONB), version, is_active, created_at
 `student_answer_sheets`: id, test_id, student_id, file_id, upload_attempt_number, current_status, checking_job_id, created_at
 `answer_quality_checks`: id, sheet_id, blur_score, brightness_score, tilt_angle, resolution_ok, readability_score, overall_status, quality_notes, created_at
-`answer_extractions`: id, sheet_id, extracted_data (JSONB), overall_confidence, model_used, created_at
-`answer_evaluations`: id, sheet_id, evaluation_data (JSONB), total_marks_awarded, total_marks_possible, overall_confidence, model_used, created_at
+`answer_extractions`: id, sheet_id, extracted_data (JSONB; full line-level text + coords), overall_confidence, model_used, created_at
+`answer_evaluations`: id, sheet_id, evaluation_data (JSONB; the **reviewed** result used for the checked PDF), initial_evaluation_data (JSONB; pre-review result, for audit), reviewed (bool), review_notes, total_marks_awarded, total_marks_possible, overall_confidence, model_used, created_at
 `pdf_annotations`: id, sheet_id, annotation_instructions (JSONB), checked_file_id, annotation_status, created_at
 
-### Video
-`videos`: id, display_name, file_id, audio_file_id, topic, subtopic, custom_instruction, processing_status, duration_seconds, is_audio_only, created_by, created_at
-`video_support_slides`: id, video_id, file_id, slide_count
-`video_transcripts`: id, video_id, raw_transcript, refined_transcript, segments (JSONB), created_at
-`video_timelines`: id, video_id, timeline_data (JSONB), created_at
-`video_slide_labels`: id, video_id, slide_number, slide_id, title, related_timestamps (JSONB), topics (JSONB), summary
+(Reviewer-pass output is persisted for audit via `answer_evaluations.initial_evaluation_data` + `reviewed`/`review_notes`; the exact shape — these columns vs. a dedicated `answer_reviews` table — is finalized during the build.)
+
+### Video (migration `011_video`; segment/chunk times in seconds)
+`videos`: id, display_name, content_usage_type (objective|subjective), topic, subtopic, custom_instruction, file_id, audio_file_id, support_slides_file_id, processing_status, duration_seconds, is_audio_only, status (draft|active|archived), processing_job_id, created_by, created_at
+`video_audio_chunks`: id, video_id, chunk_index, start_seconds, end_seconds, audio_file_id, status, raw_transcript, model_used, error_message, created_at
+`video_transcripts`: id, video_id, raw_merged_transcript, cleaned_transcript, language, model_used_for_cleaning, segments (JSONB), created_at
+`video_timeline_segments`: id, video_id, segment_index, start_seconds, end_seconds, label, description, summary, original_transcript, topic, subtopic_ids (JSONB), mapping_confidence, created_at
+`video_summaries`: id, video_id, short_summary, detailed_summary, key_points (JSONB), exam_focused_points (JSONB), important_terms (JSONB), possible_questions (JSONB), created_at
+`video_support_slides`: id, video_id, file_id, slide_count, created_at
+`video_slide_labels`: id, video_id, slide_number, slide_id, title, related_timestamps (JSONB), topics (JSONB), summary, created_at
+`video_chat_sessions`: id, video_id, student_id, created_at, updated_at
+`video_chat_messages`: id, session_id, video_id, student_id, question, answer, language, selected_segment_ids (JSONB), detected_topic, detected_subtopic_ids (JSONB), sources_json (JSONB), supporting_knowledge_json (JSONB), confidence, follow_up_suggestions (JSONB), created_at
 `video_views`: id, video_id, student_id, viewed_at, watch_duration_seconds
-`video_tutor_questions`: id, video_id, student_id, question_text, answer_text, confidence, sources_used (JSONB), created_at
 
 ### Skill Layer
 `agent_core_skills`: id, agent_type, current_version_id, created_at
@@ -747,11 +902,11 @@ DEFAULT_ADMIN_NAME=Institute Admin
 ✅ Phase 3: Files & Jobs (R2, Celery, job tracking)
 ✅ Phase 4: Knowledge Layer (upload, extract, chunk, embed, Pinecone)
 
-Phase 5: AI Audit + Files Router + MCQ Extraction & Generation
-Phase 6: MCQ Test Sets & Student Attempts
-Phase 7: Subjective Test Management & Skill Generation
-Phase 8: Answer Checking Pipeline (quality check, extraction, evaluation, PDF)
-Phase 9: Video Tutor (upload, transcribe, timeline, slides, Q&A)
+✅ Phase 5: AI Audit + Files Router + MCQ Extraction & Generation
+✅ Phase 6: MCQ Test Sets & Student Attempts
+✅ Phase 7: Subjective Test Management & Skill Generation (admin-configured tests = source of truth; optional per-test rubric file with default-rubric fallback; auto-generated question-specific checking guide)
+✅ Phase 8: Answer Checking Pipeline (quality check → high-quality page images → full line-level extraction → question-wise reconstruction → evaluation against admin config → GPT-5.5 reviewer/verification pass → checked PDF)
+✅ Phase 9: Video Tutor (upload → FFmpeg audio extract/chunk → gpt-4o-transcribe → clean → timeline segments → syllabus mapping → full summary → slide labels; timeline-first synchronous Q&A with always-on lecture summary, segment + topic/subtopic routing, filtered knowledge support)
 Phase 10: Skill Layer (seed skills, chat UI, approval, agent integration)
 Phase 11: Analytics & Dashboard Completion
 Phase 12: Hardening (error handling, security, logging, deployment)
@@ -771,6 +926,9 @@ Phase 12: Hardening (error handling, security, logging, deployment)
 - Upload lecture slides from Knowledge Layer
 - Upload marking rubrics from Knowledge Layer
 - Use notes to generate explanations for original uploaded MCQs
+- Hardcode the question paper, marks, rubric, or checking rules inside the answer-sheet checking workflow (always read the admin-configured test)
+- Exceed the configured full marks for any question (or the configured total)
+- Line-annotate for missing points, weak explanation, missing examples, poor structure, or general improvement feedback
 - Store MCQ images or option images
 - Expose Azure OpenAI keys in UI or API responses
 - Run heavy AI/PDF/video tasks in synchronous request handlers
@@ -796,24 +954,25 @@ Phase 12: Hardening (error handling, security, logging, deployment)
 11. System warns with shortage breakdown if questions insufficient
 12. Admin activates MCQ sets
 13. Student attempts active set once, sees immediate result + explanations
-14. Admin creates subjective tests with question paper, model answer, rubric
+14. Admin creates subjective tests with question paper, question-wise marks, model answer, and optional rubric file (default rubric applied when none selected)
 15. System generates internal question-specific checking skills automatically
 16. Student uploads PDF/image answer sheet
 17. System checks quality, asks reupload up to 2x
-18. System extracts answer text + layout coordinates
-19. System evaluates answers, generates marks + feedback
-20. System produces checked PDF with red handwritten-style marks/comments
-21. Student sees marks + feedback + checked PDF immediately after processing
-22. Admin uploads video/audio + support slides PDF
-23. System transcribes with gpt-4o-transcribe
-24. System generates transcript, summary, timeline, slide labels with reasoning model
-25. Student watches video, asks tutor questions
-26. Tutor answers from video artifacts, notes fallback only if needed
-27. Skill Layer updates backend agent behavior after admin approval
-28. Skill version history visible
-29. Admin analytics for MCQ, subjective, video
-30. All heavy workflows show job status
-31. App deployable with React, FastAPI, Celery, PostgreSQL, Redis, Pinecone, R2, Azure OpenAI
+18. System converts pages to high-quality images and performs full line-level extraction (text + coordinates)
+19. System reconstructs answers question-wise and evaluates them against the admin-configured test (paper, marks, rubric/default, admin instructions in priority order; never exceeding configured full marks)
+20. System runs a GPT-5.5 reviewer/verification pass (fair marks, max-marks enforced, annotations pruned)
+21. System produces a checked PDF with red handwritten-style marks/comments (line annotations only for specific wrong items; not overcrowded)
+22. Student sees total marks + question-wise marks + feedback + checked PDF immediately after processing (no internal JSON exposed)
+23. Admin uploads video/audio + support slides PDF
+24. System transcribes with gpt-4o-transcribe
+25. System generates transcript, summary, timeline, slide labels with reasoning model
+26. Student watches video, asks tutor questions
+27. Tutor answers from video artifacts, notes fallback only if needed
+28. Skill Layer updates backend agent behavior after admin approval
+29. Skill version history visible
+30. Admin analytics for MCQ, subjective, video
+31. All heavy workflows show job status
+32. App deployable with React, FastAPI, Celery, PostgreSQL, Redis, Pinecone, R2, Azure OpenAI
 
 ---
 
@@ -836,3 +995,4 @@ celery -A workers.celery_app.celery_app beat -l info
 
 uvicorn app.main:app --reload --port 8000
 alembic upgrade head
+pip install -r requirements.txt

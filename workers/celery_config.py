@@ -34,11 +34,12 @@ TASK_ROUTES = {
     "workers.tasks.knowledge_tasks.*": {"queue": "kvi_ai_knowledge"},
     "workers.tasks.mcq_tasks.*": {"queue": "kvi_ai_mcq"},
     "workers.tasks.mcq_test_tasks.*": {"queue": "kvi_ai_mcq"},
+    "workers.tasks.subjective_tasks.*": {"queue": "kvi_ai_subjective"},
+    "workers.tasks.video_tasks.*": {"queue": "kvi_ai_video"},
     "workers.tasks.skill_tasks.*": {"queue": "kvi_ai_skill"},
     "workers.tasks.maintenance.*": {"queue": "kvi_ai_default"},
     "workers.tasks.keepalive.*": {"queue": "kvi_ai_default"},
     "workers.tasks.test_task.*": {"queue": "kvi_ai_default"},
-    # subjective / video routes added when those stages land
 }
 
 # Transport options shared by broker and result backend.

@@ -32,6 +32,70 @@ _DEFAULT_SKILLS: dict[str, str] = {
         "Ensure appropriate difficulty and clear explanations. "
         "CRITICAL: Questions must NEVER reference the source document — write standalone factual questions only."
     ),
+    # ── Subjective answer-sheet checking agents ──────────────────────────────
+    "QuestionPaperAgent": (
+        "Extract every question's number, full text, and allotted marks from a subjective "
+        "question paper. Preserve Nepali Devanagari exactly. Never answer or rephrase questions."
+    ),
+    "CheckingSkillAgent": (
+        "Produce a fair, rubric-grounded per-question checking guide: required points, marks "
+        "distribution summing to full marks, expected keywords, common mistakes, and concise "
+        "feedback style. Ground it only in the question, model answer, rubric, and admin instruction."
+    ),
+    "AnswerExtractionAgent": (
+        "Transcribe handwritten answer sheets line by line with precise pixel bounding boxes. "
+        "Support Nepali, English, and mixed text plus formulas, tables, and numerical work. "
+        "Transcribe only — never check, correct, rewrite, translate, or summarize."
+    ),
+    "AnswerEvaluationAgent": (
+        "Mark each answer fairly within the configured full marks (a hard cap). Priority: admin "
+        "instruction > rubric > general judgement. Award partial marks; accept correct ideas in the "
+        "student's own words; do not over-penalize spelling/grammar. Annotate ONLY specific wrong "
+        "written items; put missing-point/structure feedback in the feedback field, not as annotations."
+    ),
+    "AnswerReviewerAgent": (
+        "Verify a first-pass evaluation: ensure marks are fair and consistent, never exceed full "
+        "marks, prune unnecessary annotations, and keep feedback concise and useful."
+    ),
+    # ── Video Tutor agents ───────────────────────────────────────────────────
+    "VideoTranscriptCleanerAgent": (
+        "Clean Nepali/English lecture transcripts: fix sentence flow, punctuation, repeated words, and "
+        "transcription artifacts. Preserve meaning, examples, technical terms, numbers, dates, and "
+        "Loksewa terms exactly. Preserve Devanagari; never translate or summarize."
+    ),
+    "VideoTimelineAgent": (
+        "Split the lecture into meaningful teaching segments (roughly 3–10 min each, but a coherent "
+        "teaching unit matters more than duration). Write high-quality labels and descriptions, since "
+        "the segment router depends on them. Keep segments ordered and covering the whole lecture."
+    ),
+    "VideoSegmentTopicMapperAgent": (
+        "Map each timeline segment to topic/subtopic chosen ONLY from the fixed syllabus tree; never "
+        "invent names. A segment may map to multiple subtopics. When uncertain, choose a broader topic "
+        "and a low confidence."
+    ),
+    "VideoSummaryAgent": (
+        "Summarize the lecture faithfully and completely. Include a short and a detailed summary, key "
+        "points, exam-focused points, important terms, and a bank of possible questions (MCQs, short, "
+        "long). Do not invent facts not present in the lecture."
+    ),
+    "VideoSlideLabelAgent": (
+        "Label support slides with semantic titles, align each to the lecture timeline timestamps it "
+        "relates to, and add topics + a short summary."
+    ),
+    "VideoSegmentRouterAgent": (
+        "Route a student question to the 1–3 most relevant timeline segments by label/description "
+        "meaning; for vague questions use the current video time. Avoid selecting too many segments."
+    ),
+    "VideoTopicRouterAgent": (
+        "Select topic/subtopic for a question ONLY from the fixed syllabus tree; never invent. When "
+        "uncertain, pick the broader topic with low confidence."
+    ),
+    "VideoTutorAgent": (
+        "Answer grounded in the selected lecture segment first (transcript > summary), then the full "
+        "lecture summary, then approved notes as secondary support. Match the question's language, "
+        "include timestamps for lecture-based answers, never attribute note-only content to the teacher, "
+        "and never hallucinate."
+    ),
 }
 
 SKILL_REFINEMENT_PROMPT = """You are a skill optimization system for an MCQ generation agent used in a competitive exam preparation platform.
