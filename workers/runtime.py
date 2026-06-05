@@ -112,12 +112,23 @@ async def _run_task(work: Callable[[Any], Awaitable[None]], *, job_id: str, time
         logger.info("Job %s already completed; skipping redelivered task", job_uuid)
         return
     try:
+        # Mark `processing` in its OWN short session that is closed immediately.
+        # The session passed into `work` must never be the one we reuse for the
+        # terminal update: a long task (OCR/embedding/Pinecone) can run for
+        # minutes, during which an idle pooled connection is dropped server-side
+        # (Neon). Reusing that stale connection for the final commit is exactly
+        # the "connection is closed" failure we are eliminating.
+        async with AsyncSessionLocal() as mark_db:
+            await update_job(mark_db, job_uuid, status=JobStatus.processing, step="Starting…")
+
         async with AsyncSessionLocal() as db:
-            await update_job(db, job_uuid, status=JobStatus.processing, step="Starting…")
             await asyncio.wait_for(work(db), timeout=timeout)
-            # Guarantee a terminal success state. Agents report progress/steps but
-            # several never set `completed`, which left jobs stuck at processing.
-            await update_job(db, job_uuid, status=JobStatus.completed, progress=100)
+
+        # Guarantee a terminal success state in a FRESH session, never the one
+        # held open across `work`. Agents report progress/steps but several never
+        # set `completed`, which left jobs stuck at processing.
+        async with AsyncSessionLocal() as done_db:
+            await update_job(done_db, job_uuid, status=JobStatus.completed, progress=100)
     except asyncio.TimeoutError:
         status = JobStatus.retrying if will_retry else JobStatus.failed
         await _record_terminal(job_uuid, status=status, message=f"Task timed out after {timeout}s")

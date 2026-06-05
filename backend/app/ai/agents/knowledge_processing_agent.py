@@ -6,6 +6,7 @@ from collections import defaultdict
 from io import BytesIO
 
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
@@ -19,6 +20,57 @@ from app.modules.knowledge.models import KnowledgeChunk, KnowledgeDocument
 from app.modules.syllabus.models import SyllabusItem, SyllabusType
 
 logger = logging.getLogger(__name__)
+
+# Connection-level errors that mean "the DB connection died" rather than "the SQL
+# was wrong". On a flaky network a pooled asyncpg connection can be dropped by the
+# server (Neon) *mid-query* — pool_pre_ping only validates on checkout, so it
+# cannot prevent this. These are safe to retry on a fresh connection.
+_DB_DISCONNECT_ERRORS = (DBAPIError, OperationalError, InterfaceError)
+
+
+def _is_db_disconnect(exc: Exception) -> bool:
+    """True if `exc` is a dropped/stale DB connection (retryable), not a real
+    SQL/constraint error (which must surface)."""
+    if isinstance(exc, _DB_DISCONNECT_ERRORS):
+        # SQLAlchemy flags invalidated connections; also treat asyncpg's
+        # connection-does-not-exist / connection-closed as disconnects by name.
+        if getattr(exc, "connection_invalidated", False):
+            return True
+        text = f"{type(getattr(exc, 'orig', exc)).__name__}: {exc}".lower()
+        return any(
+            marker in text
+            for marker in ("connectiondoesnotexist", "connection was closed",
+                           "connection is closed", "connection reset",
+                           "server closed the connection", "interfaceerror")
+        )
+    return False
+
+
+async def _db_op_with_retry(op, *, attempts: int = 4, label: str = "db op"):
+    """Run an async DB operation, retrying transient connection drops.
+
+    `op` is a zero-arg coroutine factory that opens its OWN fresh session and
+    performs an idempotent unit of work. Each retry therefore checks out a fresh
+    connection (pool_pre_ping validates it), which is the only way to recover
+    from a connection the server killed mid-operation.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await op()
+        except Exception as exc:  # noqa: BLE001 — re-raised below if not retryable
+            if not _is_db_disconnect(exc):
+                raise
+            last_exc = exc
+            if attempt < attempts:
+                delay = min(2.0 * attempt, 8.0)
+                logger.warning(
+                    "%s hit a transient DB disconnect (attempt %d/%d): %s — retrying in %.0fs",
+                    label, attempt, attempts, exc, delay,
+                )
+                await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 PREETI_DECODE_PROMPT = """The text below was extracted from a PDF that uses a legacy Nepali font (Preeti or Kantipur).
 These fonts store Devanagari glyphs mapped to ASCII codepoints, so PDF text extraction returns garbled ASCII instead of Unicode Devanagari.
@@ -214,8 +266,27 @@ class KnowledgeProcessingAgent:
         self,
         document_id: str,
         job_id: str,
-        db: AsyncSession,
+        db: AsyncSession | None = None,
     ) -> None:
+        """Process a knowledge document into embedded, Pinecone-indexed chunks.
+
+        DB-session lifecycle (the reason this is structured in three phases):
+
+          1. LOAD   — a short session reads the document/file/syllabus metadata,
+                      marks the doc `processing`, then CLOSES.
+          2. WORK   — the long AI/OCR/embedding/Pinecone work runs holding NO DB
+                      session. Pooled asyncpg connections are dropped server-side
+                      (Neon) when left idle for minutes, so we must not pin one
+                      across this phase — that is the root of the historic
+                      "connection is closed" failure at the final commit.
+          3. SAVE   — a FRESH session inserts chunks in batches and flips the doc
+                      to `completed`. Made idempotent so a Celery retry that
+                      re-enters this phase does not duplicate vectors/chunks.
+
+        The `db` argument is intentionally ignored: every phase opens its own
+        short-lived session via `AsyncSessionLocal()`, so this task never reuses
+        a global/long-lived session.
+        """
         job_uuid = uuid.UUID(job_id)
         doc_uuid = uuid.UUID(document_id)
 
@@ -223,69 +294,90 @@ class KnowledgeProcessingAgent:
             # Always use a fresh session so a failed step update never
             # corrupts the main data session (asyncpg marks a session
             # IN_FAILED_TRANSACTION on any error; a shared session would
-            # then reject all subsequent data commits).
-            try:
+            # then reject all subsequent data commits). A progress update is
+            # cosmetic, so a transient connection drop here is retried a couple
+            # of times and then swallowed — it must never fail the job.
+            async def _do() -> None:
                 async with AsyncSessionLocal() as step_db:
                     await update_job(step_db, job_uuid, status=status, progress=progress, step=step)
+
+            try:
+                await _db_op_with_retry(_do, attempts=3, label=f"progress {progress}%")
             except Exception as step_exc:
                 logger.warning("Could not update job progress (%d%% — %s): %s", progress, step, step_exc)
 
         try:
             await _step(JobStatus.processing, 5, "Loading document record…")
 
-            result = await db.execute(
-                select(KnowledgeDocument).where(KnowledgeDocument.id == doc_uuid)
-            )
-            doc = result.scalar_one_or_none()
-            if not doc:
-                await update_job(db, job_uuid, status=JobStatus.failed, error="Document not found.")
-                return
-
-            # Mark document as processing
-            doc.processing_status = "processing"
-            await db.commit()
-
-            # Derive hardcoded chapter for this deployment's vertical slice
-            hardcoded_chapter = _CHAPTER_BY_USAGE_TYPE.get(doc.content_usage_type, "")
-
-            # Load syllabus topics/subtopics for metadata validation and prompt injection
-            syl_result = await db.execute(
-                select(SyllabusItem)
-                .where(
-                    SyllabusItem.syllabus_type == SyllabusType(doc.content_usage_type),
-                    SyllabusItem.is_active == True,
+            # ── PHASE 1: LOAD METADATA (short session, then close) ──────────────
+            # Capture everything the long work phase needs into plain locals so we
+            # hold no ORM objects (and no DB connection) across the AI work.
+            async with AsyncSessionLocal() as load_db:
+                result = await load_db.execute(
+                    select(KnowledgeDocument).where(KnowledgeDocument.id == doc_uuid)
                 )
-                .order_by(SyllabusItem.sort_order)
-            )
-            syllabus_items = syl_result.scalars().all()
-            valid_topics: set[str] = {item.topic for item in syllabus_items}
-            valid_subtopics: set[str] = {item.subtopic for item in syllabus_items if item.subtopic}
-            _topic_sub_map: dict[str, list[str]] = defaultdict(list)
-            for _item in syllabus_items:
-                if _item.subtopic:
-                    _topic_sub_map[_item.topic].append(_item.subtopic)
-                elif _item.topic not in _topic_sub_map:
-                    _topic_sub_map[_item.topic] = []
-            _lines: list[str] = []
-            for _topic, _subs in _topic_sub_map.items():
-                _lines.append(f"- {_topic}")
-                for _sub in _subs:
-                    _lines.append(f"  - {_sub}")
-            syllabus_topics_block = "\n".join(_lines)
+                doc = result.scalar_one_or_none()
+                if not doc:
+                    await update_job(load_db, job_uuid, status=JobStatus.failed, error="Document not found.")
+                    return
 
-            # Load file record
-            file_result = await db.execute(select(File).where(File.id == doc.file_id))
-            file_record = file_result.scalar_one_or_none()
-            if not file_record:
-                raise RuntimeError("File record not found.")
+                # Mark document as processing
+                doc.processing_status = "processing"
 
+                usage_type = doc.content_usage_type
+                document_type = doc.document_type
+                custom_instruction = doc.custom_instruction
+                doc_topic = doc.topic
+                doc_subtopic = doc.subtopic
+                display_name = doc.display_name
+                file_id = doc.file_id
+
+                # Derive hardcoded chapter for this deployment's vertical slice
+                hardcoded_chapter = _CHAPTER_BY_USAGE_TYPE.get(usage_type, "")
+
+                # Load syllabus topics/subtopics for metadata validation and prompt injection
+                syl_result = await load_db.execute(
+                    select(SyllabusItem)
+                    .where(
+                        SyllabusItem.syllabus_type == SyllabusType(usage_type),
+                        SyllabusItem.is_active == True,
+                    )
+                    .order_by(SyllabusItem.sort_order)
+                )
+                syllabus_items = syl_result.scalars().all()
+                valid_topics: set[str] = {item.topic for item in syllabus_items}
+                valid_subtopics: set[str] = {item.subtopic for item in syllabus_items if item.subtopic}
+                _topic_sub_map: dict[str, list[str]] = defaultdict(list)
+                for _item in syllabus_items:
+                    if _item.subtopic:
+                        _topic_sub_map[_item.topic].append(_item.subtopic)
+                    elif _item.topic not in _topic_sub_map:
+                        _topic_sub_map[_item.topic] = []
+                _lines: list[str] = []
+                for _topic, _subs in _topic_sub_map.items():
+                    _lines.append(f"- {_topic}")
+                    for _sub in _subs:
+                        _lines.append(f"  - {_sub}")
+                syllabus_topics_block = "\n".join(_lines)
+
+                # Load file record
+                file_result = await load_db.execute(select(File).where(File.id == file_id))
+                file_record = file_result.scalar_one_or_none()
+                if not file_record:
+                    raise RuntimeError("File record not found.")
+                r2_key = file_record.r2_key
+                mime = file_record.mime_type
+
+                await load_db.commit()
+            # load_db is now closed — no DB session is held during the work below.
+
+            # ── PHASE 2: LONG AI WORK (no DB session held) ──────────────────────
             await _step(JobStatus.processing, 10, "Downloading file from storage…")
 
-            file_bytes = await asyncio.to_thread(get_r2().download_fileobj, file_record.r2_key)
+            file_bytes = await asyncio.to_thread(get_r2().download_fileobj, r2_key)
 
             await _step(JobStatus.processing, 20, "Extracting text…")
 
-            mime = file_record.mime_type
             if "pdf" in mime:
                 # ── Per-page smart extraction ──────────────────────────────────
                 # 1. PyMuPDF extracts text from all pages first (fast, no API cost).
@@ -410,9 +502,9 @@ class KnowledgeProcessingAgent:
             async def _chunk_one_section(i: int, section: str) -> list[dict]:
                 async with chunk_sem:
                     prompt = CHUNK_PROMPT.format(
-                        document_type=doc.document_type,
-                        content_usage_type=doc.content_usage_type,
-                        custom_instruction=doc.custom_instruction or "None",
+                        document_type=document_type,
+                        content_usage_type=usage_type,
+                        custom_instruction=custom_instruction or "None",
                         syllabus_topics=syllabus_topics_block,
                         text=section,
                     )
@@ -423,8 +515,8 @@ class KnowledgeProcessingAgent:
                         return [{
                             "content": section,
                             "content_type": "concept_explanation",
-                            "topic": doc.topic or "",
-                            "subtopic": doc.subtopic or "",
+                            "topic": doc_topic or "",
+                            "subtopic": doc_subtopic or "",
                             "language": "nepali_english_mixed",
                         }]
                     if isinstance(result_json, list):
@@ -456,24 +548,23 @@ class KnowledgeProcessingAgent:
             chunk_texts = [c.get("content", "") for c in all_chunks]
             embeddings = await provider.embed(chunk_texts)
 
-            await _step(JobStatus.processing, 70, "Upserting vectors to Pinecone…")
-
+            # Build vectors + plain chunk payloads (NOT ORM objects — no session
+            # is open yet). Vector IDs are DETERMINISTIC on (document_id, index)
+            # so a retry re-upserts the same IDs instead of creating duplicates.
             vectors: list[dict] = []
-            chunk_records: list[KnowledgeChunk] = []
-            vector_ids: list[str] = []
+            chunk_payloads: list[dict] = []
 
             for idx, (chunk, embedding) in enumerate(zip(all_chunks, embeddings)):
-                vector_id = str(uuid.uuid4())
-                vector_ids.append(vector_id)
+                vector_id = f"{doc_uuid}:{idx}"
 
                 metadata = {
-                    "document_id": str(doc.id),
-                    "document_name": doc.display_name,
-                    "document_type": doc.document_type,
-                    "content_usage_type": doc.content_usage_type,
+                    "document_id": str(doc_uuid),
+                    "document_name": display_name,
+                    "document_type": document_type,
+                    "content_usage_type": usage_type,
                     "chapter": hardcoded_chapter,
-                    "topic": chunk.get("topic") or doc.topic or "",
-                    "subtopic": chunk.get("subtopic") or doc.subtopic or "",
+                    "topic": chunk.get("topic") or doc_topic or "",
+                    "subtopic": chunk.get("subtopic") or doc_subtopic or "",
                     "language": chunk.get("language", "nepali_english_mixed"),
                     "content_type": chunk.get("content_type", "concept_explanation"),
                     "quality_status": "processed",
@@ -486,45 +577,135 @@ class KnowledgeProcessingAgent:
                     "metadata": metadata,
                 })
 
-                chunk_records.append(KnowledgeChunk(
-                    document_id=doc.id,
-                    chunk_index=idx,
-                    content=chunk.get("content", ""),
-                    content_type=chunk.get("content_type"),
-                    chapter=hardcoded_chapter,
-                    topic=chunk.get("topic") or doc.topic,
-                    subtopic=chunk.get("subtopic") or doc.subtopic,
-                    language=chunk.get("language", "nepali_english_mixed"),
-                    pinecone_vector_id=vector_id,
-                    quality_status="processed",
-                    chunk_metadata=metadata,
-                ))
+                chunk_payloads.append({
+                    "chunk_index": idx,
+                    "content": chunk.get("content", ""),
+                    "content_type": chunk.get("content_type"),
+                    "topic": chunk.get("topic") or doc_topic,
+                    "subtopic": chunk.get("subtopic") or doc_subtopic,
+                    "language": chunk.get("language", "nepali_english_mixed"),
+                    "pinecone_vector_id": vector_id,
+                    "metadata": metadata,
+                })
 
+            # ── PHASE 3: SAVE (fresh sessions, idempotent, batched) ─────────────
+            # Idempotency: a Celery retry can re-enter this phase after a prior run
+            # already wrote some vectors/chunks. Clear any prior chunks for this
+            # document (and their Pinecone vectors) before writing the new set, so
+            # retries never duplicate. Deterministic vector IDs additionally cause
+            # same-index re-upserts to overwrite rather than accumulate.
+            await _step(JobStatus.processing, 70, "Clearing any prior partial results…")
+
+            # Each DB unit below opens its OWN fresh session and is idempotent, so
+            # `_db_op_with_retry` can re-run it on a connection the server dropped
+            # mid-operation (which pool_pre_ping cannot prevent on this network).
+
+            # Clear any chunks from a prior partial/failed run; return their vector
+            # ids so we can also purge them from Pinecone. Re-running just finds no
+            # rows the second time — safe.
+            async def _clear_old_chunks() -> list[str]:
+                async with AsyncSessionLocal() as clean_db:
+                    try:
+                        old_res = await clean_db.execute(
+                            select(KnowledgeChunk).where(KnowledgeChunk.document_id == doc_uuid)
+                        )
+                        old_chunks = old_res.scalars().all()
+                        ids = [c.pinecone_vector_id for c in old_chunks if c.pinecone_vector_id]
+                        for c in old_chunks:
+                            await clean_db.delete(c)
+                        await clean_db.commit()
+                        return ids
+                    except Exception:
+                        await clean_db.rollback()
+                        raise
+
+            old_vector_ids = await _db_op_with_retry(_clear_old_chunks, label="clear old chunks")
+
+            if old_vector_ids:
+                await asyncio.to_thread(get_pinecone().delete_vectors, old_vector_ids)
+
+            await _step(JobStatus.processing, 78, "Upserting vectors to Pinecone…")
             await asyncio.to_thread(get_pinecone().upsert_vectors, vectors)
 
             await _step(JobStatus.processing, 88, "Saving chunks to database…")
 
-            db.add_all(chunk_records)
-            doc.chunk_count = len(chunk_records)
-            doc.processing_status = "completed"
-            await db.commit()
+            # Insert chunks in small batches, each its own transaction, on a FRESH
+            # short-lived session — so the final write never depends on a
+            # connection that has been idle through the long AI work above. The
+            # whole insert is idempotent (old chunks were just cleared and vector
+            # ids are deterministic), so a mid-operation drop retries cleanly.
+            BATCH_SIZE = 100
 
-            # Use a fresh session for the completion update — the main data
-            # session may be in a dirty state after a long run.
-            async with AsyncSessionLocal() as done_db:
-                await update_job(
-                    done_db,
-                    job_uuid,
-                    status=JobStatus.completed,
-                    progress=100,
-                    step="Processing complete",
-                    output={"document_id": str(doc.id), "chunk_count": len(chunk_records)},
-                )
-            logger.info("Knowledge document %s processed: %d chunks", document_id, len(chunk_records))
+            async def _save_chunks() -> None:
+                async with AsyncSessionLocal() as save_db:
+                    try:
+                        # Re-entrancy guard for a retry that already committed some
+                        # batches before the connection dropped: start clean.
+                        existing = await save_db.execute(
+                            select(KnowledgeChunk.id).where(KnowledgeChunk.document_id == doc_uuid).limit(1)
+                        )
+                        if existing.scalar_one_or_none() is not None:
+                            await save_db.execute(
+                                KnowledgeChunk.__table__.delete().where(
+                                    KnowledgeChunk.document_id == doc_uuid
+                                )
+                            )
+                            await save_db.commit()
+
+                        for start in range(0, len(chunk_payloads), BATCH_SIZE):
+                            batch = chunk_payloads[start : start + BATCH_SIZE]
+                            save_db.add_all([
+                                KnowledgeChunk(
+                                    document_id=doc_uuid,
+                                    chunk_index=p["chunk_index"],
+                                    content=p["content"],
+                                    content_type=p["content_type"],
+                                    chapter=hardcoded_chapter,
+                                    topic=p["topic"],
+                                    subtopic=p["subtopic"],
+                                    language=p["language"],
+                                    pinecone_vector_id=p["pinecone_vector_id"],
+                                    quality_status="processed",
+                                    chunk_metadata=p["metadata"],
+                                )
+                                for p in batch
+                            ])
+                            await save_db.commit()
+
+                        # Flip the document to completed in the same fresh session.
+                        doc_res = await save_db.execute(
+                            select(KnowledgeDocument).where(KnowledgeDocument.id == doc_uuid)
+                        )
+                        doc_row = doc_res.scalar_one_or_none()
+                        if doc_row:
+                            doc_row.chunk_count = len(chunk_payloads)
+                            doc_row.processing_status = "completed"
+                            await save_db.commit()
+                    except Exception:
+                        await save_db.rollback()
+                        raise
+
+            await _db_op_with_retry(_save_chunks, label="save chunks")
+
+            # Fresh session for the completion update.
+            async def _mark_done() -> None:
+                async with AsyncSessionLocal() as done_db:
+                    await update_job(
+                        done_db,
+                        job_uuid,
+                        status=JobStatus.completed,
+                        progress=100,
+                        step="Processing complete",
+                        output={"document_id": str(doc_uuid), "chunk_count": len(chunk_payloads)},
+                    )
+
+            await _db_op_with_retry(_mark_done, label="mark job done")
+            logger.info("Knowledge document %s processed: %d chunks", document_id, len(chunk_payloads))
 
         except Exception as exc:
             logger.exception("Knowledge processing failed for document %s", document_id)
-            try:
+
+            async def _mark_failed() -> None:
                 async with AsyncSessionLocal() as fresh_db:
                     res = await fresh_db.execute(
                         select(KnowledgeDocument).where(KnowledgeDocument.id == doc_uuid)
@@ -534,5 +715,9 @@ class KnowledgeProcessingAgent:
                         doc_ref.processing_status = "failed"
                         await fresh_db.commit()
                     await update_job(fresh_db, job_uuid, status=JobStatus.failed, error=str(exc))
+
+            try:
+                await _db_op_with_retry(_mark_failed, attempts=3, label="mark failed")
             except Exception as cleanup_exc:
                 logger.error("Failed to mark job/document as failed: %s", cleanup_exc)
+            raise
