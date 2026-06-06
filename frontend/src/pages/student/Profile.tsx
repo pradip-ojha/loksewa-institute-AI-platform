@@ -3,7 +3,7 @@ import { useAuth } from "../../context/AuthContext";
 import api from "../../services/api";
 
 export function StudentProfile() {
-  const { user, logout } = useAuth();
+  const { user } = useAuth();
   const [currentPw, setCurrentPw] = useState("");
   const [newPw, setNewPw] = useState("");
   const [confirmPw, setConfirmPw] = useState("");

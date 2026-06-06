@@ -12,7 +12,6 @@ export function AdminStudents() {
   const [showCreate, setShowCreate] = useState(false);
   const [showEdit, setShowEdit] = useState<User | null>(null);
   const [showReset, setShowReset] = useState<User | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   const load = async () => {
     setLoading(true);

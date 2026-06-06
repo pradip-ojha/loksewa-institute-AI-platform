@@ -14,12 +14,12 @@ import { AdminMCQTests } from "./pages/admin/MCQTests";
 import { AdminSubjectiveTests } from "./pages/admin/SubjectiveTests";
 import { AdminVideoTutor } from "./pages/admin/VideoTutor";
 import { AdminSkillLayer } from "./pages/admin/SkillLayer";
+import { AdminAnalytics } from "./pages/admin/Analytics";
 import { StudentDashboard } from "./pages/student/Dashboard";
 import { StudentMCQTests } from "./pages/student/StudentMCQTests";
 import { StudentSubjectiveTests } from "./pages/student/StudentSubjectiveTests";
 import { StudentVideoTutor } from "./pages/student/StudentVideoTutor";
 import { StudentProfile } from "./pages/student/Profile";
-import { AdminPlaceholder } from "./pages/admin/Placeholder";
 import { StudentPlaceholder } from "./pages/student/Placeholder";
 
 function App() {
@@ -45,7 +45,7 @@ function App() {
               <Route path="video-tutor" element={<AdminVideoTutor />} />
               <Route path="subjective" element={<AdminSubjectiveTests />} />
               <Route path="skill-layer" element={<AdminSkillLayer />} />
-              <Route path="analytics" element={<AdminPlaceholder title="Analytics" description="View platform analytics — available in Stage 10" />} />
+              <Route path="analytics" element={<AdminAnalytics />} />
             </Route>
           </Route>
 

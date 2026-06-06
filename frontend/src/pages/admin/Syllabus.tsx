@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { syllabusService, type SyllabusTree } from "../../services/syllabus";
 
 type SyllabusTypeKey = "objective" | "subjective";

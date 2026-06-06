@@ -6,6 +6,7 @@ import type {
   SubjectiveTest, SubjectiveTestDetail, Submission,
 } from "../../services/subjectiveTests";
 import { getErrorMessage } from "../../utils/error";
+import { SubjectiveAnalyticsView } from "./Analytics";
 
 type Tab = "create" | "tests" | "submissions" | "analytics";
 
@@ -66,7 +67,7 @@ export function AdminSubjectiveTests() {
       {tab === "tests" && <TestListTab />}
       {tab === "submissions" && <SubmissionsTab />}
       {tab === "analytics" && (
-        <p className="text-sm text-gray-500">Subjective analytics arrive in a later stage.</p>
+        <SubjectiveAnalyticsView />
       )}
     </div>
   );

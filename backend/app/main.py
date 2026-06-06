@@ -17,6 +17,8 @@ from app.modules.mcq_tests.router import router as mcq_tests_router
 from app.modules.subjective.router import router as subjective_router
 from app.modules.video.router import router as video_router
 from app.modules.skill_layer.router import router as skill_router
+from app.modules.dashboard.router import router as dashboard_router
+from app.modules.analytics.router import router as analytics_router
 from app.seeds.admin_seed import create_default_admin
 from app.seeds.syllabus_seed import seed_syllabus
 from app.modules.skill_layer.service import seed_default_skills
@@ -82,6 +84,8 @@ app.include_router(mcq_tests_router, prefix="/api")
 app.include_router(subjective_router, prefix="/api")
 app.include_router(video_router, prefix="/api")
 app.include_router(skill_router, prefix="/api")
+app.include_router(dashboard_router, prefix="/api")
+app.include_router(analytics_router, prefix="/api")
 
 
 @app.get("/health")

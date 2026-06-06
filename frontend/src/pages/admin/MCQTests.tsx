@@ -6,6 +6,7 @@ import type { Blueprint, TestSet, TestSetPreview, TopicDistEntry } from "../../s
 import { syllabusService } from "../../services/syllabus";
 import type { ChapterNode } from "../../services/syllabus";
 import { getErrorMessage } from "../../utils/error";
+import { MCQAnalyticsView } from "./Analytics";
 
 type Tab = "create" | "sets" | "active" | "attempts" | "analytics";
 
@@ -432,12 +433,8 @@ export function AdminMCQTests() {
       {tab === "sets" && <SetsTable sets={draftSets} onPreview={handlePreview} onAction={handleSetAction} />}
       {tab === "active" && <SetsTable sets={activeSets} onPreview={handlePreview} onAction={handleSetAction} />}
 
-      {tab === "attempts" && (
-        <p className="text-sm text-gray-500">Student attempt records and per-question statistics arrive with Analytics in Stage 7.</p>
-      )}
-      {tab === "analytics" && (
-        <p className="text-sm text-gray-500">MCQ analytics (scores, topic-wise performance, weak subtopics) arrive in Stage 7.</p>
-      )}
+      {tab === "attempts" && <MCQAnalyticsView />}
+      {tab === "analytics" && <MCQAnalyticsView />}
 
       {preview && <PreviewModal preview={preview} onClose={() => setPreview(null)} />}
     </div>

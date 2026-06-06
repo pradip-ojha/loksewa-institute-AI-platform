@@ -608,6 +608,33 @@ Total submissions, avg/highest/lowest marks, student-wise marks, question-wise a
 ### Video Tutor Analytics
 Total views, total questions, most asked questions, unclear concepts, student-wise questions, low-confidence answers.
 
+### Implementation notes (`backend/app/modules/analytics/` + `backend/app/modules/dashboard/`, Phase 11)
+Both are **read-only aggregation** modules (no new tables, no migration) — they query the existing
+MCQ / subjective / video / jobs tables. All endpoints are `require_admin`.
+- **Dashboard** (`dashboard/service.py` + `router.py`): `GET /api/admin/dashboard/stats` returns the headline
+  counts (students, knowledge docs, approved MCQs, active MCQ sets, subjective tests, videos, pending/failed
+  jobs) **plus** a `recent_activity` feed built from the latest `processing_jobs` (job type → friendly
+  `{type, title, status, created_at}`). Counts are guarded (`_safe_scalar`) so a partial migration degrades to
+  0 instead of 500-ing. (This endpoint moved here from `users/router.py`, where the old copy had a stale
+  `video_tutor.models` import that silently zeroed the video count — now uses `app.modules.video.models`.)
+- **Analytics** (`analytics/service.py` + `router.py`, prefix `/api/admin/analytics`):
+  - `GET /mcq/overview` — score summary (avg/high/low %), student-wise results, topic-wise performance,
+    weak subtopics (<60%, ≥2 samples), and hardest questions (lowest correct %). Computed over **submitted**
+    attempts only, across all students.
+  - `GET /subjective/overview` — submission/marks summary, low-confidence count, checked-PDF count, per-test
+    breakdown, and global common mistakes (most-missed points). Reads the reviewed `evaluation_data` JSON
+    (deduped to the latest checked sheet per student/test); there is no separate per-question marks table.
+  - `GET /subjective/tests/{test_id}` — per-test drill-down: question-wise average marks, student marks,
+    common mistakes.
+  - `GET /video` — per-video views / unique viewers / questions / low-confidence counts.
+  - `GET /video/{video_id}` — views, questions, most-asked questions (normalized), unclear concepts
+    (low-confidence questions grouped by detected topic), per-student question counts, low-confidence answers.
+  - Low-confidence threshold = `0.6` (`analytics.service.LOW_CONFIDENCE`).
+- **Frontend:** admin `pages/admin/Analytics.tsx` (tabs MCQ | Subjective | Video) exports
+  `MCQAnalyticsView` / `SubjectiveAnalyticsView` / `VideoAnalyticsView`, reused inline by the MCQ Tests
+  (`attempts` + `analytics` tabs) and Subjective Tests (`analytics` tab) pages. Service
+  `frontend/src/services/analytics.ts`. Dashboard page already consumed `recent_activity`.
+
 ---
 
 ## 16. Admin Interface (Desktop-First)
@@ -924,7 +951,7 @@ DEFAULT_ADMIN_NAME=Institute Admin
 ✅ Phase 8: Answer Checking Pipeline (quality check → high-quality page images → full line-level extraction → question-wise reconstruction → evaluation against admin config → GPT-5.5 reviewer/verification pass → checked PDF)
 ✅ Phase 9: Video Tutor (upload → FFmpeg audio extract/chunk → gpt-4o-transcribe → clean → timeline segments → syllabus mapping → full summary → slide labels; timeline-first synchronous Q&A with always-on lecture summary, segment + topic/subtopic routing, filtered knowledge support)
 ✅ Phase 10: Skill Layer (seed skills, synchronous Skill Builder chat, draft → approve → activate, global scope, agent integration)
-Phase 11: Analytics & Dashboard Completion
+✅ Phase 11: Analytics & Dashboard Completion (read-only admin analytics for MCQ/subjective/video + dashboard stats with recent-activity feed)
 Phase 12: Hardening (error handling, security, logging, deployment)
 
 ---
