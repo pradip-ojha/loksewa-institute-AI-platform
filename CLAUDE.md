@@ -296,17 +296,17 @@ Test Name, Total Time, Number of Sets, Custom Instruction, Topic/Subtopic Distri
 Status: draft / active / archived. Admin: Preview / Activate / Deactivate / Delete.
 
 ### Implementation notes (`backend/app/modules/mcq_tests/`)
-Implemented in Stage 2. Module layout mirrors `mcq/`: `models.py`, `schemas.py`, `service.py`, `router.py`; tables in migration `009_mcq_tests`.
+Module mirrors `mcq/` (`models/schemas/service/router`); tables in migration `009_mcq_tests`.
 
-- **Blueprint** carries `topic_distribution` (`[{topic, subtopic|null, count}]`, count = questions per set), optional `difficulty_distribution` (`{easy, medium, hard}`), `num_sets`, `total_time_minutes`, `custom_instruction`, a `status` lifecycle (`draft → generating → generated | shortage`), and `generation_result` (JSONB; sets_created or the shortage breakdown).
-- **Generation runs as a Celery job** `mcq_test_set_generation` on `kvi_ai_mcq` (`workers/tasks/mcq_test_tasks.py`), driven by `service.generate_sets`. Created via `POST /blueprints` (returns a `JobOut`); re-runnable via `POST /blueprints/{id}/regenerate`.
-- **Planning:** topic_distribution is authoritative for counts; difficulty_distribution is split *within* each topic bucket proportionally (never adds questions). Validation rejects a difficulty total exceeding the per-set total.
-- **Cross-set uniqueness:** per leaf bucket `(topic, subtopic, complexity)` the generator pulls `count × num_sets` distinct approved questions, shuffles, and deals them round-robin into the sets, so no question repeats across sets. Questions claimed by an earlier bucket are excluded from later buckets.
-- **Shortage:** if any bucket can't supply `count × num_sets` approved questions, NOTHING is created — blueprint status becomes `shortage` and `generation_result.shortages` lists `{topic, subtopic, complexity, required, available, shortage}`. The job still completes (a reported shortage is a valid outcome, not a failure). No auto-borrow.
-- **Student attempts:** one attempt per `(set, student)` enforced by a DB unique constraint (`no retake`). `start` (`get_or_create_attempt`) is **race-safe**: a duplicate/concurrent start that loses the unique-constraint insert is caught (`IntegrityError` → rollback → re-fetch) and resumes the same attempt instead of 500ing. `start` returns questions with NO answers/explanations; a submitted attempt cannot be re-started (409). An in-progress attempt can always be resumed (Continue) even if the set was later deactivated. `submit` grades (no negative marking, score = correct count), is idempotent (a second submit returns the stored result), and returns the full result with correct answers + explanations.
-- **Student endpoints (own data only, `require_student`):** `GET /student/mcq-tests` returns each test with the student's own `attempt_status` (`none` | `in_progress` | `submitted`) → Start / Continue / View Result; `GET /student/mcq-tests/attempts/{id}/result` (ownership-checked); `GET /student/mcq-tests/history` (submitted attempts, newest first); `GET /student/mcq-tests/analytics` (overall accuracy, average/best score, per-topic performance, weak topics <60% — all scoped to the calling student).
-- Multi-step writes use the flush-then-single-`commit()` pattern (atomic), matching the rest of the codebase; the unused `database.transaction()` helper is avoided because it conflicts with the session's autobegun read transaction.
-- Frontend: admin `pages/admin/MCQTests.tsx` (Create Blueprint / Generated Sets / Active Tests + Attempts/Analytics placeholders for Stage 7), student `pages/student/StudentMCQTests.tsx` (Tests / Results / Analytics tabs; Start/Continue/View-Result buttons with duplicate-start guard; timer with auto-submit, question palette, immediate result + answer review). Service: `frontend/src/services/mcqTests.ts`.
+- **Blueprint** fields: `topic_distribution` (`[{topic, subtopic|null, count}]`, count = per-set), optional `difficulty_distribution` (`{easy,medium,hard}`), `num_sets`, `total_time_minutes`, `custom_instruction`, `status` (`draft → generating → generated | shortage`), `generation_result` (JSONB: sets_created or shortage breakdown).
+- **Generation = Celery job** `mcq_test_set_generation` on `kvi_ai_mcq` (`workers/tasks/mcq_test_tasks.py` → `service.generate_sets`). Created via `POST /blueprints` (returns `JobOut`); re-run via `POST /blueprints/{id}/regenerate`.
+- **Planning:** topic_distribution is authoritative for counts; difficulty split *within* each topic bucket proportionally (never adds questions). Validation rejects difficulty total > per-set total.
+- **Cross-set uniqueness:** per leaf bucket `(topic, subtopic, complexity)` pull `count × num_sets` distinct approved questions, shuffle, deal round-robin into sets → no repeats across sets. Questions claimed by an earlier bucket are excluded from later ones.
+- **Shortage:** if any bucket can't supply `count × num_sets`, NOTHING is created — status `shortage`, `generation_result.shortages` = `{topic, subtopic, complexity, required, available, shortage}`. Job still completes (valid outcome). No auto-borrow.
+- **Student attempts:** one per `(set, student)` via DB unique constraint (no retake). `start`/`get_or_create_attempt` is race-safe (`IntegrityError → rollback → re-fetch` resumes same attempt) and returns questions with NO answers/explanations; submitted attempt can't restart (409); in-progress always resumable (Continue) even if set later deactivated. `submit` grades (no negative marking, score = correct count), idempotent (second submit returns stored result), returns full result with correct answers + explanations.
+- **Student endpoints (own data, `require_student`):** `GET /student/mcq-tests` (each test + own `attempt_status` none|in_progress|submitted); `GET .../attempts/{id}/result` (ownership-checked); `GET .../history`; `GET .../analytics` (accuracy, avg/best score, per-topic, weak topics <60% — all student-scoped).
+- Multi-step writes use flush-then-single-`commit()` (atomic). `database.transaction()` helper avoided (conflicts with session's autobegun read transaction).
+- Frontend: admin `pages/admin/MCQTests.tsx`, student `pages/student/StudentMCQTests.tsx` (timer + auto-submit, palette, immediate result/review), service `frontend/src/services/mcqTests.ts`.
 
 ---
 
@@ -332,16 +332,29 @@ Status: draft / active / archived.
 ### 11.2 Question Paper Format
 Must have: clear question numbering + marks per question. Example: `Q1. ... [8 marks]` or `प्रश्न नं. १ ... [८ अंक]`
 
-### 11.3 Question-Specific Checking Skills
-Generated automatically when test is created. No admin approval needed. These are a **pre-computed
-checking guide per question**, cached and used by the checker as enrichment on top of the live admin
-test config at check time (not a replacement for it).
+### 11.3 Question-Specific Checking Skills (multi-agent, locked at test creation)
+Generated automatically when the test is created (no admin approval). This is the **one place** the heavy
+resources are read: the system detects each question's topic/subtopic, fetches supporting notes/book/rubric
+chunks (best-effort, from the subjective knowledge set via Pinecone), and **distills** them into a focused,
+practical examiner CHECKING GUIDE per question. The per-sheet checker then reuses these **locked** skills and
+never re-reads the large resources — keeping checking consistent and attention-focused.
 
-Inputs: question paper, model answer, sample marked answer (if any), rubric (or default), subjective
-notes, book content, subjective syllabus, custom instruction, active copy-checking skill.
+Two GPT-5.5 agents with a bounded loop (max 2 iterations):
+- **SkillGenerator** — builds the detailed guide per question.
+- **SkillEvaluator** — lenient QA: passes a guide if it is operationally usable; fails ONLY for serious
+  issues (wrong-question mapping, qnum/max-marks mismatch, breakdown ≠ full marks, major missing areas, too
+  vague, rubric/admin ignored, numerical lacking formula/steps, wrong topic mapping, duplicate/missing).
+- Iteration 1 generate → evaluate; weak/failed guides only are improved once (iteration 2) → re-evaluate →
+  lock. Residual minor issues lock as `passed_with_warning` (internal audit; no admin gate, never blocks).
 
-Output per question: required points, marks distribution, partial marking rules, expected keywords,
-common mistakes, feedback style, annotation rules, confidence hints.
+Inputs: question paper, model answer, sample marked answer (if any), rubric (or default), detected
+topic/subtopic, fetched topic/subtopic resources, custom instruction, active skill.
+
+Output per question (`skill_json`): question intent, topic/subtopic, max marks, expected answer points,
+sample answer fragments, acceptable alternative wording, marks breakdown (sums to full marks), partial
+marking rules, common mistakes, serious wrong statements, annotation-worthy mistakes, feedback + strictness
+guidance, plus theory-specific and numerical-specific (formula/steps/calculation/final-answer) guidance.
+It is a CHECKING GUIDE for marking many varied answers, not a copied model answer.
 
 ### 11.4 Checking Inputs & Priority
 The checker always reads the live admin-configured test. When guidance conflicts, priority is:
@@ -374,47 +387,66 @@ Student uploads handwritten answer-sheet PDF/image
 → Quality check (blur, brightness, tilt, resolution, orientation)
 → If low quality: ask reupload (max 2 attempts), then continue with warning
 → Convert pages to HIGH-QUALITY images for GPT-5.5 vision
-→ Full line-level extraction (GPT-5.5 vision): per-line text + coordinates
-→ Question-wise reconstruction (backend groups lines by question number + page context)
-→ Load admin test config (paper, marks, rubric/default, admin instructions) + question-specific guide
-→ Evaluate each reconstructed answer → marks (capped at full marks) + feedback + annotation instructions
-→ Reviewer / verification pass (second GPT-5.5 call): fix fairness, enforce max marks, prune annotations
-→ Python annotates PDF (PyMuPDF + Pillow) from the reviewed instructions
-→ Store checked PDF in R2
+→ Question-level extraction (GPT-5.5 vision): per-question text + question bbox + page size + continuation
+→ Backend assembles whole-question answers across pages
+→ Load admin test config (paper, marks, rubric/default, admin instructions) + LOCKED checking skills
+  (NO large notes/books re-sent — the locked skill already distilled them)
+→ Checker decides WHAT is wrong → marks (capped at full marks) + feedback + missing points + annotation targets (by exact text)
+→ Reviewer / verification pass (second GPT-5.5 call): fix fairness, enforce max marks, prune annotation targets
+→ For each annotation target: vision Locator finds WHERE (natural underline path + comment box)
+→ Validator decides WHETHER geometry is safe (smooth / soft-mark / feedback-only fallback)
+→ Human-like renderer draws the checked PDF (curved baseline underlines, hand-style comments) → R2
 → Student sees result + checked PDF immediately
 ```
 
-### Extraction (full line-level, used from the start for demo quality)
-The extractor captures, per line: page number, question number (if visible/inferable), extracted
-handwritten text, line-level coordinates. It supports **Nepali / English / mixed** answers, and captures
-formulas, tables, diagrams, and numerical work where visible.
+### Extraction (question-level by default)
+The extractor captures, per question on a page: page number, question number, the full transcribed answer
+text, a question-level bounding box, page size, and a continuation flag. It supports **Nepali / English /
+mixed** answers and captures formulas/tables/numerical work. It does NOT do per-line geometry for every line
+— exact annotation geometry is found later, on demand, only for the few wrong items that get marked.
 
 The extractor MUST NOT: check answers, correct grammar, rewrite text, or summarize student answers — it
-only transcribes what is on the page with coordinates. Checking happens later.
+only transcribes what is on the page, preserving wording. Checking happens later.
 
-### Extraction Output (per question)
+### Extraction Output (per page)
 ```json
 {
-  "qid": "Q1",
-  "lines": [{"id": "L1", "text": "...", "bbox": {"x": 120, "y": 430, "w": 620, "h": 32}}],
-  "confidence": 0.82
-}
-```
-
-### Evaluation Output (compact)
-```json
-{
-  "qid": "Q1", "m": 6, "fm": 8,
-  "fb": "Good but missing example.",
-  "mistakes": ["No example provided."],
-  "ann": [
-    {"t": "mark", "text": "6/8", "pos": "auto"},
-    {"t": "comment", "text": "Add example.", "pos": "margin"},
-    {"t": "underline", "line": "L4", "c": "Incomplete."}
+  "page": 1,
+  "page_size": [1000, 1400],
+  "answers": [
+    {"question_number": "Q1", "answer_text": "...", "question_bbox": [80, 120, 1000, 640], "continues": false}
   ],
-  "confidence": 0.78
+  "page_confidence": 0.82
 }
 ```
+
+### Evaluation Output (checker / reviewer)
+```json
+{
+  "total_awarded_marks": 16, "total_full_marks": 25,
+  "overall_summary": "Short overall summary.",
+  "question_results": [
+    {
+      "question_number": "1", "page_numbers": [1], "awarded_marks": 6, "max_marks": 10,
+      "feedback": "Good but missing example.", "missing_points": ["export promotion"], "confidence": 0.78,
+      "annotation_targets": [
+        {"page_number": 1, "question_number": "1", "target_text": "exact wrong phrase",
+         "comment_text": "Add example.", "annotation_action": "underline_with_comment"}
+      ]
+    }
+  ]
+}
+```
+
+### Annotation Locator + Validator + Renderer
+The checker emits annotation **targets by exact text** (WHAT is wrong), never coordinates. For each
+reviewed target a GPT-5.5 **vision Locator** returns WHERE it sits — a natural underline **path** (multiple
+ordered baseline points, not two bbox endpoints) plus a safe comment box. A pure-Python **Validator**
+(`processing/annotation_geometry.py`) decides WHETHER the geometry is safe: valid → use; noisy → smooth;
+bad path but good text box → short soft mark on the box baseline; both unreliable → no exact mark
+(question-area feedback only); never draw at a random/low-confidence spot. The **Renderer**
+(`processing/annotation.py`) draws the validated plan in a human-like red-pen style (Catmull-Rom curved
+underline with jitter + slight stroke variation; hand-style rotated comments/marks; uncrowded).
 
 ### Reviewer / Verification Pass
 A second GPT-5.5 pass runs after evaluation for demo-quality reliability. The reviewer:
@@ -448,21 +480,22 @@ processing status. Internal JSON (extraction/evaluation payloads) is not exposed
 (debug-only).
 
 ### Production Note
-This demo is intentionally **quality-first**: full line-level extraction + a reviewer pass on every
-sheet. A later production optimization may switch to question-level extraction first, falling back to
-line-level only when exact annotation is needed, and fewer AI calls for lower cost. For this demo,
-prioritize quality and client presentation.
+This demo is intentionally **quality-first**: question-level extraction + a reviewer pass + an on-demand
+vision locator/validator for natural annotation geometry on every sheet. Cost is secondary to quality and
+client presentation here.
 
 No follow-up chat after checking.
 
-### Implementation notes (`backend/app/modules/subjective/`, Stage 3)
-Module mirrors `mcq_tests/` (`models.py`, `schemas.py`, `service.py`, `router.py`); tables in migration `010_subjective`. Two orchestrated Celery jobs on `kvi_ai_subjective` (`workers/tasks/subjective_tasks.py`):
-- **`generate_test_skills`** (`subjective_test_processing`) — created by `POST /admin/subjective/tests` (multipart: paper required; model answer / sample / rubric optional). Extracts questions+marks from the paper (`QuestionPaperAgent`, with a vision-OCR fallback for scanned papers via `_resolve_text`), persists `subjective_questions` (their `marks` are the full-marks source of truth; `total_marks` is derived from them when the paper has marks), then generates one `question_specific_checking_skills` row per question (`CheckingSkillAgent`). Sets `skill_generation_status=completed`; a test can only be **activated** once skills are completed and it has ≥1 question.
-- **`check_answer_sheet`** (`answer_sheet_checking`) — created by `POST /student/subjective/tests/{id}/upload-answer` (context `answer-sheets`; re-upload increments `upload_attempt_number`, capped at 2). One job runs: render pages to PNG (`processing/pdf_tools`) → quality gate (`processing/image_quality`, OpenCV; **poor + attempt<2 ⇒ status `needs_reupload`, job completes, no AI spent**) → full line-level extraction per page (`AnswerExtractionAgent.extract_page`, vision, pixel bboxes) → question-wise reconstruction (`service.reconstruct_questionwise`, digit-tolerant qid match + unlabeled-line carry-forward) → evaluation against live test config + per-question guide (`AnswerEvaluationAgent`, default rubric constant when no rubric file) → **reviewer/verification pass** (`AnswerReviewerAgent`) → annotate pages (`processing/annotation`, Pillow) + assemble checked PDF (`pdf_tools.build_pdf_from_images`) → upload to `answer-sheets/checked/`. `service.clamp_marks` hard-caps each question at its full marks after BOTH the eval and review passes. `answer_evaluations` stores reviewed `evaluation_data` + `initial_evaluation_data` + `reviewed`/`review_notes`.
-- **Uniform rasterization:** every page (PDF or image) becomes a high-DPI PNG so extraction coords, evaluation line refs, and annotation drawing share one pixel space; the checked PDF is rebuilt from annotated PNGs.
-- **Agents** (`backend/app/ai/agents/`): `question_paper_agent`, `checking_skill_agent`, `answer_extraction_agent`, `answer_evaluation_agent`, `answer_reviewer_agent` — all use `get_provider("reasoning")` (GPT-5.5), `audit_ctx`, and an active skill via `get_active_skill_text` (defaults seeded in `skill_layer/service._DEFAULT_SKILLS`).
-- **Result/UX:** student result (`GET /student/subjective/tests/{id}/result`) returns total + per-question marks + feedback + checked-PDF signed URL, never internal JSON. Frontend: admin `pages/admin/SubjectiveTests.tsx` (Create Test / Test List / Submissions / Analytics-placeholder), student `pages/student/StudentSubjectiveTests.tsx` (list → upload → result, with quality-driven re-upload), service `frontend/src/services/subjectiveTests.ts`.
-- Knowledge-layer enrichment is intentionally NOT used for subjective checking in this stage — checking is grounded in the admin-configured test (paper, model answer, rubric/default, instruction).
+### Implementation notes (`backend/app/modules/subjective/`, Stage 3; checking v2 in migration `013_subjective_checking_v2`)
+Module mirrors `mcq_tests/`; base tables in migration `010_subjective`. Migration `013` adds
+`subjective_questions.topic/subtopic`, `question_specific_checking_skills.evaluation_status/evaluation_notes/iterations`,
+and `pdf_annotations.locator_plan`. Two orchestrated Celery jobs on `kvi_ai_subjective` (`workers/tasks/subjective_tasks.py`):
+- **`generate_test_skills`** (`subjective_test_processing`) — from `POST /admin/subjective/tests` and `POST .../{id}/regenerate-skills` (regenerate replaces questions + skills). Extracts questions+marks (`QuestionPaperAgent`, vision-OCR fallback via `_resolve_text`), persists `subjective_questions` (`marks` = full-marks source of truth), detects per-question topic/subtopic (`SubjectiveTopicRouterAgent`, validated vs the live subjective syllabus tree via `video.service.get_chapter_tree`), fetches supporting knowledge best-effort (`service.fetch_question_resources`, Pinecone `content_usage_type="subjective"`), then runs the multi-agent skill loop: `SkillGeneratorAgent` → `SkillEvaluatorAgent` → improve weak skills once (max 2 iterations) → lock one `question_specific_checking_skills` row per question with `skill_json` + `evaluation_status`/`evaluation_notes`/`iterations`. Sets `skill_generation_status=completed`; test **activates** only once skills completed and ≥1 question. **Knowledge is read ONLY here**, never during per-sheet checking.
+- **`check_answer_sheet`** (`answer_sheet_checking`) — from `POST /student/subjective/tests/{id}/upload-answer` (re-upload increments `upload_attempt_number`, cap 2). One job: render pages → PNG (`processing/pdf_tools`) → quality gate (`processing/image_quality`, OpenCV; **poor + attempt<2 ⇒ `needs_reupload`, no AI spent**) → **question-level** extraction per page (`AnswerExtractionAgent.extract_page`, vision) → assemble whole-question answers (`service.assemble_questionwise`, digit-tolerant qid match + `continues` carry-forward) → **checker** using locked skills + live config only, no big notes (`AnswerEvaluationAgent`, default-rubric constant when no rubric file) → **reviewer pass** (`AnswerReviewerAgent`) → per reviewed annotation target: vision **locator** (`AnnotationLocatorAgent`) → geometry **validator** (`processing/annotation_geometry.validate_and_smooth`) → human-like **renderer** (`processing/annotation`) + assemble checked PDF (`pdf_tools.build_pdf_from_images`) → upload `answer-sheets/checked/`. `service.clamp_marks` hard-caps each question (`question_results[].awarded_marks`/`max_marks`) after BOTH passes. `answer_evaluations` stores reviewed `evaluation_data` + `initial_evaluation_data` + `reviewed`/`review_notes`; `pdf_annotations` stores `annotation_instructions` (draw commands) + `locator_plan` (locator/validation audit). Per-question/per-page target caps keep the PDF uncrowded.
+- **Uniform rasterization:** every page (PDF or image) → high-DPI PNG so extraction bboxes, locator geometry, and annotation share one pixel space; checked PDF rebuilt from annotated PNGs.
+- **Agents** (`backend/app/ai/agents/`): `question_paper_agent`, `subjective_topic_router_agent`, `skill_generator_agent`, `skill_evaluator_agent`, `answer_extraction_agent`, `answer_evaluation_agent`, `answer_reviewer_agent`, `annotation_locator_agent` — all use `get_provider("reasoning")`, `audit_ctx`, active skill via `get_active_skill_text`. (`checking_skill_agent` was replaced by `skill_generator_agent`.)
+- **Result/UX:** `GET /student/subjective/tests/{id}/result` returns total + per-question marks + feedback + checked-PDF signed URL, never internal JSON. Frontend: admin `pages/admin/SubjectiveTests.tsx`, student `pages/student/StudentSubjectiveTests.tsx`, service `frontend/src/services/subjectiveTests.ts`.
+- Knowledge-layer enrichment intentionally NOT used here — checking is grounded in the admin-configured test only.
 
 ---
 
@@ -515,47 +548,12 @@ question (+ current_video_time) → SegmentRouter (picks 1–3 timeline segments
   timestamp when the answer is lecture-based. If neither lecture nor notes cover it, say so honestly.
 
 ### Implementation notes (`backend/app/modules/video/`, Phase 9)
-Module mirrors `subjective/` (`models.py`, `schemas.py`, `service.py`, `router.py`); tables in migration
-`011_video`. Tables: `videos`, `video_audio_chunks`, `video_transcripts`, `video_timeline_segments`,
-`video_summaries`, `video_support_slides`, `video_slide_labels`, `video_chat_sessions`,
-`video_chat_messages`, `video_views`. Segment times stored in **seconds** (float) for precise seeking.
-- **Admin picks `content_usage_type`** (`objective`|`subjective`) per video — no subject/chapter picker
-  (fixed-slice). That choice drives both the syllabus tree used for topic/subtopic routing/mapping and the
-  knowledge set used for supporting chunks.
-- **One orchestrated Celery job** `process_video` on `kvi_ai_video` (`workers/tasks/video_tasks.py`), created
-  by `POST /admin/videos` (multipart: media required; support-slides PDF optional). Pipeline + the
-  `videos.processing_status` lifecycle: `uploaded → extracting_audio → chunking_audio → transcribing →
-  merging_transcript → cleaning_transcript → generating_timeline → mapping_topics → generating_summary →
-  processing_slides → completed | failed`. Steps: extract audio (`processing/audio_tools.extract_audio`,
-  FFmpeg via `ffmpeg-python`, mono 16 kHz mp3, stored to R2 `audio/`) → chunk (≈8 min, 12 s overlap, global
-  offsets preserved) → transcribe each chunk (`provider.transcribe`, gpt-4o-transcribe, `response_format="json"`
-  — that model does NOT support `verbose_json`, so transcription returns text only, no segment timestamps) →
-  merge → clean **per chunk** (`VideoTranscriptCleanerAgent`, run once per chunk so each cleaned section keeps
-  its global time window; per-chunk languages aggregated via `_pick_language`) → timeline
-  (`VideoTimelineAgent`, fed the cleaned chunks as **time-anchored sections** so segment timestamps are pinned
-  to real chunk windows — accurate even on long multi-chunk lectures, since gpt-4o-transcribe gives no
-  per-segment times) → map segments to
-  syllabus (`VideoSegmentTopicMapperAgent`, validated against the live tree) → full summary
-  (`VideoSummaryAgent`) → slide labels if a slides PDF (`VideoSlideLabelAgent`, per-page PDF text aligned to
-  timeline). Admin can **activate** only once `processing_status=completed`; `POST /admin/videos/{id}/retry`
-  re-runs the job (replaces prior children).
-- **Q&A is synchronous in the router** (`POST /student/videos/{id}/ask` → `service.run_qa_chain`), NOT a job:
-  `VideoSegmentRouterAgent` → `VideoTopicRouterAgent` → `service.fetch_supporting_knowledge` (Pinecone query
-  filtered by `content_usage_type` + routed `topic`/`subtopic`, mapped back to `knowledge_chunks` by
-  `pinecone_vector_id`; best-effort — Q&A still answers lecture-only if Pinecone is unavailable) →
-  `VideoTutorAgent`. Each turn is persisted to `video_chat_messages` (segments, topic, sources, confidence,
-  follow-ups). Response shape: `{answer, language, chat_session_id, selected_segments, detected_topic,
-  detected_subtopic_ids, supporting_knowledge_used, confidence, follow_up_suggestions}`.
-- **Agents** (`backend/app/ai/agents/video_*`): `video_transcript_cleaner_agent`, `video_timeline_agent`,
-  `video_segment_topic_mapper_agent`, `video_summary_agent`, `video_slide_label_agent`,
-  `video_segment_router_agent`, `video_topic_router_agent`, `video_tutor_agent` — all use
-  `get_provider("reasoning")` (GPT-5.5), `audit_ctx` (`entity_type="video"`), and `get_active_skill_text`
-  (defaults seeded in `skill_layer/service._DEFAULT_SKILLS`).
-- **Frontend:** admin `pages/admin/VideoTutor.tsx` (Upload / Library / Details: summary, timeline,
-  key/exam points, slides, possible questions; activate/retry/delete with `JobStatusPoller`), student
-  `pages/student/StudentVideoTutor.tsx` (player + tabs सारांश / समयरेखा / मुख्य बुँदा / AI Tutor;
-  timeline + tutor source timestamps seek the player; follow-up chips), service
-  `frontend/src/services/videoTutor.ts`.
+Module mirrors `subjective/`; tables in migration `011_video` (see §19). Segment/chunk times in **seconds** (float) for precise seeking.
+- **Admin picks `content_usage_type`** (`objective`|`subjective`) per video (no subject/chapter picker) — drives both the syllabus tree (routing/mapping) and the knowledge set (supporting chunks).
+- **One orchestrated Celery job** `process_video` on `kvi_ai_video` (`workers/tasks/video_tasks.py`), from `POST /admin/videos` (multipart: media required; slides PDF optional). `processing_status` lifecycle: `uploaded → extracting_audio → chunking_audio → transcribing → merging_transcript → cleaning_transcript → generating_timeline → mapping_topics → generating_summary → processing_slides → completed | failed`. Steps: extract audio (`audio_tools.extract_audio`, FFmpeg, mono 16 kHz mp3 → R2 `audio/`) → chunk (≈8 min, 12 s overlap, global offsets preserved) → transcribe per chunk (`provider.transcribe`, gpt-4o-transcribe, `response_format="json"` — **no `verbose_json` support, so text only, no segment timestamps**) → merge → clean **per chunk** (`VideoTranscriptCleanerAgent`, run once per chunk so each cleaned section keeps its global time window; languages aggregated via `_pick_language`) → timeline (`VideoTimelineAgent`, fed cleaned chunks as **time-anchored sections** so segment timestamps pin to real chunk windows — accurate on long multi-chunk lectures despite no per-segment times) → map to syllabus (`VideoSegmentTopicMapperAgent`, validated vs live tree) → summary (`VideoSummaryAgent`) → slide labels if slides PDF (`VideoSlideLabelAgent`, per-page text aligned to timeline). **Activate** only once `completed`; `POST /admin/videos/{id}/retry` re-runs (replaces prior children).
+- **Q&A is synchronous in the router** (`POST /student/videos/{id}/ask` → `service.run_qa_chain`), NOT a job: `VideoSegmentRouterAgent` → `VideoTopicRouterAgent` → `service.fetch_supporting_knowledge` (Pinecone filtered by `content_usage_type` + routed `topic`/`subtopic`, mapped to `knowledge_chunks` by `pinecone_vector_id`; best-effort — answers lecture-only if Pinecone down) → `VideoTutorAgent`. Each turn persisted to `video_chat_messages`. Response: `{answer, language, chat_session_id, selected_segments, detected_topic, detected_subtopic_ids, supporting_knowledge_used, confidence, follow_up_suggestions}`.
+- **Agents** (`backend/app/ai/agents/video_*`): `video_transcript_cleaner_agent`, `video_timeline_agent`, `video_segment_topic_mapper_agent`, `video_summary_agent`, `video_slide_label_agent`, `video_segment_router_agent`, `video_topic_router_agent`, `video_tutor_agent` — all use `get_provider("reasoning")`, `audit_ctx` (`entity_type="video"`), `get_active_skill_text`.
+- **Frontend:** admin `pages/admin/VideoTutor.tsx` (Upload/Library/Details, activate/retry/delete via `JobStatusPoller`), student `pages/student/StudentVideoTutor.tsx` (player + tabs सारांश/समयरेखा/मुख्य बुँदा/AI Tutor; timeline + source timestamps seek player; follow-up chips), service `frontend/src/services/videoTutor.ts`.
 
 ---
 
@@ -565,8 +563,8 @@ Real behavior-control system. Approved skill updates affect future agent executi
 
 ### Agents Requiring Default Skills (seeded from JSON)
 Knowledge Processing, MCQ Extraction, MCQ Generation, MCQ Review/Regeneration, MCQ Test Set Generation,
-Question-Specific Skill Generation, Answer Extraction, Answer Evaluation (Copy Checking), Answer
-Reviewer/Verification, PDF Annotation, Skill Builder, Analytics. Video Tutor agents (seeded in
+Subjective Topic Router, Skill Generator, Skill Evaluator, Answer Extraction, Answer Evaluation (Copy
+Checking), Answer Reviewer/Verification, Annotation Locator, Skill Builder, Analytics. Video Tutor agents (seeded in
 `_DEFAULT_SKILLS`): `VideoTranscriptCleanerAgent`, `VideoTimelineAgent`, `VideoSegmentTopicMapperAgent`,
 `VideoSummaryAgent`, `VideoSlideLabelAgent`, `VideoSegmentRouterAgent`, `VideoTopicRouterAgent`,
 `VideoTutorAgent`.
@@ -586,6 +584,16 @@ created_by, approved_by, created_at, activated_at, change_summary
 ```
 
 Internal question-specific checking skills: auto-generated, no approval needed, stored for audit.
+
+### Implementation notes (`backend/app/modules/skill_layer/`, Phase 10 / Stage 6)
+Module: `models/service/schemas/router`; chat tables in migration `012_skill_chat`.
+- **Foundation:** `agent_core_skills` + `agent_skill_versions` (migration `008`). `seed_default_skills()` (idempotent, run at startup in `main.py`) seeds one **global active** version per agent in `_DEFAULT_SKILLS` (MCQ, subjective-checking, video agents, **plus `SkillBuilderAgent`** itself). Agents read via `get_active_skill_text(db, agent_type, scope_type="global", scope_id=None)`.
+- **Scope this stage: global only** (`scope_type="global"`, `scope_id=NULL`). Schema already carries `scope_type`/`scope_id` so chapter/test/question scopes can be added later without migration.
+- **Skill Builder chat is synchronous** (in request, NOT a Celery job). `SkillBuilderAgent` (`get_provider("reasoning")`, `audit_ctx`, own active skill) returns `{reply, proposed_instruction, change_summary}`. Produces **`instruction_text` only**; `structured_rules_json` null (no agent reads it yet).
+- **Flow:** `start_chat` (seeds assistant greeting) → `post_message` (persists admin turn, runs agent, persists reply, **upserts a single `draft` AgentSkillVersion** per chat — re-asking overwrites, never piles up — pointed to by `skill_update_chats.draft_version_id`) → `approve_chat` (archives current active, flips draft to `active` with `activated_at`/`approved_by`, sets `agent_core_skills.current_version_id` — one atomic commit, **idempotent**) → `discard_chat` (archives draft, closes chat).
+- **Endpoints (`require_admin`):** `GET /api/admin/skills`, `GET /api/admin/skills/{agent_type}` (active + history), `POST .../chat/start`, `.../chat/{id}/message`, `.../chat/{id}/approve`, `.../chat/{id}/discard`.
+- **Agent integration:** 11 production agents inject active skill via `_get_skill()` + `{skill_instructions}` placeholder, so an approved global update takes effect on next run with no further wiring. The MCQ-rejection auto-refinement path (`update_skill_from_rejection` on `kvi_ai_skill`) is unchanged.
+- **Frontend:** admin `pages/admin/SkillLayer.tsx` (three-pane: agent selector | chat | draft+approve/discard + active instruction + history), service `frontend/src/services/skillLayer.ts`.
 
 ---
 
@@ -647,25 +655,25 @@ Total views, total questions, most asked questions, unclear concepts, student-wi
 All heavy tasks run in Celery workers. API returns job_id. UI shows live status.
 
 ### Celery config — single source of truth (`workers/celery_config.py`)
-Both the worker app (`workers/celery_app.py`) and the FastAPI sender app (`backend/app/core/celery_client.py`) apply `build_common_conf()` from this one module, so their queues / routing / serialization / transport / TLS **can never drift** (drift between the two apps is what silently misrouted tasks). It exports:
-- `QUEUES` — the only place queue names are listed (`kvi_ai_default`, `kvi_ai_mcq`, `kvi_ai_knowledge`, `kvi_ai_subjective`, `kvi_ai_video`, `kvi_ai_skill`).
-- `TASK_ROUTES` — maps each task name → its queue. **Routing is by task name**, so a `send_task` that omits `queue=` still routes correctly instead of vanishing into an unconsumed queue. Explicit `queue=` args in routers are kept only as redundant agreement.
-- Shared transport opts (`health_check_interval=15`, `visibility_timeout=21600`, keepalive), `task_acks_late=True`, `worker_prefetch_multiplier=1`, `task_ignore_result=True` (status is tracked in the DB `processing_jobs` row, never via `AsyncResult`, so no result keys are written to Upstash), and hard time limits `task_soft_time_limit=TASK_TIMEOUT_SECONDS` / `task_time_limit=TASK_TIMEOUT_SECONDS+120`.
+Both the worker app (`workers/celery_app.py`) and the FastAPI sender (`backend/app/core/celery_client.py`) apply `build_common_conf()` from this one module, so queues/routing/serialization/transport/TLS **can never drift** (drift silently misrouted tasks). Exports:
+- `QUEUES` — only place queue names are listed (`kvi_ai_default`, `kvi_ai_mcq`, `kvi_ai_knowledge`, `kvi_ai_subjective`, `kvi_ai_video`, `kvi_ai_skill`).
+- `TASK_ROUTES` — task name → queue. **Routing is by task name**, so a `send_task` omitting `queue=` still routes correctly. Explicit `queue=` in routers = redundant agreement.
+- Shared transport opts (`health_check_interval=15`, `visibility_timeout=21600`, keepalive), `task_acks_late=True`, `worker_prefetch_multiplier=1`, `task_ignore_result=True` (status tracked in DB `processing_jobs`, never via `AsyncResult` — no result keys written to Upstash), hard limits `task_soft_time_limit=TASK_TIMEOUT_SECONDS` / `task_time_limit=TASK_TIMEOUT_SECONDS+120`.
 
-The worker is started **without `-Q`** — with `task_queues` declared it consumes ALL declared queues automatically, so the consumed set can't drift from the declared set. The FastAPI sender app has **no result backend** (it never reads results).
+Worker starts **without `-Q`** — with `task_queues` declared it consumes ALL declared queues, so consumed can't drift from declared. The sender app has **no result backend**.
 
 ### Worker Runtime (`workers/runtime.py`)
-Every Celery task body delegates to `run_task(work, *, job_id, task=self)`:
-- Runs `work(db)` on ONE persistent event loop per worker process (created lazily by `get_loop()`), not a fresh `asyncio.run()` per task. The async DB engine is disposed once on `worker_shutdown`, not per task. This removes the old per-task `engine.dispose()` hack and the "event loop is closed" failures on retry. **Supported pools: `solo` (Windows/dev) and `prefork` (Linux/prod) only — never threaded/gevent/eventlet** (multiple threads on the one shared loop would corrupt it).
-- **Short-lived sessions only.** The `processing` mark, the `work(db)` session, and the terminal `completed` mark each use a **separate** `AsyncSessionLocal()` — the terminal update is NEVER the connection held open across `work`. A long task (OCR/embedding/Pinecone) runs for minutes, during which an idle pooled asyncpg connection is dropped server-side by Neon; reusing it for the final commit was the historic `connection is closed` failure. `pool_pre_ping=True` (in `core/database.py`, with `pool_recycle=1800`/`pool_timeout=30`) only validates a connection on **checkout**, so it helps only because each phase checks out fresh.
-- **Guarantees a terminal state**: `completed` (progress 100) on success, or `failed`/`retrying` with a sanitized `error_message` on any exception (recorded in a fresh session so a poisoned transaction can't hide the failure).
-- **Long-running agents must self-manage sessions** (see `KnowledgeProcessingAgent`): load metadata in a short session → run AI/OCR/embedding/Pinecone holding NO session → save in a fresh session with **batched commits** and `rollback()` on error. Such agents ignore the `db` passed by `run_task` and open their own `AsyncSessionLocal()` per phase. Because Pinecone is written before the DB commit, the save phase is **idempotent**: prior chunks (and their vectors) for the document are cleared first, and vector IDs are deterministic (`{document_id}:{index}`) so a retry overwrites instead of duplicating.
-- **Mid-operation disconnect retries.** `pool_pre_ping` validates a connection only on **checkout**; on a flaky network the server can still drop a connection *during* a query (`asyncpg.ConnectionDoesNotExistError: connection was closed in the middle of operation`). Each idempotent DB unit in `KnowledgeProcessingAgent` therefore runs through `_db_op_with_retry`, which re-runs the unit on a **fresh session/connection** (so pre-ping re-validates) for connection-level errors only — real SQL/constraint errors surface immediately. Progress-step updates are cosmetic: they retry a few times then are swallowed, never failing the job. The failure handler re-raises after marking the doc/job failed so `run_task` records the terminal state and Celery retries (previously the swallowed exception let `run_task` mark the job `completed`).
-- **Redelivery idempotency:** because `task_acks_late=True` can redeliver a task if a worker died after finishing but before acking, `run_task` skips work if the job is already `completed` (avoids duplicate embeddings/questions).
-- Enforces a hard per-task timeout (`TASK_TIMEOUT_SECONDS`) via `asyncio.wait_for`.
+Every task body delegates to `run_task(work, *, job_id, task=self)`:
+- Runs `work(db)` on ONE persistent event loop per worker process (lazy `get_loop()`), not a fresh `asyncio.run()` per task; engine disposed once on `worker_shutdown`. Fixes the old "event loop is closed" retry failures. **Pools: `solo` (Win/dev) and `prefork` (Linux/prod) only — never threaded/gevent/eventlet** (multiple threads on the shared loop corrupt it).
+- **Short-lived sessions only.** The `processing` mark, `work(db)`, and the terminal `completed` mark each use a **separate** `AsyncSessionLocal()` — the terminal update is never the connection held open across `work`. *Why:* a long task (OCR/embed/Pinecone) runs minutes; Neon drops the idle pooled asyncpg connection server-side, and reusing it for the final commit was the historic `connection is closed` failure. `pool_pre_ping=True` (`pool_recycle=1800`/`pool_timeout=30`) validates only on **checkout**, so it helps only because each phase checks out fresh.
+- **Guarantees a terminal state**: `completed` (progress 100) on success, or `failed`/`retrying` with sanitized `error_message` (recorded in a fresh session so a poisoned transaction can't hide the failure).
+- **Long-running agents self-manage sessions** (see `KnowledgeProcessingAgent`): load metadata (short session) → run AI/OCR/embed/Pinecone holding NO session → save (fresh session, **batched commits**, `rollback()` on error). They ignore `run_task`'s `db` and open their own session per phase. Pinecone is written before the DB commit, so the save phase is **idempotent**: prior chunks/vectors cleared first, vector IDs deterministic (`{document_id}:{index}`) so retries overwrite, not duplicate.
+- **Mid-operation disconnect retries.** Pre-ping validates only on checkout; a flaky network can still drop a connection *during* a query (`ConnectionDoesNotExistError`). Each idempotent DB unit runs through `_db_op_with_retry` → re-runs on a **fresh session/connection** for connection-level errors only (real SQL/constraint errors surface immediately). Progress-step updates are cosmetic (retry then swallowed). The failure handler re-raises after marking doc/job failed so `run_task` records the terminal state and Celery retries (a swallowed exception used to let it mark `completed`).
+- **Redelivery idempotency:** `task_acks_late=True` can redeliver if a worker died after finishing before acking, so `run_task` skips work if the job is already `completed`.
+- Hard per-task timeout (`TASK_TIMEOUT_SECONDS`) via `asyncio.wait_for`.
 
 ### Stuck-job reaper (`workers/tasks/maintenance.py`, beat every 2 min)
-System-level backstop so **no job is ever stuck forever**, even if a terminal write was lost. `reap_stale_jobs` (in `jobs/service.py`) fails: jobs `queued` > 10 min (worker never picked it up — covers misrouted/orphaned messages), and jobs `processing` past `TASK_TIMEOUT_SECONDS` + 5 min grace (worker died/wedged). This is the cross-platform timeout backstop — **Celery's hard `task_time_limit` does NOT fire under `--pool=solo` on Windows** (no signals), so on Windows the in-task `wait_for` + the reaper are the real timeouts; on Linux/prefork the hard limit also applies.
+Backstop so **no job is stuck forever** even if a terminal write was lost. `reap_stale_jobs` (`jobs/service.py`) fails: `queued` > 10 min (never picked up — misrouted/orphaned), and `processing` past `TASK_TIMEOUT_SECONDS` + 5 min grace (worker died/wedged). *Why needed:* **Celery's hard `task_time_limit` does NOT fire under `--pool=solo` on Windows** (no signals), so on Windows the in-task `wait_for` + reaper are the real timeouts; on Linux/prefork the hard limit also applies.
 
 ### Queue Routing (defined in `TASK_ROUTES`)
 ```
@@ -679,7 +687,7 @@ analytics / reaper / keepalive→ kvi_ai_default
 ```
 
 ### Job Types
-knowledge_processing, mcq_extraction, mcq_generation, mcq_regeneration, mcq_test_set_generation, subjective_test_processing, question_specific_skill_generation, answer_sheet_quality_check, answer_sheet_extraction, answer_evaluation, answer_review (reviewer/verification pass), pdf_annotation, video_audio_extraction, video_transcription, video_processing, video_timeline_generation, skill_builder_update, analytics_recalculation.
+knowledge_processing, mcq_extraction, mcq_generation, mcq_regeneration, mcq_test_set_generation, subjective_test_processing (skill generation: topic routing → knowledge fetch → skill generate → skill evaluate → improve → lock), question_specific_skill_generation, skill_evaluation, answer_sheet_quality_check, answer_sheet_extraction (question-level), answer_evaluation, answer_review (reviewer/verification pass), annotation_location (vision locator) + annotation geometry validation, pdf_annotation, video_audio_extraction, video_transcription, video_processing, video_timeline_generation, skill_builder_update, analytics_recalculation.
 
 The exact job decomposition for answer-sheet checking (one orchestrated job running the steps vs. chained jobs) is decided during the build; the **reviewer/verification pass must be a tracked step**. Subjective tasks live in `workers/tasks/subjective_tasks.py`, routed `workers.tasks.subjective_tasks.* → kvi_ai_subjective`.
 
@@ -725,13 +733,13 @@ job_id, job_type, status (queued/processing/completed/failed/retrying/cancelled)
 
 ### Subjective
 `subjective_tests`: id, display_name, total_time_minutes, num_questions, total_marks, question_paper_file_id, model_answer_file_id, sample_marked_file_id, rubric_file_id (optional per-test rubric file; default rubric used when null), custom_instruction, status, skill_generation_status, skill_generation_job_id, created_by, created_at
-`subjective_questions`: id, test_id, question_number, question_text, marks, question_order
-`question_specific_checking_skills`: id, test_id, question_id, skill_json (JSONB), version, is_active, created_at
+`subjective_questions`: id, test_id, question_number, question_text, marks, question_order, topic, subtopic (migration `013`; detected per question)
+`question_specific_checking_skills`: id, test_id, question_id, skill_json (JSONB; rich examiner guide), version, is_active, evaluation_status, evaluation_notes, iterations (migration `013`; Skill Evaluator audit), created_at
 `student_answer_sheets`: id, test_id, student_id, file_id, upload_attempt_number, current_status, checking_job_id, created_at
 `answer_quality_checks`: id, sheet_id, blur_score, brightness_score, tilt_angle, resolution_ok, readability_score, overall_status, quality_notes, created_at
-`answer_extractions`: id, sheet_id, extracted_data (JSONB; full line-level text + coords), overall_confidence, model_used, created_at
+`answer_extractions`: id, sheet_id, extracted_data (JSONB; question-level text + question bboxes + page sizes), overall_confidence, model_used, created_at
 `answer_evaluations`: id, sheet_id, evaluation_data (JSONB; the **reviewed** result used for the checked PDF), initial_evaluation_data (JSONB; pre-review result, for audit), reviewed (bool), review_notes, total_marks_awarded, total_marks_possible, overall_confidence, model_used, created_at
-`pdf_annotations`: id, sheet_id, annotation_instructions (JSONB), checked_file_id, annotation_status, created_at
+`pdf_annotations`: id, sheet_id, annotation_instructions (JSONB; draw commands), locator_plan (JSONB; vision-locator + geometry-validation audit, migration `013`), checked_file_id, annotation_status, created_at
 
 (Reviewer-pass output is persisted for audit via `answer_evaluations.initial_evaluation_data` + `reviewed`/`review_notes`; the exact shape — these columns vs. a dedicated `answer_reviews` table — is finalized during the build.)
 
@@ -748,10 +756,10 @@ job_id, job_type, status (queued/processing/completed/failed/retrying/cancelled)
 `video_views`: id, video_id, student_id, viewed_at, watch_duration_seconds
 
 ### Skill Layer
-`agent_core_skills`: id, agent_type, current_version_id, created_at
-`agent_skill_versions`: id, skill_id, agent_type, scope_type, scope_id, version_number, instruction_text, structured_rules_json (JSONB), status, created_by, approved_by, created_at, activated_at, change_summary
-`skill_update_chats`: id, agent_type, scope_type, scope_id, status, draft_version_id, created_by, created_at
-`skill_update_messages`: id, chat_id, role, content, created_at
+`agent_core_skills`: id, agent_type, current_version_id, created_at  (migration `008`)
+`agent_skill_versions`: id, skill_id, agent_type, scope_type, scope_id, version_number, instruction_text, structured_rules_json (JSONB), status, created_by, approved_by, created_at, activated_at, change_summary  (migration `008`)
+`skill_update_chats`: id, agent_type, scope_type, scope_id, status (open|approved|discarded), draft_version_id (FK agent_skill_versions, SET NULL), created_by, created_at  (migration `012`)
+`skill_update_messages`: id, chat_id (FK skill_update_chats, CASCADE), role (admin|assistant), content, created_at  (migration `012`)
 
 ---
 
@@ -915,7 +923,7 @@ DEFAULT_ADMIN_NAME=Institute Admin
 ✅ Phase 7: Subjective Test Management & Skill Generation (admin-configured tests = source of truth; optional per-test rubric file with default-rubric fallback; auto-generated question-specific checking guide)
 ✅ Phase 8: Answer Checking Pipeline (quality check → high-quality page images → full line-level extraction → question-wise reconstruction → evaluation against admin config → GPT-5.5 reviewer/verification pass → checked PDF)
 ✅ Phase 9: Video Tutor (upload → FFmpeg audio extract/chunk → gpt-4o-transcribe → clean → timeline segments → syllabus mapping → full summary → slide labels; timeline-first synchronous Q&A with always-on lecture summary, segment + topic/subtopic routing, filtered knowledge support)
-Phase 10: Skill Layer (seed skills, chat UI, approval, agent integration)
+✅ Phase 10: Skill Layer (seed skills, synchronous Skill Builder chat, draft → approve → activate, global scope, agent integration)
 Phase 11: Analytics & Dashboard Completion
 Phase 12: Hardening (error handling, security, logging, deployment)
 

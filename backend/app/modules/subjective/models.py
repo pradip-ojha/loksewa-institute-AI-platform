@@ -50,6 +50,10 @@ class SubjectiveQuestion(Base):
     question_text: Mapped[str] = mapped_column(Text, nullable=False)
     marks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     question_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Detected per question against the subjective syllabus tree (best-effort; used to
+    # fetch supporting knowledge during skill generation). Null when not matched.
+    topic: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    subtopic: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
 
 class QuestionSpecificCheckingSkill(Base):
@@ -64,6 +68,11 @@ class QuestionSpecificCheckingSkill(Base):
     skill_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Skill Evaluator audit: passed | passed_with_warning | failed, plus the
+    # evaluator's notes and how many generate→evaluate iterations were spent (1 or 2).
+    evaluation_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    evaluation_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    iterations: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
@@ -104,7 +113,8 @@ class AnswerExtraction(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     sheet_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("student_answer_sheets.id", ondelete="CASCADE"), nullable=False)
-    # Full line-level extraction: {"pages": [...], "questions": [{qid, lines:[{id,text,bbox,page}]}]}
+    # Question-level extraction: {"pages": [{page, width, height}],
+    #   "questions": [{qid, marks, answer_text, pages:[{page, question_bbox, continues}]}]}
     extracted_data: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     overall_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     model_used: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -135,6 +145,8 @@ class PDFAnnotation(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     sheet_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("student_answer_sheets.id", ondelete="CASCADE"), nullable=False)
     annotation_instructions: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Vision-locator output + geometry-validation result per annotation target (audit).
+    locator_plan: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     checked_file_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("files.id", ondelete="SET NULL"), nullable=True)
     annotation_status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")  # pending | completed | failed
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

@@ -157,6 +157,38 @@ async def activate_test(
     return SubjectiveTestOut(**svc.test_out_fields(t))
 
 
+@router.post("/admin/subjective/tests/{test_id}/regenerate-skills", response_model=JobOut, status_code=201)
+async def regenerate_skills(
+    test_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Re-run the multi-agent skill generation for an existing test (e.g. to upgrade
+    skills created by an older pipeline). Replaces the test's questions and locked
+    checking skills."""
+    t = await svc.get_test(db, test_id)
+    if not t:
+        raise AppException(404, "not_found", "Test not found.")
+
+    t.skill_generation_status = "processing"
+    job = await create_job(
+        db, job_type="subjective_test_processing",
+        created_by=current_user.id,
+        input_reference={"test_id": str(test_id), "regenerate": True},
+    )
+    t.skill_generation_job_id = job.id
+    await db.commit()
+
+    from app.core.celery_client import get_celery
+    task = get_celery().send_task(
+        "workers.tasks.subjective_tasks.generate_test_skills",
+        args=[str(job.id), str(test_id)],
+        queue="kvi_ai_subjective",
+    )
+    await update_job(db, job.id, status=JobStatus.processing, celery_task_id=task.id)
+    return await _job_out(db, job.id)
+
+
 @router.post("/admin/subjective/tests/{test_id}/archive", response_model=SubjectiveTestOut)
 async def archive_test(
     test_id: uuid.UUID,

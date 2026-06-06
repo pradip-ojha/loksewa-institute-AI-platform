@@ -13,6 +13,7 @@ import { AdminMCQ } from "./pages/admin/MCQ";
 import { AdminMCQTests } from "./pages/admin/MCQTests";
 import { AdminSubjectiveTests } from "./pages/admin/SubjectiveTests";
 import { AdminVideoTutor } from "./pages/admin/VideoTutor";
+import { AdminSkillLayer } from "./pages/admin/SkillLayer";
 import { StudentDashboard } from "./pages/student/Dashboard";
 import { StudentMCQTests } from "./pages/student/StudentMCQTests";
 import { StudentSubjectiveTests } from "./pages/student/StudentSubjectiveTests";
@@ -43,7 +44,7 @@ function App() {
               <Route path="mcq-tests" element={<AdminMCQTests />} />
               <Route path="video-tutor" element={<AdminVideoTutor />} />
               <Route path="subjective" element={<AdminSubjectiveTests />} />
-              <Route path="skill-layer" element={<AdminPlaceholder title="Skill Layer" description="Improve AI agent behavior — available in Stage 9" />} />
+              <Route path="skill-layer" element={<AdminSkillLayer />} />
               <Route path="analytics" element={<AdminPlaceholder title="Analytics" description="View platform analytics — available in Stage 10" />} />
             </Route>
           </Route>

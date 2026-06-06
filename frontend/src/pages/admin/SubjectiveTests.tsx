@@ -222,6 +222,10 @@ function TestListTab() {
     try { await subjectiveTestsService.archiveTest(id); await refresh(); }
     catch (err) { setError(getErrorMessage(err, "Could not archive.")); }
   }
+  async function regenerate(id: string) {
+    try { await subjectiveTestsService.regenerateSkills(id); await refresh(); }
+    catch (err) { setError(getErrorMessage(err, "Could not regenerate skills.")); }
+  }
 
   if (loading) return <p className="text-sm text-gray-500">Loading…</p>;
 
@@ -262,6 +266,9 @@ function TestListTab() {
                     {t.status !== "active" && t.skill_generation_status === "completed" && (
                       <button onClick={() => activate(t.id)} className="mr-3 text-green-700 hover:underline">Activate</button>
                     )}
+                    {t.skill_generation_status !== "processing" && (
+                      <button onClick={() => regenerate(t.id)} className="mr-3 text-amber-700 hover:underline">Regenerate skills</button>
+                    )}
                     {t.status === "active" && (
                       <button onClick={() => archive(t.id)} className="text-gray-500 hover:underline">Archive</button>
                     )}
@@ -293,6 +300,11 @@ function TestListTab() {
                     <span className="text-gray-500">{q.marks} marks</span>
                   </div>
                   <p className="mt-1 text-sm text-gray-600">{q.question_text}</p>
+                  {(q.topic || q.subtopic) && (
+                    <p className="mt-1 text-xs text-gray-400">
+                      {[q.topic, q.subtopic].filter(Boolean).join(" › ")}
+                    </p>
+                  )}
                 </li>
               ))}
             </ol>

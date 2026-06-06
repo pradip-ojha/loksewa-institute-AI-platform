@@ -33,6 +33,8 @@ export interface SubjectiveQuestion {
   question_text: string;
   marks: number;
   question_order: number;
+  topic: string | null;
+  subtopic: string | null;
 }
 
 export interface SubjectiveTestDetail extends SubjectiveTest {
@@ -128,6 +130,8 @@ export const subjectiveTestsService = {
     api.post(`/api/admin/subjective/tests/${id}/activate`).then((r) => r.data),
   archiveTest: (id: string): Promise<SubjectiveTest> =>
     api.post(`/api/admin/subjective/tests/${id}/archive`).then((r) => r.data),
+  regenerateSkills: (id: string): Promise<JobRef> =>
+    api.post(`/api/admin/subjective/tests/${id}/regenerate-skills`).then((r) => r.data),
   deleteTest: (id: string): Promise<void> =>
     api.delete(`/api/admin/subjective/tests/${id}`).then(() => undefined),
   listSubmissions: (id: string): Promise<Submission[]> =>

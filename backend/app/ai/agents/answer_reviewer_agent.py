@@ -1,10 +1,10 @@
-"""Reviewer / verification pass over a first-pass evaluation (CLAUDE.md §12).
+"""Reviewer / verification pass over the checker's evaluation (CLAUDE.md §12).
 
 A second GPT-5.5 call for demo-quality reliability: checks fairness, enforces the
-configured max marks, prunes unnecessary annotations, and tightens feedback. It
-returns a corrected evaluation in the SAME shape as the evaluator output, so the
-pipeline can store it as the reviewed result (the pre-review result is kept for
-audit).
+configured max marks, tightens feedback, and PRUNES annotation targets that aren't
+genuinely wrong written text. It returns a corrected evaluation in the SAME shape as
+the checker output so the pipeline can store it as the reviewed result (the
+pre-review result is kept for audit). It does not rewrite everything unnecessarily.
 """
 import logging
 import uuid
@@ -20,21 +20,27 @@ REVIEW_PROMPT = """You are a senior examiner doing a verification pass over a ju
 
 YOUR JOB:
 1. Check the marks are fair and internally consistent across questions.
-2. Enforce the configured FULL MARKS per question — no awarded mark may exceed it.
-3. Remove unnecessary or noisy annotations. Keep ONLY annotations tied to a specific wrong written item (wrong sentence/formula/calculation/keyword, contradiction, irrelevant line). Drop annotations for missing points / weak explanation / structure / general advice.
+2. Enforce the configured MAX MARKS per question — no awarded mark may exceed it.
+3. Prune annotation_targets: keep ONLY targets tied to a specific wrong written item (wrong sentence/formula/calculation step/number/keyword, contradiction, irrelevant line). Drop targets for missing points / weak explanation / structure / general advice. Do NOT invent new targets, and keep each target's "target_text" exactly as given.
 4. Keep feedback concise and useful; fix anything unfair or unclear.
-5. Do not invent new line ids — only keep annotations whose "line" id appears in the first-pass evaluation.
+5. Do not rewrite things that are already fine.
 
-FULL MARKS PER QUESTION:
+MAX MARKS PER QUESTION:
 {full_marks_block}
 
-FIRST-PASS EVALUATION (JSON):
+CHECKER EVALUATION (JSON):
 {evaluation_json}
 
-Return ONLY valid JSON in exactly this structure (one entry per question), plus a short overall note:
+Return ONLY valid JSON in exactly this structure (same shape as the input), plus a short overall note:
 {{
-  "questions": [
-    {{"qid": "Q1", "m": 6, "fm": 8, "fb": "...", "mistakes": ["..."], "ann": [{{"t": "underline", "line": "p1_L4", "c": "..."}}], "confidence": 0.8}}
+  "total_awarded_marks": 0,
+  "total_full_marks": 0,
+  "overall_summary": "...",
+  "question_results": [
+    {{"question_number": "1", "page_numbers": [1], "awarded_marks": 6, "max_marks": 10,
+      "feedback": "...", "missing_points": ["..."], "confidence": 0.8,
+      "annotation_targets": [{{"page_number": 1, "question_number": "1", "target_text": "...",
+        "comment_text": "...", "annotation_action": "underline_with_comment"}}]}}
   ],
   "review_notes": "one or two sentences on what was adjusted"
 }}"""
@@ -53,7 +59,7 @@ class AnswerReviewerAgent:
         full_marks_block = "\n".join(f"- {qid}: {fm}" for qid, fm in full_marks_by_qid.items()) or "none"
         prompt = REVIEW_PROMPT.format(
             full_marks_block=full_marks_block,
-            evaluation_json=json.dumps(evaluation, ensure_ascii=False)[:48000],
+            evaluation_json=json.dumps(evaluation, ensure_ascii=False)[:50000],
         )
         audit_ctx = {
             "db": self.db,
@@ -66,6 +72,6 @@ class AnswerReviewerAgent:
             result = await self.provider.generate_text(prompt, schema={}, audit_ctx=audit_ctx)
         except Exception as exc:
             raise RuntimeError(f"Answer review failed: {exc}") from exc
-        if not isinstance(result, dict) or not isinstance(result.get("questions"), list):
-            raise AIResponseError("answer review did not return a 'questions' list")
+        if not isinstance(result, dict) or not isinstance(result.get("question_results"), list):
+            raise AIResponseError("answer review did not return a 'question_results' list")
         return result

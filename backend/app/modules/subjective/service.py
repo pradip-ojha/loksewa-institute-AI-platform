@@ -213,16 +213,16 @@ async def build_student_result(db: AsyncSession, sheet: StudentAnswerSheet) -> d
         questions = await get_test_questions(db, sheet.test_id)
         by_number = {q.question_number: q for q in questions}
         rows = []
-        for item in (evaluation.evaluation_data or {}).get("questions", []):
-            qnum = str(item.get("qid") or item.get("question_number") or "")
+        for item in (evaluation.evaluation_data or {}).get("question_results", []):
+            qnum = str(item.get("question_number") or "")
             q = by_number.get(qnum)
             rows.append({
                 "question_number": qnum or (q.question_number if q else "?"),
                 "question_text": q.question_text if q else "",
-                "marks_awarded": float(item.get("m", 0) or 0),
-                "marks_possible": float(item.get("fm", q.marks if q else 0) or 0),
-                "feedback": item.get("fb"),
-                "mistakes": item.get("mistakes") or [],
+                "marks_awarded": float(item.get("awarded_marks", 0) or 0),
+                "marks_possible": float(item.get("max_marks", q.marks if q else 0) or 0),
+                "feedback": item.get("feedback"),
+                "mistakes": item.get("missing_points") or [],
             })
         result["questions"] = rows
         result["total_marks_awarded"] = evaluation.total_marks_awarded
@@ -235,53 +235,106 @@ async def build_student_result(db: AsyncSession, sheet: StudentAnswerSheet) -> d
     return result
 
 
-# ── Question-wise reconstruction + marks clamp (AI-free, used by the task) ───────
+# ── Knowledge fetch (skill-generation only, best-effort) ─────────────────────────
 
-def reconstruct_questionwise(extraction: dict, questions: list[SubjectiveQuestion]) -> dict:
-    """Group extracted lines into question-wise answers using the question number
-    on each line, with page-order fallback for unlabeled lines.
+async def fetch_question_resources(
+    db: AsyncSession, *, topic: str | None, subtopic: str | None, query: str, top_k: int = 6,
+) -> str:
+    """Vector-search the SUBJECTIVE knowledge set for a question's topic/subtopic and
+    return distilled excerpt text. Best-effort: returns "" on any failure or when no
+    knowledge is uploaded, so skill generation never blocks (CLAUDE.md §11 — knowledge
+    is used ONLY here at skill-generation time, never during per-sheet checking)."""
+    from app.modules.knowledge.models import KnowledgeChunk
+    try:
+        from app.ai.model_router import get_provider
+        from app.integrations.pinecone_client import get_pinecone
 
-    `extraction` is the raw extractor output: {"pages": [...], "lines": [{id, text,
-    bbox, page, qid?}]} OR {"questions": [{qid, lines:[...]}]}. Returns a normalized
-    {"questions": [{"qid", "question_text", "marks", "answer_text", "lines": [...]}]}.
+        embeddings = await get_provider("reasoning").embed([query[:6000]])
+        if not embeddings:
+            return ""
+        filter_dict: dict = {"content_usage_type": "subjective"}
+        if topic:
+            filter_dict["topic"] = topic
+        if subtopic:
+            filter_dict["subtopic"] = {"$in": [subtopic]}
+
+        matches = get_pinecone().query(embeddings[0], top_k=top_k, filter_dict=filter_dict)
+        vector_ids = [m["id"] for m in matches if m.get("id")]
+        if not vector_ids:
+            return ""
+        r = await db.execute(
+            select(KnowledgeChunk).where(KnowledgeChunk.pinecone_vector_id.in_(vector_ids))
+        )
+        chunks = {c.pinecone_vector_id: c for c in r.scalars().all()}
+        lines: list[str] = []
+        for vid in vector_ids:
+            c = chunks.get(vid)
+            if not c:
+                continue
+            label = " | ".join(filter(None, [c.topic, c.subtopic])) or "General"
+            lines.append(f"[{label}]\n{c.content}")
+        return "\n\n".join(lines)
+    except Exception as exc:
+        logger.warning("question-resource retrieval failed (continuing without it): %s", exc)
+        return ""
+
+
+# ── Question-wise assembly + marks clamp (AI-free, used by the task) ──────────────
+
+def assemble_questionwise(page_outputs: list[dict], questions: list[SubjectiveQuestion]) -> dict:
+    """Assemble per-page question-level extractor outputs into whole-question answers.
+
+    `page_outputs` is a list of extractor results, each {page, page_size:[w,h],
+    answers:[{question_number, answer_text, question_bbox, continues}]}. Groups by
+    question number (digit-tolerant), carrying an unlabeled continuation onto the last
+    known question. Returns the stored extraction shape:
+      {"pages": [{page, width, height}],
+       "questions": [{qid, question_text, marks, answer_text, page_numbers,
+                      page_regions: [{page, question_bbox}]}]}
     """
     valid_numbers = [q.question_number for q in questions]
-    by_number = {q.question_number: q for q in questions}
-
-    # Collect a flat list of lines regardless of which shape the extractor used.
-    lines: list[dict] = []
-    if isinstance(extraction.get("questions"), list):
-        for grp in extraction["questions"]:
-            gqid = str(grp.get("qid") or "")
-            for ln in grp.get("lines", []) or []:
-                ln = dict(ln)
-                ln.setdefault("qid", gqid)
-                lines.append(ln)
-    if isinstance(extraction.get("lines"), list):
-        lines.extend(dict(ln) for ln in extraction["lines"])
-
-    buckets: dict[str, list[dict]] = {n: [] for n in valid_numbers}
+    buckets: dict[str, dict] = {
+        n: {"texts": [], "pages": set(), "regions": []} for n in valid_numbers
+    }
     last_known: str | None = valid_numbers[0] if valid_numbers else None
-    for ln in lines:
-        qid = _match_question_number(str(ln.get("qid") or ""), valid_numbers)
-        if qid:
-            last_known = qid
-        target = qid or last_known
-        if target and target in buckets:
-            buckets[target].append(ln)
+    # When an answer is flagged as continuing onto the next page, an unlabeled answer
+    # at the start of the next page belongs to it (it was the last thing written).
+    pending_continuation: str | None = None
+
+    pages_meta: list[dict] = []
+    for po in page_outputs:
+        size = po.get("page_size") or [0, 0]
+        pages_meta.append({"page": po.get("page"), "width": size[0], "height": size[1]})
+        for a in po.get("answers", []) or []:
+            qid = _match_question_number(str(a.get("question_number") or ""), valid_numbers)
+            if qid:
+                last_known = qid
+                target = qid
+            else:
+                target = pending_continuation or last_known
+            pending_continuation = target if a.get("continues") else None
+            if not target or target not in buckets:
+                continue
+            if a.get("answer_text"):
+                buckets[target]["texts"].append(a["answer_text"])
+            buckets[target]["pages"].add(po.get("page"))
+            if a.get("question_bbox"):
+                buckets[target]["regions"].append(
+                    {"page": po.get("page"), "question_bbox": a["question_bbox"]}
+                )
 
     out_questions = []
     for q in questions:
-        qlines = buckets.get(q.question_number, [])
-        answer_text = "\n".join((ln.get("text") or "").strip() for ln in qlines if ln.get("text"))
+        b = buckets.get(q.question_number, {"texts": [], "pages": set(), "regions": []})
         out_questions.append({
             "qid": q.question_number,
             "question_text": q.question_text,
             "marks": q.marks,
-            "answer_text": answer_text,
-            "lines": qlines,
+            "answer_text": "\n".join(t for t in b["texts"] if t).strip(),
+            "page_numbers": sorted(p for p in b["pages"] if p is not None),
+            "page_regions": b["regions"],
         })
-    return {"questions": out_questions}
+    return {"pages": pages_meta, "questions": out_questions}
 
 
 def _match_question_number(raw: str, valid: list[str]) -> str | None:
@@ -301,27 +354,34 @@ def _match_question_number(raw: str, valid: list[str]) -> str | None:
 
 
 def clamp_marks(evaluation: dict, questions: list[SubjectiveQuestion]) -> tuple[dict, float, float]:
-    """Enforce per-question full-marks caps and recompute totals. Returns the
-    sanitized evaluation plus (awarded, possible)."""
+    """Enforce per-question full-marks caps and recompute totals on the checker/reviewer
+    evaluation ({"question_results": [{question_number, awarded_marks, max_marks, ...}]}).
+    Returns the sanitized evaluation plus (awarded, possible). Idempotent — safe to call
+    after both the checker and the reviewer pass."""
     by_number = {q.question_number: q for q in questions}
     total_possible = float(sum(q.marks for q in questions))
     total_awarded = 0.0
 
-    items = (evaluation or {}).get("questions", [])
+    items = (evaluation or {}).get("question_results", [])
     for item in items:
-        qnum = _match_question_number(str(item.get("qid") or ""), list(by_number.keys()))
+        qnum = _match_question_number(str(item.get("question_number") or ""), list(by_number.keys()))
         q = by_number.get(qnum) if qnum else None
-        cap = float(q.marks) if q else float(item.get("fm", 0) or 0)
-        item["fm"] = cap
+        cap = float(q.marks) if q else float(item.get("max_marks", 0) or 0)
+        item["max_marks"] = cap
         if qnum:
-            item["qid"] = qnum
-        awarded = float(item.get("m", 0) or 0)
+            item["question_number"] = qnum
+        awarded = float(item.get("awarded_marks", 0) or 0)
         awarded = max(0.0, min(awarded, cap))
-        item["m"] = awarded
+        awarded = round(awarded * 2) / 2  # snap to nearest half mark (examiner convention)
+        item["awarded_marks"] = awarded
         total_awarded += awarded
 
-    evaluation["questions"] = items
-    return evaluation, round(total_awarded, 2), round(total_possible, 2)
+    evaluation["question_results"] = items
+    total_awarded = round(total_awarded, 2)
+    total_possible = round(total_possible, 2)
+    evaluation["total_awarded_marks"] = total_awarded
+    evaluation["total_full_marks"] = total_possible
+    return evaluation, total_awarded, total_possible
 
 
 # ── internal helpers ────────────────────────────────────────────────────────────

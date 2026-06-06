@@ -12,6 +12,8 @@ class SubjectiveQuestionOut(BaseModel):
     question_text: str
     marks: int
     question_order: int
+    topic: str | None = None
+    subtopic: str | None = None
 
     model_config = {"from_attributes": True}
 

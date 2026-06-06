@@ -1,13 +1,18 @@
 """Celery tasks for the subjective system.
 
 Two orchestrated jobs:
-  • generate_test_skills  — at test creation: extract questions+marks from the
-    paper, then generate the per-question checking guides.
-  • check_answer_sheet    — on student upload: quality gate → render → line-level
-    extraction → question-wise reconstruction → evaluation → reviewer pass →
-    annotated checked PDF. The reviewer pass is a tracked step; per-question full
-    marks are a hard cap (service.clamp_marks).
+  • generate_test_skills  — at test creation (and on regenerate): extract questions +
+    marks from the paper, detect each question's topic/subtopic, fetch supporting
+    knowledge (best-effort), then run the multi-agent skill generation:
+    SkillGenerator → SkillEvaluator → improve weak skills once (max 2 iterations) →
+    lock the per-question examiner skills. All heavy resource reading happens HERE.
+  • check_answer_sheet    — on student upload: quality gate → question-level extraction
+    → checker (locked skills + test config only, NO big notes) → reviewer pass →
+    per-target vision locator → geometry validator → human-like checked PDF. The
+    reviewer pass is a tracked step; per-question full marks are a hard cap
+    (service.clamp_marks).
 """
+import copy
 import io
 import logging
 import uuid
@@ -17,8 +22,12 @@ from workers.runtime import run_task
 
 logger = logging.getLogger(__name__)
 
+# Keep the checked PDF uncrowded (CLAUDE.md §12).
+MAX_TARGETS_PER_QUESTION = 3
+MAX_TARGETS_PER_PAGE = 6
 
-# ── Test setup: question extraction + per-question checking guides ───────────────
+
+# ── Test setup: question extraction + multi-agent skill generation ───────────────
 
 @celery_app.task(
     bind=True,
@@ -31,11 +40,15 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
         from sqlalchemy import select
         from app.modules.jobs.models import JobStatus
         from app.modules.jobs.service import update_job
+        from app.modules.subjective import service as svc
         from app.modules.subjective.models import (
             QuestionSpecificCheckingSkill, SubjectiveQuestion, SubjectiveTest,
         )
+        from app.modules.video.service import get_chapter_tree
         from app.ai.agents.question_paper_agent import QuestionPaperAgent
-        from app.ai.agents.checking_skill_agent import CheckingSkillAgent
+        from app.ai.agents.subjective_topic_router_agent import SubjectiveTopicRouterAgent
+        from app.ai.agents.skill_generator_agent import SkillGeneratorAgent
+        from app.ai.agents.skill_evaluator_agent import SkillEvaluatorAgent
 
         jid = uuid.UUID(job_id)
         t_r = await db.execute(select(SubjectiveTest).where(SubjectiveTest.id == uuid.UUID(test_id)))
@@ -43,17 +56,17 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
         if not test:
             raise ValueError(f"SubjectiveTest {test_id} not found")
 
-        await update_job(db, jid, status=JobStatus.processing, progress=10, step="Reading question paper")
+        await update_job(db, jid, status=JobStatus.processing, progress=8, step="Reading question paper")
         paper_text = await _resolve_text(db, test.question_paper_file_id)
         if not paper_text.strip():
             raise ValueError("Could not read any text from the question paper")
 
-        await update_job(db, jid, progress=25, step="Extracting questions and marks")
+        await update_job(db, jid, progress=18, step="Extracting questions and marks")
         questions = await QuestionPaperAgent(db).extract(
             paper_text=paper_text, custom_instruction=test.custom_instruction, test_id=test.id,
         )
 
-        # Persist questions (replace any from a previous run).
+        # Persist questions (replace any from a previous run — cascades old skills).
         old = await db.execute(select(SubjectiveQuestion).where(SubjectiveQuestion.test_id == test.id))
         for q in old.scalars().all():
             await db.delete(q)
@@ -62,11 +75,8 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
         question_rows: list[SubjectiveQuestion] = []
         for order, q in enumerate(questions):
             row = SubjectiveQuestion(
-                test_id=test.id,
-                question_number=q["question_number"],
-                question_text=q["question_text"],
-                marks=q["marks"],
-                question_order=order,
+                test_id=test.id, question_number=q["question_number"],
+                question_text=q["question_text"], marks=q["marks"], question_order=order,
             )
             db.add(row)
             question_rows.append(row)
@@ -78,44 +88,127 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
             test.total_marks = marks_sum
         await db.commit()
 
-        # Inputs shared by every question's checking guide.
+        # Detect topic/subtopic per question against the subjective syllabus tree.
+        await update_job(db, jid, progress=30, step="Detecting topics")
+        tree_text, valid_topics, valid_subtopics = await get_chapter_tree(db, "subjective")
+        router = SubjectiveTopicRouterAgent(db)
+        for q in question_rows:
+            try:
+                route = await router.route(
+                    question_number=q.question_number, question_text=q.question_text,
+                    tree_text=tree_text, test_id=test.id,
+                )
+                q.topic = route["topic"] if route["topic"] in valid_topics else None
+                q.subtopic = route["subtopic"] if route["subtopic"] in valid_subtopics else None
+            except Exception as exc:
+                logger.warning("topic routing failed for %s: %s", q.question_number, exc)
+        await db.commit()
+
+        # Shared inputs distilled into the skills (read ONCE, here).
         model_answer = await _resolve_text(db, test.model_answer_file_id)
         rubric_text = await _resolve_text(db, test.rubric_file_id)
 
-        agent = CheckingSkillAgent(db)
+        generator = SkillGeneratorAgent(db)
         total = len(question_rows)
+        skills: list[dict] = []   # working list: {q, skill_json}
         for i, q in enumerate(question_rows):
             await update_job(
-                db, jid, progress=40 + int(50 * i / max(1, total)),
-                step=f"Generating checking guide {i + 1}/{total}",
+                db, jid, progress=36 + int(34 * i / max(1, total)),
+                step=f"Generating checking skill {i + 1}/{total}",
             )
-            skill_json = await agent.generate(
-                question_number=q.question_number,
-                question_text=q.question_text,
-                marks=q.marks,
-                model_answer=model_answer,
-                rubric=rubric_text,
-                custom_instruction=test.custom_instruction,
-                test_id=test.id,
+            knowledge = await svc.fetch_question_resources(
+                db, topic=q.topic, subtopic=q.subtopic, query=q.question_text,
             )
+            skill_json = await generator.generate(
+                question_number=q.question_number, question_text=q.question_text, marks=q.marks,
+                topic=q.topic, subtopic=q.subtopic, model_answer=model_answer, rubric=rubric_text,
+                custom_instruction=test.custom_instruction, knowledge=knowledge, test_id=test.id,
+            )
+            skills.append({"q": q, "skill_json": skill_json, "knowledge": knowledge, "iterations": 1,
+                           "evaluation_status": "passed", "evaluation_notes": None})
+
+        # Evaluate the generated skills (lenient gate), then improve only the weak ones.
+        await update_job(db, jid, progress=74, step="Evaluating checking skills")
+        verdicts = await _evaluate_skills(db, SkillEvaluatorAgent(db), skills, test, svc)
+        weak = [s for s in skills if verdicts.get(s["q"].question_number, {}).get("status") == "failed"]
+        if weak:
+            await update_job(db, jid, progress=84, step=f"Improving {len(weak)} weak skill(s)")
+            for s in weak:
+                q = s["q"]
+                fb = verdicts.get(q.question_number, {})
+                feedback = " ".join(filter(None, [
+                    "; ".join(fb.get("issues") or []), fb.get("fix_feedback") or "",
+                ])) or "Make the guide more usable and correctly mapped."
+                try:
+                    s["skill_json"] = await generator.improve(
+                        question_number=q.question_number, question_text=q.question_text, marks=q.marks,
+                        topic=q.topic, subtopic=q.subtopic, model_answer=model_answer, rubric=rubric_text,
+                        custom_instruction=test.custom_instruction, knowledge=s["knowledge"],
+                        previous_skill=s["skill_json"], evaluator_feedback=feedback, test_id=test.id,
+                    )
+                    s["iterations"] = 2
+                except Exception as exc:
+                    logger.warning("skill improve failed for %s: %s", q.question_number, exc)
+            verdicts2 = await _evaluate_skills(db, SkillEvaluatorAgent(db), weak, test, svc)
+            verdicts.update(verdicts2)
+
+        # Lock the skills (no admin gate). Residual failure → passed_with_warning (audit).
+        await update_job(db, jid, progress=92, step="Locking checking skills")
+        for s in skills:
+            q = s["q"]
+            v = verdicts.get(q.question_number, {})
+            status = v.get("status") or "passed"
+            if status == "failed":
+                status = "passed_with_warning"
+            notes = " ".join(filter(None, [
+                "; ".join(v.get("issues") or []), v.get("fix_feedback") or "",
+            ])) or None
             db.add(QuestionSpecificCheckingSkill(
-                test_id=test.id, question_id=q.id, skill_json=skill_json, version=1, is_active=True,
+                test_id=test.id, question_id=q.id, skill_json=s["skill_json"], version=1, is_active=True,
+                evaluation_status=status, evaluation_notes=notes, iterations=s["iterations"],
             ))
         test.skill_generation_status = "completed"
         await db.commit()
 
         await update_job(
-            db, jid, status=JobStatus.completed, progress=100,
-            step="Test ready", output={"questions": total, "total_marks": test.total_marks},
+            db, jid, status=JobStatus.completed, progress=100, step="Test ready",
+            output={"questions": total, "total_marks": test.total_marks, "improved": len(weak)},
         )
 
     try:
         run_task(work, job_id=job_id, task=self)
     except Exception as exc:
         logger.exception("generate_test_skills failed: %s", exc)
-        # Mark the test so the admin sees the failure (best-effort, separate session).
         _mark_skill_failed(test_id)
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
+
+
+async def _evaluate_skills(db, evaluator, skills: list[dict], test, svc) -> dict[str, dict]:
+    """Run the SkillEvaluator over `skills` and return {question_number: verdict}.
+    Best-effort: on evaluator failure, treat all as passed (never block the demo)."""
+    payload = [{
+        "question_number": s["q"].question_number, "marks": s["q"].marks,
+        "question_text": s["q"].question_text, "topic": s["q"].topic, "subtopic": s["q"].subtopic,
+        "skill_json": s["skill_json"],
+    } for s in skills]
+    valid = [s["q"].question_number for s in skills]
+    try:
+        result = await evaluator.evaluate(
+            skills=payload, custom_instruction=test.custom_instruction, test_id=test.id,
+        )
+    except Exception as exc:
+        logger.warning("skill evaluation failed (locking as-is): %s", exc)
+        return {}
+    out: dict[str, dict] = {}
+    for r in result.get("results", []):
+        qnum = svc._match_question_number(str(r.get("question_number") or ""), valid)
+        if qnum:
+            out[qnum] = {
+                "status": (r.get("status") or "passed"),
+                "issues": r.get("issues") or [],
+                "fix_feedback": r.get("fix_feedback") or "",
+            }
+    return out
 
 
 # ── Answer-sheet checking pipeline ──────────────────────────────────────────────
@@ -141,7 +234,9 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         from app.ai.agents.answer_extraction_agent import AnswerExtractionAgent
         from app.ai.agents.answer_evaluation_agent import AnswerEvaluationAgent
         from app.ai.agents.answer_reviewer_agent import AnswerReviewerAgent
+        from app.ai.agents.annotation_locator_agent import AnnotationLocatorAgent
         from app.processing import pdf_tools, image_quality, annotation as annotate
+        from app.processing import annotation_geometry as geom
 
         jid = uuid.UUID(job_id)
         sid = uuid.UUID(sheet_id)
@@ -161,22 +256,18 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         await update_job(db, jid, status=JobStatus.processing, progress=8, step="Rendering pages")
         file_bytes = get_r2().download_fileobj(file_record.r2_key)
         pages = pdf_tools.render_to_page_images(file_bytes, file_record.mime_type)
+        page_map = {p.page_number: p for p in pages}
         page_pngs = [p.png_bytes for p in pages]
 
         # 1) Quality gate ---------------------------------------------------------
-        await update_job(db, jid, progress=16, step="Checking image quality")
+        await update_job(db, jid, progress=15, step="Checking image quality")
         metrics = image_quality.assess(page_pngs)
         db.add(AnswerQualityCheck(
-            sheet_id=sheet.id,
-            blur_score=metrics.blur_score,
-            brightness_score=metrics.brightness_score,
-            tilt_angle=metrics.tilt_angle,
-            resolution_ok=metrics.resolution_ok,
-            readability_score=metrics.readability_score,
-            overall_status=metrics.overall_status,
+            sheet_id=sheet.id, blur_score=metrics.blur_score, brightness_score=metrics.brightness_score,
+            tilt_angle=metrics.tilt_angle, resolution_ok=metrics.resolution_ok,
+            readability_score=metrics.readability_score, overall_status=metrics.overall_status,
             quality_notes=metrics.quality_notes,
         ))
-
         if metrics.overall_status == "poor" and sheet.upload_attempt_number < svc.MAX_UPLOAD_ATTEMPTS:
             sheet.current_status = "needs_reupload"
             await db.commit()
@@ -187,31 +278,28 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
             return
         await db.commit()
 
-        # 2) Full line-level extraction ------------------------------------------
+        # 2) Question-level extraction -------------------------------------------
         sheet.current_status = "extracting"
         await db.commit()
-        await update_job(db, jid, progress=24, step="Extracting handwriting (line level)")
+        await update_job(db, jid, progress=24, step="Extracting answers (question level)")
         valid_numbers = [q.question_number for q in questions]
         extractor = AnswerExtractionAgent(db)
-        all_lines: list[dict] = []
+        page_outputs: list[dict] = []
         confidences: list[float] = []
         for idx, page in enumerate(pages):
             await update_job(
-                db, jid, progress=24 + int(26 * idx / max(1, len(pages))),
+                db, jid, progress=24 + int(24 * idx / max(1, len(pages))),
                 step=f"Extracting page {idx + 1}/{len(pages)}",
             )
-            page_out = await extractor.extract_page(
+            po = await extractor.extract_page(
                 page_png=page.png_bytes, page_number=page.page_number,
                 width=page.width, height=page.height,
                 valid_numbers=valid_numbers, sheet_id=sheet.id,
             )
-            all_lines.extend(page_out["lines"])
-            confidences.append(page_out.get("page_confidence", 0.0))
+            page_outputs.append(po)
+            confidences.append(po.get("page_confidence", 0.0))
 
-        extraction = {
-            "pages": [{"page": p.page_number, "width": p.width, "height": p.height} for p in pages],
-            "lines": all_lines,
-        }
+        extraction = svc.assemble_questionwise(page_outputs, questions)
         overall_conf = round(sum(confidences) / len(confidences), 3) if confidences else None
         db.add(AnswerExtraction(
             sheet_id=sheet.id, extracted_data=extraction,
@@ -219,11 +307,7 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         ))
         await db.commit()
 
-        # 3) Reconstruct question-wise -------------------------------------------
-        await update_job(db, jid, progress=54, step="Reconstructing answers question-wise")
-        reconstructed = svc.reconstruct_questionwise(extraction, questions)
-
-        # Per-question checking guides keyed by question number.
+        # Locked per-question checking skills.
         sk_r = await db.execute(
             select(QuestionSpecificCheckingSkill, SubjectiveQuestion.question_number)
             .join(SubjectiveQuestion, SubjectiveQuestion.id == QuestionSpecificCheckingSkill.question_id)
@@ -231,22 +315,25 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         )
         skills_by_qid = {qnum: skill.skill_json for skill, qnum in sk_r.all()}
 
-        # 4) Evaluation -----------------------------------------------------------
+        # 3) Checker --------------------------------------------------------------
         sheet.current_status = "evaluating"
         await db.commit()
-        await update_job(db, jid, progress=62, step="Evaluating answers")
+        await update_job(db, jid, progress=54, step="Checking answers")
         rubric_text = await _resolve_text(db, test.rubric_file_id) or None
+        checker_questions = [{
+            "qid": q["qid"], "question_text": q["question_text"], "marks": q["marks"],
+            "answer_text": q["answer_text"], "page_numbers": q["page_numbers"],
+        } for q in extraction["questions"]]
         initial_eval = await AnswerEvaluationAgent(db).evaluate(
-            reconstructed=reconstructed, skills_by_qid=skills_by_qid,
+            questions=checker_questions, skills_by_qid=skills_by_qid,
             rubric_text=rubric_text, custom_instruction=test.custom_instruction, sheet_id=sheet.id,
         )
-        import copy
         clamped_initial, _, _ = svc.clamp_marks(copy.deepcopy(initial_eval), questions)
 
-        # 5) Reviewer / verification pass ----------------------------------------
+        # 4) Reviewer / verification pass ----------------------------------------
         sheet.current_status = "reviewing"
         await db.commit()
-        await update_job(db, jid, progress=74, step="Reviewer verification pass")
+        await update_job(db, jid, progress=66, step="Reviewer verification pass")
         full_marks_by_qid = {q.question_number: q.marks for q in questions}
         reviewed = await AnswerReviewerAgent(db).review(
             evaluation=clamped_initial, full_marks_by_qid=full_marks_by_qid, sheet_id=sheet.id,
@@ -255,26 +342,26 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         final_eval, awarded, possible = svc.clamp_marks(reviewed, questions)
 
         db.add(AnswerEvaluation(
-            sheet_id=sheet.id,
-            evaluation_data=final_eval,
-            initial_evaluation_data=initial_eval,
-            reviewed=True,
-            review_notes=review_notes,
-            total_marks_awarded=awarded,
-            total_marks_possible=possible,
-            overall_confidence=overall_conf,
-            model_used="gpt-5.5",
+            sheet_id=sheet.id, evaluation_data=final_eval, initial_evaluation_data=initial_eval,
+            reviewed=True, review_notes=review_notes, total_marks_awarded=awarded,
+            total_marks_possible=possible, overall_confidence=overall_conf, model_used="gpt-5.5",
         ))
         await db.commit()
 
-        # 6) Annotate + build checked PDF ----------------------------------------
+        # 5) Locate + validate annotation geometry -------------------------------
         sheet.current_status = "annotating"
         await db.commit()
-        await update_job(db, jid, progress=86, step="Drawing checked PDF")
-
-        commands_by_page = _build_annotation_commands(
-            final_eval, reconstructed, all_lines, pages, awarded, possible,
+        await update_job(db, jid, progress=78, step="Locating annotations")
+        locator = AnnotationLocatorAgent(db)
+        regions_by_q = _regions_by_question(extraction)
+        commands_by_page, locator_plans = await _locate_and_build_commands(
+            final_eval, regions_by_q, page_map, locator, geom, sheet.id,
         )
+
+        await update_job(db, jid, progress=90, step="Drawing checked PDF")
+        # Per-question marks + total banner.
+        _add_marks_and_banner(commands_by_page, final_eval, regions_by_q, page_map, awarded, possible)
+
         annotated_pngs = [
             annotate.draw_annotations(page.png_bytes, commands_by_page.get(page.page_number, []))
             for page in pages
@@ -284,11 +371,8 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         checked_key = f"answer-sheets/checked/{sheet.id}/checked.pdf"
         get_r2().upload_fileobj(checked_key, io.BytesIO(checked_pdf), "application/pdf")
         checked_file = File(
-            original_filename="checked.pdf",
-            display_name=f"{test.display_name} — Checked",
-            mime_type="application/pdf",
-            file_size=len(checked_pdf),
-            r2_key=checked_key,
+            original_filename="checked.pdf", display_name=f"{test.display_name} — Checked",
+            mime_type="application/pdf", file_size=len(checked_pdf), r2_key=checked_key,
             uploaded_by=sheet.student_id,
         )
         db.add(checked_file)
@@ -296,19 +380,16 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         db.add(PDFAnnotation(
             sheet_id=sheet.id,
             annotation_instructions={"pages": {str(k): v for k, v in commands_by_page.items()}},
-            checked_file_id=checked_file.id,
-            annotation_status="completed",
+            locator_plan={"targets": locator_plans},
+            checked_file_id=checked_file.id, annotation_status="completed",
         ))
         sheet.current_status = "checked"
         await db.commit()
 
         await update_job(
             db, jid, status=JobStatus.completed, progress=100, step="Checked",
-            output={
-                "total_marks_awarded": awarded,
-                "total_marks_possible": possible,
-                "quality_status": metrics.overall_status,
-            },
+            output={"total_marks_awarded": awarded, "total_marks_possible": possible,
+                    "quality_status": metrics.overall_status},
         )
 
     try:
@@ -319,11 +400,104 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
 
 
-# ── helpers ─────────────────────────────────────────────────────────────────────
+# ── annotation helpers ───────────────────────────────────────────────────────────
+
+def _regions_by_question(extraction: dict) -> dict[str, list[dict]]:
+    """{question_number: [{page, question_bbox}]} from the stored extraction."""
+    out: dict[str, list[dict]] = {}
+    for q in extraction.get("questions", []):
+        out[str(q.get("qid"))] = q.get("page_regions") or []
+    return out
+
+
+async def _locate_and_build_commands(final_eval, regions_by_q, page_map, locator, geom, sheet_id):
+    """For each reviewed annotation target: run the vision locator, validate the
+    geometry, and emit underline/comment draw commands. Returns (commands_by_page,
+    locator_plans) — plans are persisted for audit. Stays uncrowded via per-page and
+    per-question caps."""
+    commands_by_page: dict[int, list[dict]] = {}
+    locator_plans: list[dict] = []
+    page_target_count: dict[int, int] = {}
+
+    def add(page_no: int, cmd: dict) -> None:
+        commands_by_page.setdefault(page_no, []).append(cmd)
+
+    for qres in final_eval.get("question_results", []):
+        qnum = str(qres.get("question_number") or "")
+        regions = regions_by_q.get(qnum, [])
+        targets = (qres.get("annotation_targets") or [])[:MAX_TARGETS_PER_QUESTION]
+        for target in targets:
+            if not isinstance(target, dict) or not (target.get("target_text") or "").strip():
+                continue
+            page_no = target.get("page_number") or (regions[0]["page"] if regions else None)
+            page = page_map.get(page_no)
+            if not page:
+                continue
+            if page_target_count.get(page_no, 0) >= MAX_TARGETS_PER_PAGE:
+                continue
+            qbbox = next((r.get("question_bbox") for r in regions if r.get("page") == page_no), None)
+            try:
+                loc = await locator.locate(
+                    page_png=page.png_bytes, page_number=page_no, width=page.width, height=page.height,
+                    question_number=qnum, target_text=target.get("target_text", ""),
+                    comment_text=target.get("comment_text", ""),
+                    annotation_action=target.get("annotation_action", "underline_with_comment"),
+                    question_bbox=qbbox, sheet_id=sheet_id,
+                )
+            except Exception as exc:
+                logger.warning("locator failed (skipping target): %s", exc)
+                continue
+            plan = geom.validate_and_smooth(loc, (page.width, page.height), qbbox)
+            locator_plans.append({k: v for k, v in plan.items() if k != "original"})
+            page_target_count[page_no] = page_target_count.get(page_no, 0) + 1
+
+            if plan.get("final_underline_paths"):
+                add(page_no, {"type": "underline_path", "paths": plan["final_underline_paths"]})
+            if plan.get("final_comment_box") and (plan.get("comment_text") or "").strip():
+                add(page_no, {"type": "comment", "text": plan["comment_text"], "box": plan["final_comment_box"]})
+    return commands_by_page, locator_plans
+
+
+def _add_marks_and_banner(commands_by_page, final_eval, regions_by_q, page_map, awarded, possible) -> None:
+    first_page = min(page_map.keys()) if page_map else 1
+
+    def add(page_no: int, cmd: dict) -> None:
+        commands_by_page.setdefault(page_no, []).append(cmd)
+
+    for qres in final_eval.get("question_results", []):
+        qnum = str(qres.get("question_number") or "")
+        regions = [r for r in regions_by_q.get(qnum, []) if r.get("question_bbox")]
+        if not regions:
+            continue
+        # Place the mark at the END of the answer (bottom-right of the largest region),
+        # like a teacher's tick — never the page-top corner.
+        region = max(regions, key=lambda r: (r["question_bbox"][2] * r["question_bbox"][3]))
+        page = page_map.get(region.get("page"))
+        if not page:
+            continue
+        x, y, w, h = region["question_bbox"]
+        mark_text = f"{_fmt(qres.get('awarded_marks', 0))}/{_fmt(qres.get('max_marks', 0))}"
+        mx = min(int(page.width * 0.88), int(x + w - 10))
+        my = int(y + h - 6)
+        if region["page"] == first_page and my < 90:   # don't collide with the total banner
+            my = 96
+        add(region["page"], {"type": "mark", "text": mark_text, "x": mx, "y": my})
+    add(first_page, {"type": "banner", "text": f"Total: {_fmt(awarded)} / {_fmt(possible)}"})
+
+
+def _fmt(v) -> str:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return str(int(f)) if f == int(f) else str(round(f, 1))
+
+
+# ── text-resolution + failure helpers ────────────────────────────────────────────
 
 async def _resolve_text(db, file_id) -> str:
-    """Best-effort text for a stored file: direct text extraction, with a vision
-    OCR fallback for scanned PDFs / images that carry no embedded text."""
+    """Best-effort text for a stored file: direct text extraction, with a vision OCR
+    fallback for scanned PDFs / images that carry no embedded text."""
     if not file_id:
         return ""
     from sqlalchemy import select
@@ -349,8 +523,6 @@ async def _resolve_text(db, file_id) -> str:
             text = ""
     if len(text.strip()) >= 30:
         return text
-
-    # Vision OCR fallback (scanned paper or image upload).
     return await _vision_ocr(db, data, f.mime_type, file_id)
 
 
@@ -378,73 +550,6 @@ async def _vision_ocr(db, data: bytes, mime_type: str, entity_id) -> str:
         except Exception as exc:
             logger.warning("vision OCR failed on a page: %s", exc)
     return "\n".join(parts)
-
-
-def _build_annotation_commands(
-    evaluation: dict, reconstructed: dict, all_lines: list[dict], pages: list, awarded: float, possible: float,
-) -> dict[int, list[dict]]:
-    """Turn the reviewed evaluation into per-page draw commands.
-
-    - underline/circle: only for AI-flagged specific wrong lines (resolved via line id → bbox)
-    - mark: each question's "m/fm" placed near that question's first answer line
-    - banner: total marks on page 1
-    Keeps it sparse to avoid overcrowding (CLAUDE.md §12).
-    """
-    line_index = {ln["id"]: ln for ln in all_lines if ln.get("id")}
-    page_width = {p.page_number: p.width for p in pages}
-    first_page = pages[0].page_number if pages else 1
-
-    # First answer line (with bbox) per question, for placing the mark.
-    first_line_by_q: dict[str, dict] = {}
-    for q in reconstructed.get("questions", []):
-        for ln in q.get("lines", []):
-            if ln.get("bbox"):
-                first_line_by_q[q["qid"]] = ln
-                break
-
-    commands: dict[int, list[dict]] = {}
-
-    def add(page_no: int, cmd: dict) -> None:
-        commands.setdefault(page_no, []).append(cmd)
-
-    for item in evaluation.get("questions", []):
-        qid = str(item.get("qid") or "")
-        # Line annotations for specific wrong items only.
-        for ann in item.get("ann", []) or []:
-            if not isinstance(ann, dict):
-                continue
-            t = ann.get("t")
-            line_id = ann.get("line")
-            if t in ("underline", "circle") and line_id and line_id in line_index:
-                ref = line_index[line_id]
-                if ref.get("bbox"):
-                    add(ref.get("page", first_page), {"type": t, "bbox": ref["bbox"]})
-            elif t == "comment" and ann.get("text"):
-                anchor = first_line_by_q.get(qid)
-                page_no = anchor.get("page", first_page) if anchor else first_page
-                y = anchor["bbox"][1] if (anchor and anchor.get("bbox")) else 20
-                add(page_no, {"type": "comment", "text": str(ann["text"]),
-                              "x": int(page_width.get(page_no, 1000) * 0.7), "y": int(y)})
-
-        # Per-question mark near the question's first line.
-        anchor = first_line_by_q.get(qid)
-        if anchor and anchor.get("bbox"):
-            page_no = anchor.get("page", first_page)
-            bx, by, bw, bh = anchor["bbox"]
-            mark_text = f"{_fmt(item.get('m', 0))}/{_fmt(item.get('fm', 0))}"
-            add(page_no, {"type": "mark", "text": mark_text,
-                          "x": min(int(page_width.get(page_no, 1000) * 0.86), bx + bw + 10), "y": by})
-
-    add(first_page, {"type": "banner", "text": f"Total: {_fmt(awarded)} / {_fmt(possible)}"})
-    return commands
-
-
-def _fmt(v) -> str:
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return str(v)
-    return str(int(f)) if f == int(f) else str(round(f, 1))
 
 
 def _mark_skill_failed(test_id: str) -> None:

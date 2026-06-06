@@ -1,0 +1,328 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  skillLayerService,
+  type ChatMessage,
+  type Draft,
+  type SkillDetail,
+  type SkillListItem,
+} from "../../services/skillLayer";
+import { getErrorMessage } from "../../utils/error";
+
+export function AdminSkillLayer() {
+  const [skills, setSkills] = useState<SkillListItem[]>([]);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [detail, setDetail] = useState<SkillDetail | null>(null);
+  const [loadingList, setLoadingList] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Chat state
+  const [chatId, setChatId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [approving, setApproving] = useState(false);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+
+  const loadSkills = useCallback(async () => {
+    setLoadingList(true);
+    try {
+      const data = await skillLayerService.listSkills();
+      setSkills(data);
+      setSelected((prev) => prev ?? data[0]?.agent_type ?? null);
+    } catch (err) {
+      setError(getErrorMessage(err, "Failed to load skills."));
+    } finally {
+      setLoadingList(false);
+    }
+  }, []);
+
+  const loadDetail = useCallback(async (agentType: string) => {
+    try {
+      setDetail(await skillLayerService.getSkillDetail(agentType));
+    } catch (err) {
+      setError(getErrorMessage(err, "Failed to load skill detail."));
+    }
+  }, []);
+
+  useEffect(() => {
+    loadSkills();
+  }, [loadSkills]);
+
+  useEffect(() => {
+    if (!selected) return;
+    loadDetail(selected);
+    // Reset chat when switching agents
+    setChatId(null);
+    setMessages([]);
+    setDraft(null);
+    setInput("");
+    setError(null);
+  }, [selected, loadDetail]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const ensureChat = useCallback(async (): Promise<string> => {
+    if (chatId) return chatId;
+    const started = await skillLayerService.startChat(selected!);
+    setChatId(started.chat_id);
+    setMessages(started.messages);
+    return started.chat_id;
+  }, [chatId, selected]);
+
+  const handleSend = async () => {
+    const text = input.trim();
+    if (!text || sending || !selected) return;
+    setSending(true);
+    setError(null);
+    setInput("");
+    setMessages((prev) => [...prev, { role: "admin", content: text }]);
+    try {
+      const id = await ensureChat();
+      const res = await skillLayerService.sendMessage(id, text);
+      setMessages((prev) => [...prev, { role: "assistant", content: res.reply }]);
+      setDraft(res.draft);
+    } catch (err) {
+      setError(getErrorMessage(err, "Failed to send message."));
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "⚠️ Failed to get a response. Please try again." },
+      ]);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const handleApprove = async () => {
+    if (!chatId || !draft || approving) return;
+    setApproving(true);
+    setError(null);
+    try {
+      await skillLayerService.approveChat(chatId);
+      // New version is now active — refresh everything and reset the chat.
+      setDraft(null);
+      setChatId(null);
+      setMessages([]);
+      await loadDetail(selected!);
+      await loadSkills();
+    } catch (err) {
+      setError(getErrorMessage(err, "Failed to approve the skill update."));
+    } finally {
+      setApproving(false);
+    }
+  };
+
+  const handleDiscard = async () => {
+    if (!chatId) return;
+    setError(null);
+    try {
+      await skillLayerService.discardChat(chatId);
+    } catch {
+      /* discard is best-effort */
+    }
+    setDraft(null);
+    setChatId(null);
+    setMessages([]);
+  };
+
+  return (
+    <div className="flex h-[calc(100vh-7rem)] flex-col">
+      <div className="mb-4">
+        <h1 className="text-2xl font-bold text-gray-900">Skill Layer</h1>
+        <p className="text-sm text-gray-500">
+          Improve an AI agent's behavior by chatting with the Skill Builder, then approve to activate
+          a new version.
+        </p>
+      </div>
+
+      {error && (
+        <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">
+          {error}
+        </div>
+      )}
+
+      <div className="grid min-h-0 flex-1 grid-cols-12 gap-4">
+        {/* Left: agent selector */}
+        <div className="col-span-3 min-h-0 overflow-y-auto rounded-xl border border-gray-200 bg-white">
+          <div className="border-b border-gray-100 px-4 py-3 text-xs font-semibold uppercase tracking-wide text-gray-500">
+            Agents
+          </div>
+          {loadingList ? (
+            <div className="p-4 text-sm text-gray-400">Loading…</div>
+          ) : (
+            <ul>
+              {skills.map((s) => (
+                <li key={s.agent_type}>
+                  <button
+                    onClick={() => setSelected(s.agent_type)}
+                    className={`flex w-full items-center justify-between gap-2 px-4 py-2.5 text-left text-sm transition-colors ${
+                      selected === s.agent_type
+                        ? "bg-brand-50 font-medium text-brand-700"
+                        : "text-gray-700 hover:bg-gray-50"
+                    }`}
+                  >
+                    <span className="truncate">{s.agent_type}</span>
+                    {s.active_version_number != null && (
+                      <span className="flex-shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-500">
+                        v{s.active_version_number}
+                      </span>
+                    )}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        {/* Center: chat */}
+        <div className="col-span-5 flex min-h-0 flex-col rounded-xl border border-gray-200 bg-white">
+          <div className="border-b border-gray-100 px-4 py-3 text-sm font-semibold text-gray-700">
+            Skill Builder Chat
+          </div>
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
+            {messages.length === 0 ? (
+              <p className="text-sm text-gray-400">
+                Describe a change you'd like for <strong>{selected}</strong> to start a conversation.
+              </p>
+            ) : (
+              messages.map((m, i) => (
+                <div
+                  key={i}
+                  className={`flex ${m.role === "admin" ? "justify-end" : "justify-start"}`}
+                >
+                  <div
+                    className={`max-w-[85%] whitespace-pre-wrap rounded-2xl px-3.5 py-2 text-sm ${
+                      m.role === "admin"
+                        ? "bg-brand-500 text-white"
+                        : "bg-gray-100 text-gray-800"
+                    }`}
+                  >
+                    {m.content}
+                  </div>
+                </div>
+              ))
+            )}
+            {sending && <div className="text-xs text-gray-400">Skill Builder is thinking…</div>}
+            <div ref={chatEndRef} />
+          </div>
+          <div className="border-t border-gray-100 p-3">
+            <div className="flex gap-2">
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    handleSend();
+                  }
+                }}
+                rows={2}
+                placeholder="e.g. Make questions harder and add more numerical reasoning…"
+                disabled={!selected || sending}
+                className="flex-1 resize-none rounded-lg border border-gray-200 px-3 py-2 text-sm focus:border-brand-400 focus:outline-none"
+              />
+              <button
+                onClick={handleSend}
+                disabled={!input.trim() || sending || !selected}
+                className="self-end rounded-lg bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-600 disabled:opacity-50"
+              >
+                Send
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Right: current / draft / history */}
+        <div className="col-span-4 min-h-0 space-y-4 overflow-y-auto">
+          {/* Draft / approve */}
+          <div className="rounded-xl border border-gray-200 bg-white p-4">
+            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
+              Proposed Draft
+            </div>
+            {draft ? (
+              <>
+                <p className="mb-2 text-xs text-gray-500">{draft.change_summary}</p>
+                <div className="mb-3 max-h-48 overflow-y-auto whitespace-pre-wrap rounded-lg bg-amber-50 p-3 text-sm text-gray-800">
+                  {draft.instruction_text}
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={handleApprove}
+                    disabled={approving}
+                    className="rounded-lg bg-green-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50"
+                  >
+                    {approving ? "Approving…" : "Approve & Activate"}
+                  </button>
+                  <button
+                    onClick={handleDiscard}
+                    disabled={approving}
+                    className="rounded-lg border border-gray-200 px-4 py-1.5 text-sm text-gray-600 hover:bg-gray-50"
+                  >
+                    Discard
+                  </button>
+                </div>
+              </>
+            ) : (
+              <p className="text-sm text-gray-400">
+                No proposed change yet. Ask the Skill Builder for a change and a draft will appear here.
+              </p>
+            )}
+          </div>
+
+          {/* Current active */}
+          <div className="rounded-xl border border-gray-200 bg-white p-4">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                Active Instruction
+              </span>
+              {detail?.active && (
+                <span className="rounded-full bg-green-50 px-2 py-0.5 text-xs font-medium text-green-700">
+                  v{detail.active.version_number}
+                </span>
+              )}
+            </div>
+            <div className="max-h-48 overflow-y-auto whitespace-pre-wrap rounded-lg bg-gray-50 p-3 text-sm text-gray-800">
+              {detail?.active?.instruction_text || "No active skill."}
+            </div>
+          </div>
+
+          {/* Version history */}
+          <div className="rounded-xl border border-gray-200 bg-white p-4">
+            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
+              Version History
+            </div>
+            {detail && detail.history.length > 0 ? (
+              <ul className="space-y-2">
+                {detail.history.map((v) => (
+                  <li key={v.id} className="rounded-lg border border-gray-100 px-3 py-2 text-sm">
+                    <div className="flex items-center justify-between">
+                      <span className="font-medium text-gray-800">v{v.version_number}</span>
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-xs ${
+                          v.status === "active"
+                            ? "bg-green-50 text-green-700"
+                            : v.status === "draft"
+                            ? "bg-amber-50 text-amber-700"
+                            : "bg-gray-100 text-gray-500"
+                        }`}
+                      >
+                        {v.status}
+                      </span>
+                    </div>
+                    {v.change_summary && (
+                      <p className="mt-1 text-xs text-gray-500">{v.change_summary}</p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-sm text-gray-400">No versions yet.</p>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
