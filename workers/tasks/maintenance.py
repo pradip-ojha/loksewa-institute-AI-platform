@@ -2,7 +2,7 @@
 import logging
 
 from workers.celery_app import celery_app
-from workers.runtime import run_async
+from workers.runtime import get_loop, run_async
 
 logger = logging.getLogger(__name__)
 
@@ -30,4 +30,12 @@ def reap_stale_jobs() -> None:
             if reaped:
                 logger.warning("Reaped %d stale job(s) → failed", reaped)
 
+    # The persistent loop runs ONE task at a time. If a long task (e.g. video
+    # processing) is currently occupying it, calling run_until_complete here would
+    # raise "event loop is already running". Skip this tick — it's a 2-min backstop,
+    # the in-task wait_for timeout already bounds a genuinely wedged task, and the
+    # next tick reaps once the loop is free.
+    if get_loop().is_running():
+        logger.info("Worker loop busy with a task; skipping this reap tick.")
+        return
     run_async(work())

@@ -17,11 +17,21 @@ logger = logging.getLogger(__name__)
 TIMELINE_PROMPT = """You build a structured TIMELINE from a Nepali Loksewa lecture transcript.
 The timeline is both a UI feature and the retrieval index a router will later use to answer student questions.
 
+The transcript is provided as TIME-ANCHORED SECTIONS. Each section header states the real time window
+(in seconds) that the section's text covers. Consecutive sections may overlap by a few seconds — treat
+the whole thing as ONE continuous lecture and do NOT emit duplicate segments for the overlapping content.
+
 Split the lecture into MEANINGFUL teaching segments:
 - Each segment is one coherent teaching unit (a concept, sub-topic, worked example, or discussion).
 - Aim for roughly 3–10 minutes per segment, but a meaningful unit matters more than exact duration.
 - Segments must be in order and cover the whole lecture without large gaps.
-- The lecture's total duration is about {duration_seconds} seconds. Keep start/end within [0, duration].
+- The lecture's total duration is about {duration_seconds} seconds.
+
+ANCHOR TIMESTAMPS TO REAL TIME (important):
+- Set each segment's start_seconds/end_seconds using the time window of the section(s) its content comes from.
+- Within a section, interpolate by where the content sits in that section's text (e.g. content halfway
+  through a section that covers 480–960s starts around 720s).
+- Never output a timestamp outside the covering section's window, and keep every value within [0, {duration_seconds}].
 
 For each segment, write:
 - label: short, specific title (the router routes by this — make it descriptive, not generic).
@@ -35,7 +45,7 @@ Active skill instructions:
 Admin custom instruction (may be 'none'):
 {custom_instruction}
 
-CLEANED TRANSCRIPT:
+TIME-ANCHORED TRANSCRIPT SECTIONS:
 {transcript}
 
 Return ONLY valid JSON in exactly this structure:
@@ -59,13 +69,15 @@ class VideoTimelineAgent:
         self.db = db
         self.provider = get_provider("reasoning")
 
-    async def generate(self, *, cleaned_transcript: str, duration_seconds: int | None, custom_instruction: str | None, video_id: uuid.UUID) -> list[dict]:
+    async def generate(self, *, chunks: list[dict], duration_seconds: int | None, custom_instruction: str | None, video_id: uuid.UUID) -> list[dict]:
+        """`chunks`: ordered [{start_seconds, end_seconds, text}] cleaned sections with
+        their global time windows, so emitted segment timestamps are anchored to real time."""
         skill = await self._get_skill()
         prompt = TIMELINE_PROMPT.format(
             skill_instructions=skill,
             custom_instruction=custom_instruction or "none",
             duration_seconds=int(duration_seconds or 0),
-            transcript=cleaned_transcript[:60000],
+            transcript=_build_timed_transcript(chunks)[:60000],
         )
         audit_ctx = {
             "db": self.db,
@@ -107,3 +119,26 @@ class VideoTimelineAgent:
             return await get_active_skill_text(self.db, "VideoTimelineAgent")
         except Exception:
             return "Split the lecture into meaningful teaching segments with high-quality labels and descriptions for routing."
+
+
+def _fmt_clock(seconds: float) -> str:
+    s = max(0, int(round(seconds)))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{sec:02d}"
+
+
+def _build_timed_transcript(chunks: list[dict]) -> str:
+    """Render cleaned chunks as time-anchored sections the model can pin timestamps to."""
+    parts: list[str] = []
+    for c in chunks:
+        text = str(c.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(c.get("start_seconds") or 0)
+        end = float(c.get("end_seconds") or 0)
+        parts.append(
+            f"=== Section covering {_fmt_clock(start)}–{_fmt_clock(end)} "
+            f"({int(start)}s to {int(end)}s) ===\n{text}"
+        )
+    return "\n\n".join(parts)

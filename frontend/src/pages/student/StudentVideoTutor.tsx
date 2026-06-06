@@ -85,8 +85,31 @@ function PlayerView({ videoId, onBack }: { videoId: string; onBack: () => void }
   const seekTo = useCallback((seconds: number) => {
     const el = mediaRef.current;
     if (!el) return;
-    el.currentTime = seconds;
-    void el.play?.();
+    const target = Math.max(0, seconds || 0);
+    const apply = () => {
+      try {
+        el.currentTime = target;
+      } catch {
+        /* element not seekable yet */
+      }
+      void el.play?.();
+    };
+    // Seeking before metadata is loaded (readyState 0) is silently clamped to 0 by
+    // the browser, which is why the player jumped to the start. Wait for metadata.
+    if (el.readyState >= 1) {
+      apply();
+    } else {
+      const onReady = () => {
+        el.removeEventListener("loadedmetadata", onReady);
+        apply();
+      };
+      el.addEventListener("loadedmetadata", onReady);
+      try {
+        el.load();
+      } catch {
+        /* ignore */
+      }
+    }
     el.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
 
@@ -109,11 +132,23 @@ function PlayerView({ videoId, onBack }: { videoId: string; onBack: () => void }
       <h1 className="mb-3 text-lg font-bold text-gray-900">{data.display_name}</h1>
 
       {data.media_url && (
-        <div className="mb-4 overflow-hidden rounded-xl bg-black">
+        <div className="mx-auto mb-4 max-w-2xl overflow-hidden rounded-xl bg-black shadow-sm">
           {data.is_audio_only ? (
-            <audio ref={mediaRef as React.RefObject<HTMLAudioElement>} src={data.media_url} controls className="w-full" />
+            <audio
+              ref={mediaRef as React.RefObject<HTMLAudioElement>}
+              src={data.media_url}
+              controls
+              preload="metadata"
+              className="w-full"
+            />
           ) : (
-            <video ref={mediaRef as React.RefObject<HTMLVideoElement>} src={data.media_url} controls className="w-full" />
+            <video
+              ref={mediaRef as React.RefObject<HTMLVideoElement>}
+              src={data.media_url}
+              controls
+              preload="metadata"
+              className="mx-auto max-h-[45vh] w-full object-contain"
+            />
           )}
         </div>
       )}
@@ -213,6 +248,12 @@ interface ChatTurn {
   error?: string;
 }
 
+const STARTER_QUESTIONS = [
+  "यो लेक्चरको मुख्य बुँदा के हो?",
+  "यो विषय परीक्षाको लागि कसरी सोधिन्छ?",
+  "अहिलेको भाग सरल भाषामा बुझाउनुहोस्।",
+];
+
 function TutorTab({
   videoId, getCurrentTime, seekTo,
 }: {
@@ -223,11 +264,18 @@ function TutorTab({
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [question, setQuestion] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const endRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [turns]);
 
   async function ask(q: string) {
     const text = q.trim();
-    if (!text) return;
+    if (!text || busy) return;
     setQuestion("");
+    setBusy(true);
     const idx = turns.length;
     setTurns((t) => [...t, { question: text, loading: true }]);
     try {
@@ -239,70 +287,127 @@ function TutorTab({
       setSessionId(res.chat_session_id);
       setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, response: res } : turn)));
     } catch (err) {
-      setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, error: getErrorMessage(err, "Failed to get an answer.") } : turn)));
+      setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, error: getErrorMessage(err, "उत्तर ल्याउन सकिएन।") } : turn)));
+    } finally {
+      setBusy(false);
     }
   }
 
   return (
-    <div>
-      <div className="space-y-4">
+    <div className="flex flex-col">
+      <div className="min-h-[40vh] space-y-4">
+        {turns.length === 0 && (
+          <div className="rounded-2xl bg-gradient-to-br from-brand-50 to-white p-5 text-center ring-1 ring-brand-100">
+            <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-full bg-brand-600 text-lg text-white">
+              ✨
+            </div>
+            <p className="text-sm font-semibold text-gray-800">AI Tutor लाई सोध्नुहोस्</p>
+            <p className="mt-1 text-xs text-gray-500">
+              लेक्चरबारे जे पनि सोध्नुहोस् — उत्तरसँगै सम्बन्धित भिडियो समय पनि देखाइन्छ।
+            </p>
+            <div className="mt-3 flex flex-wrap justify-center gap-2">
+              {STARTER_QUESTIONS.map((s, i) => (
+                <button
+                  key={i}
+                  onClick={() => ask(s)}
+                  className="rounded-full bg-white px-3 py-1.5 text-xs text-brand-700 shadow-sm ring-1 ring-brand-100 hover:bg-brand-50"
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {turns.map((turn, i) => (
           <div key={i} className="space-y-2">
-            <div className="rounded-xl bg-brand-50 p-3 text-sm text-brand-900">{turn.question}</div>
-            {turn.loading && <p className="text-sm text-gray-500">सोच्दै…</p>}
-            {turn.error && <p className="text-sm text-red-600">{turn.error}</p>}
-            {turn.response && (
-              <div className="rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-100">
-                <p className="whitespace-pre-wrap text-sm text-gray-800">{turn.response.answer}</p>
+            {/* Student question — right aligned bubble */}
+            <div className="flex justify-end">
+              <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-brand-600 px-4 py-2 text-sm text-white shadow-sm">
+                {turn.question}
+              </div>
+            </div>
 
-                {turn.response.selected_segments.length > 0 && (
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    {turn.response.selected_segments.map((s) => (
-                      <button
-                        key={s.segment_id}
-                        onClick={() => seekTo(s.start_seconds)}
-                        className="rounded-lg bg-brand-50 px-2.5 py-1 text-xs font-medium text-brand-700"
-                      >
-                        ▶ {s.start_time} · {s.label}
-                      </button>
-                    ))}
+            {/* Tutor answer — left aligned */}
+            <div className="flex items-start gap-2">
+              <div className="mt-0.5 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-brand-100 text-sm">
+                🎓
+              </div>
+              <div className="max-w-[88%] rounded-2xl rounded-tl-sm bg-white p-4 shadow-sm ring-1 ring-gray-100">
+                {turn.loading && (
+                  <div className="flex items-center gap-1 py-1" aria-label="सोच्दै">
+                    <span className="h-2 w-2 animate-bounce rounded-full bg-brand-300 [animation-delay:-0.3s]" />
+                    <span className="h-2 w-2 animate-bounce rounded-full bg-brand-300 [animation-delay:-0.15s]" />
+                    <span className="h-2 w-2 animate-bounce rounded-full bg-brand-300" />
                   </div>
                 )}
+                {turn.error && <p className="text-sm text-red-600">{turn.error}</p>}
+                {turn.response && (
+                  <>
+                    <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-800">{turn.response.answer}</p>
 
-                {turn.response.follow_up_suggestions.length > 0 && (
-                  <div className="mt-3 border-t border-gray-100 pt-2">
-                    <p className="mb-1 text-xs text-gray-400">सम्भावित प्रश्न:</p>
-                    <div className="flex flex-wrap gap-2">
-                      {turn.response.follow_up_suggestions.map((f, j) => (
-                        <button
-                          key={j}
-                          onClick={() => ask(f)}
-                          className="rounded-full bg-gray-100 px-3 py-1 text-xs text-gray-700"
-                        >
-                          {f}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
+                    {turn.response.selected_segments.length > 0 && (
+                      <div className="mt-3 border-t border-gray-100 pt-3">
+                        <p className="mb-1.5 text-xs font-medium text-gray-400">📍 भिडियोमा हेर्नुहोस्</p>
+                        <div className="flex flex-wrap gap-2">
+                          {turn.response.selected_segments.map((s) => (
+                            <button
+                              key={s.segment_id}
+                              onClick={() => seekTo(s.start_seconds)}
+                              title={s.label}
+                              className="group inline-flex items-center gap-1.5 rounded-full bg-brand-50 py-1 pl-1 pr-3 text-xs font-medium text-brand-700 ring-1 ring-brand-100 transition-colors hover:bg-brand-100"
+                            >
+                              <span className="flex h-5 w-5 items-center justify-center rounded-full bg-brand-600 text-[10px] text-white">▶</span>
+                              <span className="tabular-nums">{s.start_time}</span>
+                              <span className="max-w-[8rem] truncate text-brand-500 group-hover:text-brand-700">· {s.label}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {turn.response.follow_up_suggestions.length > 0 && (
+                      <div className="mt-3 border-t border-gray-100 pt-3">
+                        <p className="mb-1.5 text-xs font-medium text-gray-400">सम्भावित प्रश्न</p>
+                        <div className="flex flex-wrap gap-2">
+                          {turn.response.follow_up_suggestions.map((f, j) => (
+                            <button
+                              key={j}
+                              onClick={() => ask(f)}
+                              className="rounded-full bg-gray-100 px-3 py-1 text-xs text-gray-700 transition-colors hover:bg-gray-200"
+                            >
+                              {f}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
-            )}
+            </div>
           </div>
         ))}
+        <div ref={endRef} />
       </div>
 
       <form
         onSubmit={(e) => { e.preventDefault(); void ask(question); }}
-        className="mt-4 flex gap-2"
+        className="sticky bottom-16 mt-4 flex items-center gap-2 rounded-full bg-white p-1.5 shadow-md ring-1 ring-gray-200"
       >
         <input
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
           placeholder="प्रश्न सोध्नुहोस्…"
-          className="flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm"
+          className="flex-1 rounded-full border-0 bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-0"
         />
-        <button type="submit" className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white">
-          Send
+        <button
+          type="submit"
+          disabled={busy || !question.trim()}
+          className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-brand-600 text-white transition-colors hover:bg-brand-700 disabled:opacity-40"
+          aria-label="Send"
+        >
+          ➤
         </button>
       </form>
     </div>

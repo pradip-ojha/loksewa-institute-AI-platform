@@ -262,16 +262,31 @@ class AzureOpenAIProvider(AIModelProvider):
         if not settings.MODEL_TRANSCRIPTION:
             raise RuntimeError("MODEL_TRANSCRIPTION is not configured.")
         client = _get_reasoning_client()
-        ext = mime_type.split("/")[-1] if "/" in mime_type else "mp3"
+        # The transcription API infers the codec from the filename extension, so
+        # the extension MUST name a real audio format. Our pipeline produces MP3
+        # with mime "audio/mpeg" — sending it as "audio.mpeg" makes the API treat
+        # it as an MPEG *video* container and reject it ("corrupted or unsupported").
+        _ext_by_mime = {
+            "audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/mpga": "mp3",
+            "audio/mp4": "mp4", "audio/m4a": "m4a", "audio/x-m4a": "m4a",
+            "audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav",
+            "audio/webm": "webm", "audio/ogg": "ogg", "audio/flac": "flac",
+        }
+        sub = (mime_type or "").split("/")[-1].lower()
+        ext = _ext_by_mime.get((mime_type or "").lower()) or ("mp3" if sub in ("", "mpeg", "mpga") else sub)
         audio_file = io.BytesIO(audio_bytes)
         audio_file.name = f"audio.{ext}"
 
+        # gpt-4o-transcribe / gpt-4o-mini-transcribe only support "json" or "text"
+        # (verbose_json — and thus segment-level timestamps — is whisper-1 only).
+        # Our timeline is built by VideoTimelineAgent from the cleaned transcript,
+        # so we don't depend on transcription segments; request plain "json".
         t0 = time.monotonic()
         try:
             response = await client.audio.transcriptions.create(
                 model=settings.MODEL_TRANSCRIPTION,
                 file=audio_file,
-                response_format="verbose_json",
+                response_format="json",
                 timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
             )
             latency = int((time.monotonic() - t0) * 1000)

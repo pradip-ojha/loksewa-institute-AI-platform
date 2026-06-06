@@ -100,8 +100,10 @@ def process_video(self, job_id: str, video_id: str) -> None:
         video.processing_status = "transcribing"
         await db.commit()
         provider = get_provider("reasoning")
-        merged_text_parts: list[str] = []
-        merged_segments: list[dict] = []
+        dur = float(video.duration_seconds or 0)
+        # Per-chunk transcripts carry their GLOBAL time window so the timeline agent
+        # can anchor segment timestamps to real time (accurate even on long lectures).
+        timed_raw: list[dict] = []
         total = len(chunks)
         for i, ch in enumerate(chunks):
             await update_job(
@@ -125,39 +127,44 @@ def process_video(self, job_id: str, video_id: str) -> None:
             row.status = "transcribed"
             row.model_used = "gpt-4o-transcribe"
             if text:
-                merged_text_parts.append(text)
-            for seg in res.get("segments", []) or []:
-                merged_segments.append({
-                    "start_seconds": float(seg.get("start_seconds", 0) or 0) + ch.start_seconds,
-                    "end_seconds": float(seg.get("end_seconds", 0) or 0) + ch.start_seconds,
-                    "text": seg.get("text", ""),
-                })
+                start = float(ch.start_seconds or 0)
+                end = float(ch.end_seconds or 0)
+                if end <= start:  # chunk-probe failed → fall back to the lecture duration
+                    end = dur if dur > start else start
+                timed_raw.append({"start_seconds": start, "end_seconds": end, "text": text})
         await db.commit()
 
         # 4) Merge transcript -----------------------------------------------------
         video.processing_status = "merging_transcript"
         await update_job(db, jid, progress=58, step="Merging transcript")
-        raw_merged = "\n".join(merged_text_parts).strip()
+        raw_merged = "\n".join(c["text"] for c in timed_raw).strip()
         if not raw_merged:
             raise ValueError("Transcription produced no text")
         transcript = VideoTranscript(
-            video_id=video.id, raw_merged_transcript=raw_merged,
-            segments=merged_segments or None,
+            video_id=video.id, raw_merged_transcript=raw_merged, segments=None,
         )
         db.add(transcript)
         await db.commit()
 
-        # 5) Clean transcript -----------------------------------------------------
+        # 5) Clean transcript (per chunk, preserving time windows) ----------------
         video.processing_status = "cleaning_transcript"
         await update_job(db, jid, progress=62, step="Cleaning transcript")
         await db.commit()
         from app.ai.agents.video_transcript_cleaner_agent import VideoTranscriptCleanerAgent
-        cleaned_res = await VideoTranscriptCleanerAgent(db).clean(
-            raw_transcript=raw_merged, custom_instruction=video.custom_instruction, video_id=video.id,
-        )
-        cleaned = (cleaned_res.get("cleaned_transcript") or raw_merged).strip()
+        cleaner = VideoTranscriptCleanerAgent(db)
+        timed_clean: list[dict] = []
+        languages: list[str] = []
+        for c in timed_raw:
+            cleaned_res = await cleaner.clean(
+                raw_transcript=c["text"], custom_instruction=video.custom_instruction, video_id=video.id,
+            )
+            ct = (cleaned_res.get("cleaned_transcript") or c["text"]).strip()
+            timed_clean.append({"start_seconds": c["start_seconds"], "end_seconds": c["end_seconds"], "text": ct})
+            if cleaned_res.get("language"):
+                languages.append(cleaned_res["language"])
+        cleaned = "\n\n".join(c["text"] for c in timed_clean).strip()
         transcript.cleaned_transcript = cleaned
-        transcript.language = cleaned_res.get("language")
+        transcript.language = _pick_language(languages)
         transcript.model_used_for_cleaning = "gpt-5.5"
         await db.commit()
 
@@ -167,7 +174,7 @@ def process_video(self, job_id: str, video_id: str) -> None:
         await db.commit()
         from app.ai.agents.video_timeline_agent import VideoTimelineAgent
         segments = await VideoTimelineAgent(db).generate(
-            cleaned_transcript=cleaned, duration_seconds=video.duration_seconds,
+            chunks=timed_clean, duration_seconds=video.duration_seconds,
             custom_instruction=video.custom_instruction, video_id=video.id,
         )
         dur = float(video.duration_seconds or 0)
@@ -269,13 +276,31 @@ async def _to_thread(fn, *args):
     return await asyncio.to_thread(fn, *args)
 
 
+def _pick_language(languages: list[str]) -> str | None:
+    """Aggregate per-chunk detected languages into one label for the transcript."""
+    if not languages:
+        return None
+    if "nepali_english_mixed" in languages:
+        return "nepali_english_mixed"
+    return max(set(languages), key=languages.count)
+
+
 async def _delete_children(db, video_id: uuid.UUID) -> None:
-    from sqlalchemy import delete
+    from sqlalchemy import delete, select
+    from app.modules.files.models import File
     from app.modules.video.models import (
-        VideoAudioChunk, VideoSlideLabel, VideoSummary, VideoTimelineSegment, VideoTranscript,
+        Video, VideoAudioChunk, VideoSlideLabel, VideoSummary, VideoTimelineSegment, VideoTranscript,
     )
     for model in (VideoTimelineSegment, VideoSummary, VideoSlideLabel, VideoAudioChunk, VideoTranscript):
         await db.execute(delete(model).where(model.video_id == video_id))
+
+    # Drop the previously-extracted audio File so its deterministic r2_key can be
+    # re-inserted on a retry (the row would otherwise collide on files.r2_key).
+    video = (await db.execute(select(Video).where(Video.id == video_id))).scalar_one_or_none()
+    if video and video.audio_file_id:
+        video.audio_file_id = None
+        await db.flush()
+    await db.execute(delete(File).where(File.r2_key == f"audio/{video_id}/lecture.mp3"))
     await db.commit()
 
 

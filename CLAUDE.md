@@ -528,8 +528,13 @@ Module mirrors `subjective/` (`models.py`, `schemas.py`, `service.py`, `router.p
   merging_transcript → cleaning_transcript → generating_timeline → mapping_topics → generating_summary →
   processing_slides → completed | failed`. Steps: extract audio (`processing/audio_tools.extract_audio`,
   FFmpeg via `ffmpeg-python`, mono 16 kHz mp3, stored to R2 `audio/`) → chunk (≈8 min, 12 s overlap, global
-  offsets preserved) → transcribe each chunk (`provider.transcribe`, gpt-4o-transcribe) → merge (absolute
-  timestamps) → clean (`VideoTranscriptCleanerAgent`) → timeline (`VideoTimelineAgent`) → map segments to
+  offsets preserved) → transcribe each chunk (`provider.transcribe`, gpt-4o-transcribe, `response_format="json"`
+  — that model does NOT support `verbose_json`, so transcription returns text only, no segment timestamps) →
+  merge → clean **per chunk** (`VideoTranscriptCleanerAgent`, run once per chunk so each cleaned section keeps
+  its global time window; per-chunk languages aggregated via `_pick_language`) → timeline
+  (`VideoTimelineAgent`, fed the cleaned chunks as **time-anchored sections** so segment timestamps are pinned
+  to real chunk windows — accurate even on long multi-chunk lectures, since gpt-4o-transcribe gives no
+  per-segment times) → map segments to
   syllabus (`VideoSegmentTopicMapperAgent`, validated against the live tree) → full summary
   (`VideoSummaryAgent`) → slide labels if a slides PDF (`VideoSlideLabelAgent`, per-page PDF text aligned to
   timeline). Admin can **activate** only once `processing_status=completed`; `POST /admin/videos/{id}/retry`
