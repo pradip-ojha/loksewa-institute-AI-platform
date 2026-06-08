@@ -231,10 +231,12 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
             AnswerEvaluation, AnswerExtraction, AnswerQualityCheck, PDFAnnotation,
             QuestionSpecificCheckingSkill, StudentAnswerSheet, SubjectiveQuestion, SubjectiveTest,
         )
+        from app.ai.agents.answer_structure_agent import AnswerStructureAgent
         from app.ai.agents.answer_extraction_agent import AnswerExtractionAgent
         from app.ai.agents.answer_evaluation_agent import AnswerEvaluationAgent
         from app.ai.agents.answer_reviewer_agent import AnswerReviewerAgent
         from app.ai.agents.annotation_locator_agent import AnnotationLocatorAgent
+        from app.core.config import settings
         from app.processing import pdf_tools, image_quality, annotation as annotate
         from app.processing import annotation_geometry as geom
 
@@ -278,11 +280,18 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
             return
         await db.commit()
 
-        # 2) Question-level extraction -------------------------------------------
+        valid_numbers = [q.question_number for q in questions]
+
+        # 2a) Whole-sheet STRUCTURE pass (guidance for page extraction) -----------
+        await update_job(db, jid, progress=20, step="Detecting sheet structure")
+        structure_map = await AnswerStructureAgent(db).detect(
+            page_pngs=page_pngs, valid_numbers=valid_numbers, sheet_id=sheet.id,
+        )
+
+        # 2b) Question-level extraction (context-aware) ---------------------------
         sheet.current_status = "extracting"
         await db.commit()
         await update_job(db, jid, progress=24, step="Extracting answers (question level)")
-        valid_numbers = [q.question_number for q in questions]
         extractor = AnswerExtractionAgent(db)
         page_outputs: list[dict] = []
         confidences: list[float] = []
@@ -291,19 +300,25 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
                 db, jid, progress=24 + int(24 * idx / max(1, len(pages))),
                 step=f"Extracting page {idx + 1}/{len(pages)}",
             )
+            prev_tail = _prev_page_tail(page_outputs)
+            nxt = AnswerStructureAgent.page_hint(structure_map, page.page_number + 1)
             po = await extractor.extract_page(
                 page_png=page.png_bytes, page_number=page.page_number,
                 width=page.width, height=page.height,
                 valid_numbers=valid_numbers, sheet_id=sheet.id,
+                structure_hint=AnswerStructureAgent.page_hint(structure_map, page.page_number),
+                prev_page_tail=prev_tail,
+                next_page_hint=(f"Next page is expected to hold: {nxt}" if nxt else ""),
             )
             page_outputs.append(po)
             confidences.append(po.get("page_confidence", 0.0))
 
         extraction = svc.assemble_questionwise(page_outputs, questions)
+        extraction["structure_map"] = structure_map
         overall_conf = round(sum(confidences) / len(confidences), 3) if confidences else None
         db.add(AnswerExtraction(
             sheet_id=sheet.id, extracted_data=extraction,
-            overall_confidence=overall_conf, model_used="gpt-5.5",
+            overall_confidence=overall_conf, model_used=settings.MODEL_VISION,
         ))
         await db.commit()
 
@@ -400,6 +415,29 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
 
 
+# ── extraction helpers ───────────────────────────────────────────────────────────
+
+def _prev_page_tail(page_outputs: list[dict]) -> str:
+    """A short carry-forward hint from the previous page: its last question and whether
+    that answer was flagged as continuing, so the extractor can attribute unlabeled
+    writing at the top of this page."""
+    if not page_outputs:
+        return ""
+    last = page_outputs[-1]
+    answers = last.get("answers") or []
+    if not answers:
+        return ""
+    a = answers[-1]
+    qn = a.get("question_number")
+    tail = (a.get("answer_text") or "").strip().replace("\n", " ")
+    tail = tail[-160:]
+    cont = " (this answer was marked as continuing)" if a.get("continues") else ""
+    if not qn and not tail:
+        return ""
+    return (f"Previous page ended with question {qn}{cont}. Its last words were: "
+            f"\"...{tail}\". If this page starts with unlabeled writing, it likely continues question {qn}.")
+
+
 # ── annotation helpers ───────────────────────────────────────────────────────────
 
 def _regions_by_question(extraction: dict) -> dict[str, list[dict]]:
@@ -410,11 +448,62 @@ def _regions_by_question(extraction: dict) -> dict[str, list[dict]]:
     return out
 
 
+def _positive_sections(qres: dict) -> list[dict]:
+    """Fully-correct sections with evidence text → become a teacher's tick beside the
+    good point. (Partial sections get no inline tick; the section-wise breakdown lives in
+    the result UI. No section fractions are drawn on the PDF.)"""
+    out: list[dict] = []
+    for s in qres.get("sections") or []:
+        if not isinstance(s, dict):
+            continue
+        if s.get("status") == "correct" and (s.get("evidence_text") or "").strip():
+            out.append({
+                "section": s.get("section"), "evidence_text": s.get("evidence_text"),
+            })
+    return out[:MAX_TARGETS_PER_QUESTION]
+
+
+def _norm_text(s: str) -> str:
+    """Lowercased alphanumeric-only form (keeps Devanagari letters) for fuzzy matching."""
+    return "".join(ch.lower() for ch in (s or "") if ch.isalnum())
+
+
+def _ngrams(s: str, n: int = 4) -> set[str]:
+    return {s[i:i + n] for i in range(len(s) - n + 1)} if len(s) >= n else ({s} if s else set())
+
+
+def _section_page(evidence_text: str, regions: list[dict]) -> int | None:
+    """Pick the page whose extracted answer text contains / best matches this section's
+    evidence, so its tick is located on the RIGHT page of a multi-page answer. Returns
+    None when no page matches confidently (caller then skips the tick)."""
+    ev = _norm_text(evidence_text)
+    if not ev:
+        return None
+    probe = ev[:80]
+    ev_grams = _ngrams(ev)
+    best_page, best_score = None, 0.0
+    for r in regions:
+        pt = _norm_text(r.get("answer_text"))
+        if not pt:
+            continue
+        if probe and probe in pt:
+            return r.get("page")
+        if ev_grams:
+            inter = len(ev_grams & _ngrams(pt))
+            score = inter / len(ev_grams)
+            if score > best_score:
+                best_page, best_score = r.get("page"), score
+    return best_page if best_score >= 0.30 else None
+
+
 async def _locate_and_build_commands(final_eval, regions_by_q, page_map, locator, geom, sheet_id):
-    """For each reviewed annotation target: run the vision locator, validate the
-    geometry, and emit underline/comment draw commands. Returns (commands_by_page,
-    locator_plans) — plans are persisted for audit. Stays uncrowded via per-page and
-    per-question caps."""
+    """One vision locator call per (question, page): finds underline paths for wrong
+    items AND placement for positive ticks/section marks, validates geometry, and emits
+    draw commands. Returns (commands_by_page, locator_plans). Section ticks/marks always
+    appear (region fallback in the validator); underlines use the safety ladder. Stays
+    uncrowded via per-page/per-question caps."""
+    from app.ai.agents.annotation_locator_agent import crop_region
+
     commands_by_page: dict[int, list[dict]] = {}
     locator_plans: list[dict] = []
     page_target_count: dict[int, int] = {}
@@ -424,38 +513,76 @@ async def _locate_and_build_commands(final_eval, regions_by_q, page_map, locator
 
     for qres in final_eval.get("question_results", []):
         qnum = str(qres.get("question_number") or "")
-        regions = regions_by_q.get(qnum, [])
-        targets = (qres.get("annotation_targets") or [])[:MAX_TARGETS_PER_QUESTION]
-        for target in targets:
-            if not isinstance(target, dict) or not (target.get("target_text") or "").strip():
-                continue
-            page_no = target.get("page_number") or (regions[0]["page"] if regions else None)
+        regions = [r for r in regions_by_q.get(qnum, []) if r.get("page") in page_map]
+        if not regions:
+            continue
+        primary = max(regions, key=lambda r: _bbox_area(r.get("question_bbox")))
+        primary_page = primary.get("page")
+
+        # Group wrong targets by the page they sit on (default = primary page).
+        targets = [t for t in (qres.get("annotation_targets") or [])
+                   if isinstance(t, dict) and (t.get("target_text") or "").strip()]
+        targets = targets[:MAX_TARGETS_PER_QUESTION]
+        targets_by_page: dict[int, list[dict]] = {}
+        for t in targets:
+            pno = t.get("page_number") if t.get("page_number") in page_map else primary_page
+            targets_by_page.setdefault(pno, []).append(t)
+
+        # Route each positive section's tick to the page its evidence actually sits on
+        # (a multi-page answer has good points spread across pages). Skip if unmatched.
+        sections_by_page: dict[int, list[dict]] = {}
+        for s in _positive_sections(qres):
+            spage = _section_page(s.get("evidence_text"), regions)
+            if spage in page_map:
+                sections_by_page.setdefault(spage, []).append(s)
+
+        pages_to_do = set(targets_by_page) | set(sections_by_page)
+
+        for page_no in pages_to_do:
             page = page_map.get(page_no)
-            if not page:
-                continue
-            if page_target_count.get(page_no, 0) >= MAX_TARGETS_PER_PAGE:
+            if not page or page_target_count.get(page_no, 0) >= MAX_TARGETS_PER_PAGE:
                 continue
             qbbox = next((r.get("question_bbox") for r in regions if r.get("page") == page_no), None)
+            page_targets = targets_by_page.get(page_no, [])
+            page_sections = sections_by_page.get(page_no, [])
+            if not page_targets and not page_sections:
+                continue
+            crop_png, crop_origin, cw, ch = crop_region(page.png_bytes, qbbox, page.width, page.height)
             try:
-                loc = await locator.locate(
-                    page_png=page.png_bytes, page_number=page_no, width=page.width, height=page.height,
-                    question_number=qnum, target_text=target.get("target_text", ""),
-                    comment_text=target.get("comment_text", ""),
-                    annotation_action=target.get("annotation_action", "underline_with_comment"),
-                    question_bbox=qbbox, sheet_id=sheet_id,
+                loc = await locator.locate_question(
+                    crop_png=crop_png, crop_origin=crop_origin, crop_w=cw, crop_h=ch,
+                    page_number=page_no, question_number=qnum,
+                    targets=page_targets, sections=page_sections, sheet_id=sheet_id,
                 )
             except Exception as exc:
-                logger.warning("locator failed (skipping target): %s", exc)
-                continue
-            plan = geom.validate_and_smooth(loc, (page.width, page.height), qbbox)
-            locator_plans.append({k: v for k, v in plan.items() if k != "original"})
+                logger.warning("locator failed for Q%s p%s (continuing): %s", qnum, page_no, exc)
+                loc = {"page_number": page_no, "question_number": qnum, "targets": [], "section_marks": []}
+
+            plan = geom.validate_question_plan(loc, (page.width, page.height), qbbox)
+            locator_plans.append(plan)
             page_target_count[page_no] = page_target_count.get(page_no, 0) + 1
 
-            if plan.get("final_underline_paths"):
-                add(page_no, {"type": "underline_path", "paths": plan["final_underline_paths"]})
-            if plan.get("final_comment_box") and (plan.get("comment_text") or "").strip():
-                add(page_no, {"type": "comment", "text": plan["comment_text"], "box": plan["final_comment_box"]})
+            for tp in plan.get("targets", []):
+                if tp.get("final_underline_paths"):
+                    add(page_no, {"type": "underline_path", "paths": tp["final_underline_paths"]})
+                if tp.get("final_comment_box") and (tp.get("comment_text") or "").strip():
+                    add(page_no, {"type": "comment", "text": tp["comment_text"], "box": tp["final_comment_box"]})
+            # Positive sections become a tick beside the located good point (no section
+            # fraction on the PDF — the breakdown lives in the result UI).
+            for sm in plan.get("section_marks", []):
+                tpoint = sm.get("tick_point")
+                if isinstance(tpoint, (list, tuple)) and len(tpoint) >= 2:
+                    add(page_no, {"type": "tick", "x": int(tpoint[0]), "y": int(tpoint[1])})
     return commands_by_page, locator_plans
+
+
+def _bbox_area(bbox) -> float:
+    if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+        try:
+            return float(bbox[2]) * float(bbox[3])
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
 
 
 def _add_marks_and_banner(commands_by_page, final_eval, regions_by_q, page_map, awarded, possible) -> None:
@@ -469,9 +596,11 @@ def _add_marks_and_banner(commands_by_page, final_eval, regions_by_q, page_map, 
         regions = [r for r in regions_by_q.get(qnum, []) if r.get("question_bbox")]
         if not regions:
             continue
-        # Place the mark at the END of the answer (bottom-right of the largest region),
-        # like a teacher's tick — never the page-top corner.
-        region = max(regions, key=lambda r: (r["question_bbox"][2] * r["question_bbox"][3]))
+        # Place the mark at the END of the answer: the LAST page the question occupies,
+        # and the bottom-most region on it — like a teacher's total after the last line.
+        last_page = max(r.get("page") for r in regions)
+        page_regions = [r for r in regions if r.get("page") == last_page]
+        region = max(page_regions, key=lambda r: (r["question_bbox"][1] + r["question_bbox"][3]))
         page = page_map.get(region.get("page"))
         if not page:
             continue
@@ -481,8 +610,37 @@ def _add_marks_and_banner(commands_by_page, final_eval, regions_by_q, page_map, 
         my = int(y + h - 6)
         if region["page"] == first_page and my < 90:   # don't collide with the total banner
             my = 96
+        # Don't let the question total overlap a section mark/tick already on this page.
+        my = _avoid_collision(mx, my, commands_by_page.get(region["page"], []), page.height)
         add(region["page"], {"type": "mark", "text": mark_text, "x": mx, "y": my})
     add(first_page, {"type": "banner", "text": f"Total: {_fmt(awarded)} / {_fmt(possible)}"})
+
+
+def _avoid_collision(x: int, y: int, existing: list[dict], page_h: int,
+                     gap: int = 150, x_thresh: int = 280) -> int:
+    """Nudge y so a circled mark at (x, y) doesn't overlap an already-placed section
+    mark/tick at a similar x. Pushes up (marks sit at the answer end) then down."""
+    def clashes(yy: int) -> bool:
+        for c in existing:
+            if c.get("type") not in ("tick", "mark"):
+                continue
+            cx, cy = c.get("x"), c.get("y")
+            if cx is None or cy is None:
+                continue
+            if abs(int(cx) - x) < x_thresh and abs(int(cy) - yy) < gap:
+                return True
+        return False
+
+    if not clashes(y):
+        return y
+    for step in range(1, 12):
+        up = y - step * gap
+        if up > gap and not clashes(up):
+            return up
+        down = y + step * gap
+        if down < page_h - gap and not clashes(down):
+            return down
+    return y
 
 
 def _fmt(v) -> str:
@@ -534,7 +692,7 @@ async def _vision_ocr(db, data: bytes, mime_type: str, entity_id) -> str:
         pages = pdf_tools.render_to_page_images(data, mime_type)
     except Exception:
         return ""
-    provider = get_provider("reasoning")
+    provider = get_provider("vision")
     parts: list[str] = []
     for page in pages[:15]:
         try:

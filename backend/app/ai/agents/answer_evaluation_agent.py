@@ -38,6 +38,13 @@ ABSOLUTE RULES:
 - Award partial marks fairly per the guide's marks breakdown. Accept correct ideas in the student's own words.
 - Keep feedback concise and useful. List the key missing points separately.
 
+SECTION-WISE MARKING (required):
+- Use the question's CHECKING GUIDE "marks_breakdown" criteria as the sections. For EACH section return its max marks, the marks you award, a status ("correct" | "partial" | "wrong"), and "evidence_text" = the exact words the student wrote that earned the marks (empty string if the student wrote nothing for that section).
+- The sum of all section awarded_marks MUST equal the question's awarded_marks. Section awarded never exceeds section max; total never exceeds the question MAX MARKS.
+
+POSITIVE MARKING (required):
+- For every answer that has ANY correct content, at least one section must be "correct" or "partial" with a non-empty "evidence_text" (this becomes a tick on the sheet). Only a blank or fully irrelevant answer may have no positive section.
+
 ANNOTATION RULES (very important — you decide WHAT is wrong, not where it is):
 - Create an annotation target ONLY for a specific WRONG WRITTEN item: a wrong sentence, wrong formula, wrong calculation step, wrong number, wrong keyword, a contradictory statement, or an irrelevant line.
 - Quote the wrong text EXACTLY as the student wrote it in "target_text" (so it can be found on the page). Keep it short (the wrong phrase/line only).
@@ -71,6 +78,10 @@ Return ONLY valid JSON in exactly this structure (one entry per question):
       "feedback": "Concise feedback.",
       "missing_points": ["..."],
       "confidence": 0.8,
+      "sections": [
+        {{"section": "Definition", "max_marks": 2, "awarded_marks": 2, "status": "correct",
+          "evidence_text": "exact words the student wrote for this section"}}
+      ],
       "annotation_targets": [
         {{"page_number": 1, "question_number": "1", "target_text": "exact wrong phrase from the answer",
           "comment_text": "Short correction.", "annotation_action": "underline_with_comment"}}

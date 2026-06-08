@@ -222,6 +222,55 @@ async def list_submissions(
     return [SubmissionOut(**r) for r in rows]
 
 
+# ── Admin debug: per-step pipeline output (for low-level optimization) ────────────
+
+@router.get("/admin/subjective/tests/{test_id}/skill-debug")
+async def skill_generation_debug(
+    test_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Every step's output of the question-paper → checking-skill generation workflow:
+    extracted questions + marks, detected topic/subtopic, the locked per-question
+    checking guide with its evaluator verdict + iteration count, and every AI call.
+    Admin-only — exposes internal JSON for tuning the skill-generation pipeline."""
+    debug = await svc.build_skill_debug(db, test_id)
+    if debug is None:
+        raise AppException(404, "not_found", "Test not found.")
+    return debug
+
+
+@router.get("/admin/subjective/sheets/{sheet_id}/debug")
+async def answer_sheet_debug(
+    sheet_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Every step's output of the answer-sheet checking pipeline for one sheet:
+    quality gate → question-level extraction → locked skills used → checker (initial)
+    → reviewer (final) → annotation locator + geometry validation → draw commands →
+    checked PDF, plus every AI call. Admin-only — exposes internal JSON for tuning."""
+    debug = await svc.build_sheet_debug(db, sheet_id)
+    if debug is None:
+        raise AppException(404, "not_found", "Answer sheet not found.")
+    return debug
+
+
+@router.get("/admin/subjective/sheets/{sheet_id}/debug-pdf")
+async def answer_sheet_debug_pdf(
+    sheet_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Coordinate debug: re-renders the sheet and overlays the locator/validation
+    geometry (raw vs. final + page corners) into a diagnostic PDF. Use to confirm an
+    annotation mismatch is geometry vs. rendering style. Admin-only."""
+    debug = await svc.build_debug_pdf(db, sheet_id)
+    if debug is None:
+        raise AppException(404, "not_found", "Answer sheet not found.")
+    return debug
+
+
 # ── Student ─────────────────────────────────────────────────────────────────────
 
 @router.get("/student/subjective/tests", response_model=list[StudentTestListItem])

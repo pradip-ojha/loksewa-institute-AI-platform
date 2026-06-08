@@ -1,14 +1,18 @@
-"""Vision locator: find WHERE a wrong piece of text sits on the answer-sheet page.
+"""Vision locator: find WHERE wrong text + correct sections sit on the answer page.
 
-Called per reviewed annotation target only (not for every line). Given the page
-image (or cropped question region) and the exact wrong `target_text`, it returns the
-natural underline PATH — multiple ordered points along the handwriting baseline, not
-two bbox endpoints — plus a safe nearby comment box. This is what lets the renderer
-draw a curved, hand-like underline instead of a rigid straight line.
+Called ONCE per question (per page the question occupies) — not per target — so one
+vision call returns: the natural underline PATH for each wrong item, AND a placement
+for each correct/partial section's tick + section mark. Ticks/section marks therefore
+cost no extra vision calls.
+
+To improve coordinate accuracy on a new vision model, the locator is given a CROP of
+the question's answer region (higher relative resolution); returned crop-space
+coordinates are mapped back to full-page pixels here via `crop_origin`.
 
 The locator decides WHERE only — never what is wrong (checker) or how to draw it
 (renderer). Geometry is in the page's pixel space (origin top-left).
 """
+import io
 import logging
 import uuid
 
@@ -19,59 +23,108 @@ from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-LOCATOR_PROMPT = """You locate a specific piece of WRONG handwritten text on a scanned exam answer page, so it can be underlined.
+LOCATOR_PROMPT = """You locate handwritten text on a CROPPED region of a scanned exam answer page, so a teacher's marks can be drawn.
 
-This page is {width} pixels wide and {height} pixels tall (origin top-left). It belongs to question {question_number}.
-{region_hint}
+This cropped image is {width} pixels wide and {height} pixels tall (origin top-left). All coordinates you return MUST be in THIS cropped image's pixel space. It shows the answer region for question {question_number}.
 
-TEXT TO LOCATE (the exact wrong written item — it may be a phrase, a formula, a number, or one line):
-"{target_text}"
+(A) WRONG ITEMS TO UNDERLINE — for each, find where that exact text appears and return the natural underline path UNDER it:
+{targets_block}
 
-CORRECTION COMMENT that will be placed near it:
-"{comment_text}"
+(B) CORRECT POINTS TO TICK — for each, find where the student's evidence text sits and return a tight box around that text plus a tick point just left of its FIRST line:
+{sections_block}
 
-YOUR TASK:
-- Find where that text appears in the handwriting.
-- Return the natural underline path as MULTIPLE ordered points [x, y] that follow the baseline UNDER the text (left to right). Handwriting is slanted/curved, so give 4–8 points that trace the real baseline, NOT just two endpoints.
-- If the text wraps across two written lines, return multiple paths (one per line).
-- Return a tight box around the located text, and a SAFE comment box in nearby blank space (right margin or just above/below) that does NOT overlap the student's writing.
-- If you cannot confidently find the text, return an empty "underline_paths" and a low confidence.
+RULES:
+- Underline path = MULTIPLE ordered points [x, y] following the real (slanted/curved) baseline UNDER the wrong text, left to right (4–8 points, not just two endpoints). If text wraps to a second line, give multiple paths.
+- "tick_point" = a single [x, y] in blank space just left of the FIRST line of the correct evidence (where a ✓ goes), NOT on top of the writing.
+- "evidence_box" / "target_text_box" = a tight box around the located text.
+- Put comment boxes in margins or blank space — never over the student's writing.
+- If you cannot confidently find an item, return empty geometry and a LOW confidence for it (do NOT guess a location).
 
 Return ONLY valid JSON in exactly this structure:
 {{
-  "page_number": {page_number},
-  "question_number": "{question_number}",
-  "target_text": "{target_text}",
-  "target_text_box": [x1, y1, x2, y2],
-  "underline_paths": [{{"points": [[x, y], [x, y], [x, y]]}}],
-  "comment_box": [x1, y1, x2, y2],
-  "comment_text": "{comment_text}",
-  "annotation_action": "{annotation_action}",
-  "confidence": 0.0
+  "targets": [
+    {{"target_text": "...", "target_text_box": [x1,y1,x2,y2],
+      "underline_paths": [{{"points": [[x,y],[x,y],[x,y]]}}],
+      "comment_box": [x1,y1,x2,y2], "comment_text": "...", "confidence": 0.0}}
+  ],
+  "section_marks": [
+    {{"section": "...", "evidence_box": [x1,y1,x2,y2], "tick_point": [x,y], "confidence": 0.0}}
+  ]
 }}"""
+
+
+def _shift_box(box, ox, oy):
+    if not isinstance(box, (list, tuple)) or len(box) < 4:
+        return box
+    try:
+        return [float(box[0]) + ox, float(box[1]) + oy, float(box[2]) + ox, float(box[3]) + oy]
+    except (TypeError, ValueError):
+        return box
+
+
+def _shift_point(pt, ox, oy):
+    if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+        return pt
+    try:
+        return [float(pt[0]) + ox, float(pt[1]) + oy]
+    except (TypeError, ValueError):
+        return pt
+
+
+def crop_region(page_png: bytes, question_bbox, page_w: int, page_h: int, pad_ratio: float = 0.06):
+    """Crop the question's answer region (with padding) from the page PNG.
+    Returns (crop_png, crop_origin(ox,oy), crop_w, crop_h). Falls back to the full page
+    when the bbox is missing/unusable."""
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(page_png)).convert("RGB")
+    if not (isinstance(question_bbox, (list, tuple)) and len(question_bbox) >= 4):
+        buf = io.BytesIO(); img.save(buf, format="PNG")
+        return buf.getvalue(), (0, 0), img.width, img.height
+    try:
+        x, y, w, h = (float(v) for v in question_bbox[:4])
+    except (TypeError, ValueError):
+        buf = io.BytesIO(); img.save(buf, format="PNG")
+        return buf.getvalue(), (0, 0), img.width, img.height
+
+    padx, pady = w * pad_ratio, h * pad_ratio
+    x1 = max(0, int(x - padx)); y1 = max(0, int(y - pady))
+    x2 = min(page_w, int(x + w + padx)); y2 = min(page_h, int(y + h + pady))
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        buf = io.BytesIO(); img.save(buf, format="PNG")
+        return buf.getvalue(), (0, 0), img.width, img.height
+    crop = img.crop((x1, y1, x2, y2))
+    buf = io.BytesIO(); crop.save(buf, format="PNG")
+    return buf.getvalue(), (x1, y1), crop.width, crop.height
 
 
 class AnnotationLocatorAgent:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.provider = get_provider("reasoning")
+        self.provider = get_provider("vision")  # Gemini locates handwriting better
 
-    async def locate(
-        self, *, page_png: bytes, page_number: int, width: int, height: int,
-        question_number: str, target_text: str, comment_text: str,
-        annotation_action: str, question_bbox: list | None, sheet_id: uuid.UUID,
+    async def locate_question(
+        self, *, crop_png: bytes, crop_origin: tuple[int, int], crop_w: int, crop_h: int,
+        page_number: int, question_number: str,
+        targets: list[dict], sections: list[dict], sheet_id: uuid.UUID,
     ) -> dict:
-        region_hint = (
-            f"The question's answer region is approximately the pixel rectangle [x,y,w,h] = {question_bbox}."
-            if question_bbox else "The question's answer region is not pre-known; scan the whole page."
-        )
+        """One vision call for a question's wrong targets + positive sections on one page.
+        Returns page-space geometry (crop coords already mapped back via crop_origin)."""
+        ox, oy = crop_origin
+        targets_block = "\n".join(
+            f'- target_text: "{(t.get("target_text") or "").replace(chr(34), chr(39))[:300]}"'
+            f' | comment: "{(t.get("comment_text") or "").replace(chr(34), chr(39))[:200]}"'
+            for t in targets
+        ) or "(none)"
+        sections_block = "\n".join(
+            f'- section: "{(s.get("section") or "")[:120]}"'
+            f' | evidence_text: "{(s.get("evidence_text") or "").replace(chr(34), chr(39))[:300]}"'
+            for s in sections
+        ) or "(none)"
+
         prompt = LOCATOR_PROMPT.format(
-            width=width, height=height, page_number=page_number,
-            question_number=question_number,
-            target_text=(target_text or "").replace('"', "'")[:400],
-            comment_text=(comment_text or "").replace('"', "'")[:300],
-            annotation_action=annotation_action or "underline_with_comment",
-            region_hint=region_hint,
+            width=crop_w, height=crop_h, question_number=question_number,
+            targets_block=targets_block, sections_block=sections_block,
         )
         audit_ctx = {
             "db": self.db,
@@ -81,19 +134,45 @@ class AnnotationLocatorAgent:
             "entity_id": sheet_id,
         }
         try:
-            result = await self.provider.generate_with_image(
-                prompt, page_png, schema={}, audit_ctx=audit_ctx,
-            )
+            result = await self.provider.generate_with_image(prompt, crop_png, schema={}, audit_ctx=audit_ctx)
         except Exception as exc:
             raise RuntimeError(f"Annotation location failed on page {page_number}: {exc}") from exc
         if not isinstance(result, dict):
             raise AIResponseError("annotation locator did not return an object")
-        # Normalize / guarantee keys the validator depends on.
-        result.setdefault("page_number", page_number)
-        result.setdefault("question_number", question_number)
-        result.setdefault("target_text", target_text)
-        result.setdefault("comment_text", comment_text)
-        result.setdefault("annotation_action", annotation_action)
-        if not isinstance(result.get("underline_paths"), list):
-            result["underline_paths"] = []
-        return result
+
+        # Map crop-space coordinates back to full-page pixel space.
+        out_targets: list[dict] = []
+        for t in result.get("targets") or []:
+            if not isinstance(t, dict):
+                continue
+            paths = []
+            for p in t.get("underline_paths") or []:
+                pts = [_shift_point(pt, ox, oy) for pt in (p or {}).get("points") or []]
+                pts = [pt for pt in pts if isinstance(pt, list)]
+                if pts:
+                    paths.append({"points": pts})
+            out_targets.append({
+                "page_number": page_number,
+                "question_number": question_number,
+                "target_text": t.get("target_text"),
+                "target_text_box": _shift_box(t.get("target_text_box"), ox, oy),
+                "underline_paths": paths,
+                "comment_box": _shift_box(t.get("comment_box"), ox, oy),
+                "comment_text": t.get("comment_text"),
+                "annotation_action": "underline_with_comment",
+                "confidence": t.get("confidence"),
+            })
+
+        out_sections: list[dict] = []
+        for s in result.get("section_marks") or []:
+            if not isinstance(s, dict):
+                continue
+            out_sections.append({
+                "section": s.get("section"),
+                "evidence_box": _shift_box(s.get("evidence_box"), ox, oy),
+                "tick_point": _shift_point(s.get("tick_point"), ox, oy),
+                "confidence": s.get("confidence"),
+            })
+
+        return {"page_number": page_number, "question_number": question_number,
+                "targets": out_targets, "section_marks": out_sections}

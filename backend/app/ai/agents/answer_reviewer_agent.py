@@ -21,9 +21,10 @@ REVIEW_PROMPT = """You are a senior examiner doing a verification pass over a ju
 YOUR JOB:
 1. Check the marks are fair and internally consistent across questions.
 2. Enforce the configured MAX MARKS per question — no awarded mark may exceed it.
-3. Prune annotation_targets: keep ONLY targets tied to a specific wrong written item (wrong sentence/formula/calculation step/number/keyword, contradiction, irrelevant line). Drop targets for missing points / weak explanation / structure / general advice. Do NOT invent new targets, and keep each target's "target_text" exactly as given.
-4. Keep feedback concise and useful; fix anything unfair or unclear.
-5. Do not rewrite things that are already fine.
+3. Keep the section-wise breakdown ("sections") consistent: each section's awarded ≤ its max, and the sections' awarded marks SUM to the question's awarded_marks. Keep at least one correct/partial section with evidence_text where the answer has any correct content (positive marking).
+4. Prune annotation_targets: keep ONLY targets tied to a specific wrong written item (wrong sentence/formula/calculation step/number/keyword, contradiction, irrelevant line). Drop targets for missing points / weak explanation / structure / general advice. Do NOT invent new targets, and keep each target's "target_text" exactly as given.
+5. Keep feedback concise and useful; fix anything unfair or unclear.
+6. Do not rewrite things that are already fine. Preserve the "sections" array shape.
 
 MAX MARKS PER QUESTION:
 {full_marks_block}
@@ -39,6 +40,7 @@ Return ONLY valid JSON in exactly this structure (same shape as the input), plus
   "question_results": [
     {{"question_number": "1", "page_numbers": [1], "awarded_marks": 6, "max_marks": 10,
       "feedback": "...", "missing_points": ["..."], "confidence": 0.8,
+      "sections": [{{"section": "Definition", "max_marks": 2, "awarded_marks": 2, "status": "correct", "evidence_text": "..."}}],
       "annotation_targets": [{{"page_number": 1, "question_number": "1", "target_text": "...",
         "comment_text": "...", "annotation_action": "underline_with_comment"}}]}}
   ],

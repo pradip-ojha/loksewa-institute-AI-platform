@@ -9,18 +9,23 @@ the task rely on.
 Source-of-truth rule: per-question `marks` on SubjectiveQuestion is the hard cap
 for awardable marks — enforced in `clamp_marks` regardless of what the AI returns.
 """
+import logging
 import uuid
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.r2_client import get_r2
+from app.modules.ai_audit.models import AIOutput, AIRequest
 from app.modules.files.models import File
+from app.modules.jobs.models import ProcessingJob
 from app.modules.subjective.models import (
-    AnswerEvaluation, AnswerQualityCheck, PDFAnnotation,
-    StudentAnswerSheet, SubjectiveQuestion, SubjectiveTest,
+    AnswerEvaluation, AnswerExtraction, AnswerQualityCheck, PDFAnnotation,
+    QuestionSpecificCheckingSkill, StudentAnswerSheet, SubjectiveQuestion, SubjectiveTest,
 )
 from app.modules.users.models import User
+
+logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_ATTEMPTS = 2
 
@@ -216,6 +221,16 @@ async def build_student_result(db: AsyncSession, sheet: StudentAnswerSheet) -> d
         for item in (evaluation.evaluation_data or {}).get("question_results", []):
             qnum = str(item.get("question_number") or "")
             q = by_number.get(qnum)
+            sections = []
+            for s in item.get("sections") or []:
+                if not isinstance(s, dict):
+                    continue
+                sections.append({
+                    "section": str(s.get("section") or ""),
+                    "awarded": float(s.get("awarded_marks", 0) or 0),
+                    "max": float(s.get("max_marks", 0) or 0),
+                    "status": s.get("status") or "partial",
+                })
             rows.append({
                 "question_number": qnum or (q.question_number if q else "?"),
                 "question_text": q.question_text if q else "",
@@ -223,6 +238,7 @@ async def build_student_result(db: AsyncSession, sheet: StudentAnswerSheet) -> d
                 "marks_possible": float(item.get("max_marks", q.marks if q else 0) or 0),
                 "feedback": item.get("feedback"),
                 "mistakes": item.get("missing_points") or [],
+                "sections": sections,
             })
         result["questions"] = rows
         result["total_marks_awarded"] = evaluation.total_marks_awarded
@@ -290,7 +306,7 @@ def assemble_questionwise(page_outputs: list[dict], questions: list[SubjectiveQu
     known question. Returns the stored extraction shape:
       {"pages": [{page, width, height}],
        "questions": [{qid, question_text, marks, answer_text, page_numbers,
-                      page_regions: [{page, question_bbox}]}]}
+                      page_regions: [{page, question_bbox, answer_text}]}]}
     """
     valid_numbers = [q.question_number for q in questions]
     buckets: dict[str, dict] = {
@@ -320,7 +336,8 @@ def assemble_questionwise(page_outputs: list[dict], questions: list[SubjectiveQu
             buckets[target]["pages"].add(po.get("page"))
             if a.get("question_bbox"):
                 buckets[target]["regions"].append(
-                    {"page": po.get("page"), "question_bbox": a["question_bbox"]}
+                    {"page": po.get("page"), "question_bbox": a["question_bbox"],
+                     "answer_text": a.get("answer_text") or ""}
                 )
 
     out_questions = []
@@ -353,6 +370,72 @@ def _match_question_number(raw: str, valid: list[str]) -> str | None:
     return None
 
 
+def _half(v: float) -> float:
+    return round(v * 2) / 2
+
+
+def _clamp_sections(item: dict, question_cap: float) -> None:
+    """Make the section breakdown complete and consistent with the question:
+    clamp each section's awarded to its max, ensure the section MAXES cover the full
+    question marks (add a remainder section if the breakdown is short), and force the
+    section AWARDED sum to equal the question's awarded_marks. Mutates in place; the
+    question's awarded_marks stays the source of truth."""
+    sections = item.get("sections")
+    if not isinstance(sections, list) or not sections:
+        return
+
+    q_awarded = _half(max(0.0, min(float(item.get("awarded_marks", 0) or 0), question_cap)))
+
+    clean: list[dict] = []
+    for s in sections:
+        if not isinstance(s, dict):
+            continue
+        smax = _half(max(0.0, float(s.get("max_marks", 0) or 0)))
+        sa = _half(max(0.0, min(float(s.get("awarded_marks", 0) or 0), smax)))
+        s["max_marks"] = smax
+        s["awarded_marks"] = sa
+        clean.append(s)
+    if not clean:
+        return
+
+    # 1) Ensure the section maxes cover the full question marks (complete breakdown).
+    sum_max = sum(s["max_marks"] for s in clean)
+    if sum_max < question_cap - 1e-6:
+        clean.append({
+            "section": "अन्य", "max_marks": _half(question_cap - sum_max),
+            "awarded_marks": 0.0, "status": "wrong", "evidence_text": "",
+        })
+
+    # 2) Force the awarded section sum to equal the question's awarded marks.
+    diff = _half(q_awarded - sum(s["awarded_marks"] for s in clean))
+    if diff > 0:  # need to add marks — give to sections with the most headroom first
+        for s in sorted(clean, key=lambda x: x["max_marks"] - x["awarded_marks"], reverse=True):
+            room = s["max_marks"] - s["awarded_marks"]
+            if room <= 0:
+                continue
+            add = min(diff, room)
+            s["awarded_marks"] = _half(s["awarded_marks"] + add)
+            diff = _half(diff - add)
+            if diff <= 0:
+                break
+    elif diff < 0:  # need to remove marks — take from the most-awarded sections first
+        for s in sorted(clean, key=lambda x: x["awarded_marks"], reverse=True):
+            take = min(-diff, s["awarded_marks"])
+            if take <= 0:
+                continue
+            s["awarded_marks"] = _half(s["awarded_marks"] - take)
+            diff = _half(diff + take)
+            if diff >= 0:
+                break
+
+    # 3) Recompute status from the reconciled marks.
+    for s in clean:
+        sa, smax = s["awarded_marks"], s["max_marks"]
+        s["status"] = "correct" if (smax > 0 and sa >= smax) else ("partial" if sa > 0 else "wrong")
+
+    item["sections"] = clean
+
+
 def clamp_marks(evaluation: dict, questions: list[SubjectiveQuestion]) -> tuple[dict, float, float]:
     """Enforce per-question full-marks caps and recompute totals on the checker/reviewer
     evaluation ({"question_results": [{question_number, awarded_marks, max_marks, ...}]}).
@@ -374,6 +457,7 @@ def clamp_marks(evaluation: dict, questions: list[SubjectiveQuestion]) -> tuple[
         awarded = max(0.0, min(awarded, cap))
         awarded = round(awarded * 2) / 2  # snap to nearest half mark (examiner convention)
         item["awarded_marks"] = awarded
+        _clamp_sections(item, cap)
         total_awarded += awarded
 
     evaluation["question_results"] = items
@@ -382,6 +466,345 @@ def clamp_marks(evaluation: dict, questions: list[SubjectiveQuestion]) -> tuple[
     evaluation["total_awarded_marks"] = total_awarded
     evaluation["total_full_marks"] = total_possible
     return evaluation, total_awarded, total_possible
+
+
+# ── Admin debug: full per-step pipeline trace (admin-only, for optimization) ──────
+
+async def _job_info(db: AsyncSession, job_id: uuid.UUID | None) -> dict | None:
+    if not job_id:
+        return None
+    r = await db.execute(select(ProcessingJob).where(ProcessingJob.id == job_id))
+    j = r.scalar_one_or_none()
+    if not j:
+        return None
+    return {
+        "id": str(j.id),
+        "job_type": j.job_type,
+        "status": getattr(j.status, "value", j.status),
+        "progress_percent": j.progress_percent,
+        "current_step": j.current_step,
+        "error_message": j.error_message,
+        "input_reference": j.input_reference,
+        "output_reference": j.output_reference,
+        "created_at": j.created_at,
+        "started_at": j.started_at,
+        "completed_at": j.completed_at,
+    }
+
+
+async def _ai_calls(db: AsyncSession, entity_id: uuid.UUID) -> list[dict]:
+    """Every AI call logged against this entity (sheet or test), in order — so the
+    admin can see which agent ran, token cost, latency, status, and a short output
+    summary for each step."""
+    r = await db.execute(
+        select(AIRequest, AIOutput.output_summary)
+        .outerjoin(AIOutput, AIOutput.request_id == AIRequest.id)
+        .where(AIRequest.related_entity_id == entity_id)
+        .order_by(AIRequest.created_at.asc())
+    )
+    out: list[dict] = []
+    for req, summary in r.all():
+        out.append({
+            "agent_type": req.agent_type,
+            "task_type": req.task_type,
+            "provider": req.provider,
+            "model": req.model,
+            "status": req.status,
+            "input_tokens": req.input_tokens,
+            "output_tokens": req.output_tokens,
+            "latency_ms": req.latency_ms,
+            "error_message": req.error_message,
+            "output_summary": summary,
+            "created_at": req.created_at,
+        })
+    return out
+
+
+async def build_sheet_debug(db: AsyncSession, sheet_id: uuid.UUID) -> dict | None:
+    """Full step-by-step trace of the answer-sheet checking pipeline for one sheet:
+    quality gate → question-level extraction → locked skills used → checker (initial)
+    → reviewer (final) → annotation locator + geometry validation → draw commands →
+    checked PDF, plus every AI call. Admin-only; exposes internal JSON for tuning."""
+    sheet = await get_sheet(db, sheet_id)
+    if not sheet:
+        return None
+    test = await get_test(db, sheet.test_id)
+    student = (
+        await db.execute(select(User).where(User.id == sheet.student_id))
+    ).scalar_one_or_none()
+
+    qc = await _latest_quality(db, sheet.id)
+    extraction = (
+        await db.execute(
+            select(AnswerExtraction).where(AnswerExtraction.sheet_id == sheet.id)
+            .order_by(AnswerExtraction.created_at.desc()).limit(1)
+        )
+    ).scalar_one_or_none()
+    evaluation = await _latest_evaluation(db, sheet.id)
+    annotation = await _latest_annotation(db, sheet.id)
+
+    # The locked per-question checking skills the checker consumed for this test.
+    sk_r = await db.execute(
+        select(QuestionSpecificCheckingSkill, SubjectiveQuestion.question_number)
+        .join(SubjectiveQuestion, SubjectiveQuestion.id == QuestionSpecificCheckingSkill.question_id)
+        .where(QuestionSpecificCheckingSkill.test_id == sheet.test_id)
+        .order_by(SubjectiveQuestion.question_order)
+    )
+    locked_skills = [
+        {
+            "question_number": qnum,
+            "evaluation_status": sk.evaluation_status,
+            "evaluation_notes": sk.evaluation_notes,
+            "iterations": sk.iterations,
+            "skill_json": sk.skill_json,
+        }
+        for sk, qnum in sk_r.all()
+    ]
+
+    return {
+        "sheet": {
+            "sheet_id": str(sheet.id),
+            "test_id": str(sheet.test_id),
+            "test_name": test.display_name if test else None,
+            "student_name": student.full_name if student else None,
+            "student_email": student.email if student else None,
+            "upload_attempt_number": sheet.upload_attempt_number,
+            "current_status": sheet.current_status,
+            "answer_sheet_url": await signed_url(db, sheet.file_id),
+            "created_at": sheet.created_at,
+        },
+        "job": await _job_info(db, sheet.checking_job_id),
+        "steps": {
+            "1_quality_check": (
+                {
+                    "blur_score": qc.blur_score,
+                    "brightness_score": qc.brightness_score,
+                    "tilt_angle": qc.tilt_angle,
+                    "resolution_ok": qc.resolution_ok,
+                    "readability_score": qc.readability_score,
+                    "overall_status": qc.overall_status,
+                    "quality_notes": qc.quality_notes,
+                }
+                if qc else None
+            ),
+            "2_extraction": (
+                {
+                    "model_used": extraction.model_used,
+                    "overall_confidence": extraction.overall_confidence,
+                    "extracted_data": extraction.extracted_data,
+                }
+                if extraction else None
+            ),
+            "3_locked_skills_used": locked_skills,
+            "4_checker_initial_evaluation": (
+                evaluation.initial_evaluation_data if evaluation else None
+            ),
+            "5_reviewer_final_evaluation": (
+                {
+                    "reviewed": evaluation.reviewed,
+                    "review_notes": evaluation.review_notes,
+                    "total_marks_awarded": evaluation.total_marks_awarded,
+                    "total_marks_possible": evaluation.total_marks_possible,
+                    "overall_confidence": evaluation.overall_confidence,
+                    "evaluation_data": evaluation.evaluation_data,
+                }
+                if evaluation else None
+            ),
+            "6_locator_and_validation": (
+                annotation.locator_plan if annotation else None
+            ),
+            "7_annotation_commands": (
+                annotation.annotation_instructions if annotation else None
+            ),
+            "8_checked_pdf_url": (
+                await signed_url(db, annotation.checked_file_id) if annotation else None
+            ),
+        },
+        "ai_calls": await _ai_calls(db, sheet.id),
+    }
+
+
+async def build_skill_debug(db: AsyncSession, test_id: uuid.UUID) -> dict | None:
+    """Full step-by-step trace of the question-paper → checking-skill generation
+    workflow for one test: extracted questions + marks, detected topic/subtopic, and
+    the locked per-question checking guide with its evaluator verdict + iterations,
+    plus every AI call. Admin-only."""
+    test = await get_test(db, test_id)
+    if not test:
+        return None
+    questions = await get_test_questions(db, test_id)
+
+    sk_r = await db.execute(
+        select(QuestionSpecificCheckingSkill, SubjectiveQuestion.question_number)
+        .join(SubjectiveQuestion, SubjectiveQuestion.id == QuestionSpecificCheckingSkill.question_id)
+        .where(QuestionSpecificCheckingSkill.test_id == test_id)
+        .order_by(SubjectiveQuestion.question_order)
+    )
+    skills_by_qnum: dict[str, dict] = {}
+    for sk, qnum in sk_r.all():
+        skills_by_qnum[qnum] = {
+            "version": sk.version,
+            "evaluation_status": sk.evaluation_status,
+            "evaluation_notes": sk.evaluation_notes,
+            "iterations": sk.iterations,
+            "skill_json": sk.skill_json,
+        }
+
+    return {
+        "test": {
+            "test_id": str(test.id),
+            "display_name": test.display_name,
+            "status": test.status,
+            "skill_generation_status": test.skill_generation_status,
+            "num_questions": test.num_questions,
+            "total_marks": test.total_marks,
+            "custom_instruction": test.custom_instruction,
+            "has_rubric": test.rubric_file_id is not None,
+            "question_paper_url": await signed_url(db, test.question_paper_file_id),
+            "model_answer_url": await signed_url(db, test.model_answer_file_id),
+            "rubric_url": await signed_url(db, test.rubric_file_id),
+        },
+        "job": await _job_info(db, test.skill_generation_job_id),
+        "steps": {
+            "1_extracted_questions": [
+                {
+                    "question_number": q.question_number,
+                    "question_text": q.question_text,
+                    "marks": q.marks,
+                    "question_order": q.question_order,
+                    "detected_topic": q.topic,
+                    "detected_subtopic": q.subtopic,
+                }
+                for q in questions
+            ],
+            "2_generated_and_locked_skills": [
+                {
+                    "question_number": q.question_number,
+                    "marks": q.marks,
+                    "topic": q.topic,
+                    "subtopic": q.subtopic,
+                    **(skills_by_qnum.get(q.question_number) or {"skill_json": None}),
+                }
+                for q in questions
+            ],
+        },
+        "ai_calls": await _ai_calls(db, test.id),
+    }
+
+
+async def build_debug_pdf(db: AsyncSession, sheet_id: uuid.UUID) -> dict | None:
+    """Coordinate debug: re-render the original answer sheet (deterministic, same pixel
+    space as checking) and overlay the persisted locator/validation geometry — raw
+    points/boxes vs. final validated geometry + page corners. Returns a signed URL to a
+    diagnostic PDF so an annotation mismatch can be diagnosed as geometry vs. style.
+    Admin-only."""
+    import io as _io
+
+    from app.processing import annotation_debug, pdf_tools
+
+    sheet = await get_sheet(db, sheet_id)
+    if not sheet:
+        return None
+    annotation = await _latest_annotation(db, sheet.id)
+    plan_targets: list[dict] = []
+    if annotation and isinstance(annotation.locator_plan, dict):
+        plan_targets = annotation.locator_plan.get("targets") or []
+
+    f = (await db.execute(select(File).where(File.id == sheet.file_id))).scalar_one_or_none()
+    if not f:
+        return None
+    file_bytes = get_r2().download_fileobj(f.r2_key)
+    pages = pdf_tools.render_to_page_images(file_bytes, f.mime_type)
+
+    # Group plans by their 1-based page number.
+    by_page: dict[int, list[dict]] = {}
+    for plan in plan_targets:
+        if isinstance(plan, dict):
+            by_page.setdefault(int(plan.get("page_number") or 1), []).append(plan)
+
+    overlaid = [
+        annotation_debug.draw_debug_overlay(p.png_bytes, by_page.get(p.page_number, []))
+        for p in pages
+    ]
+    debug_pdf = pdf_tools.build_pdf_from_images(overlaid)
+
+    debug_key = f"answer-sheets/debug/{sheet.id}/debug.pdf"
+    get_r2().upload_fileobj(debug_key, _io.BytesIO(debug_pdf), "application/pdf")
+    debug_file = File(
+        original_filename="debug.pdf", display_name="Coordinate debug",
+        mime_type="application/pdf", file_size=len(debug_pdf), r2_key=debug_key,
+        uploaded_by=sheet.student_id,
+    )
+    db.add(debug_file)
+    await db.commit()
+
+    return {
+        "sheet_id": str(sheet.id),
+        "pages": len(pages),
+        "targets": len(plan_targets),
+        "debug_pdf_url": get_r2().get_signed_url(debug_key),
+        "legend": {
+            "cyan": "page corners", "blue": "raw locator underline points",
+            "orange": "raw target_text_box", "green": "raw comment_box",
+            "red": "final validated underline path", "magenta": "final comment box",
+            "purple": "section evidence/tick/mark (positive marking)",
+        },
+    }
+
+
+# ── orphan recovery (worker restart / dead worker) ───────────────────────────────
+
+# Sheet statuses that mean "still being processed" (everything except the terminals).
+_SHEET_IN_PROGRESS = ("uploaded", "extracting", "evaluating", "reviewing", "annotating")
+
+
+async def fail_orphaned_sheets_and_tests(db: AsyncSession) -> int:
+    """Mark in-progress answer sheets / tests as failed when their job is gone.
+
+    Backstop for a worker that died mid-job (e.g. a restart): the job row is failed
+    by the reaper / startup recovery, but the sheet's own `current_status` stays at
+    'extracting'/'evaluating'/… forever, so the UI spins and the student can't
+    re-upload. This reconciles those: any in-progress sheet whose checking job is
+    failed/cancelled or missing becomes 'failed' (which enables re-upload); same for
+    a test whose skill-generation job died. Returns how many were reconciled."""
+    from app.modules.jobs.models import JobStatus
+
+    reconciled = 0
+    dead = {JobStatus.failed, JobStatus.cancelled}
+
+    sheets = (await db.execute(
+        select(StudentAnswerSheet).where(StudentAnswerSheet.current_status.in_(_SHEET_IN_PROGRESS))
+    )).scalars().all()
+    for sheet in sheets:
+        job = None
+        if sheet.checking_job_id:
+            job = (await db.execute(
+                select(ProcessingJob).where(ProcessingJob.id == sheet.checking_job_id)
+            )).scalar_one_or_none()
+        if job is None or job.status in dead:
+            sheet.current_status = "failed"
+            reconciled += 1
+
+    tests = (await db.execute(
+        select(SubjectiveTest).where(
+            ~SubjectiveTest.skill_generation_status.in_(("completed", "failed"))
+        )
+    )).scalars().all()
+    for t in tests:
+        if not t.skill_generation_status:
+            continue
+        job = None
+        if t.skill_generation_job_id:
+            job = (await db.execute(
+                select(ProcessingJob).where(ProcessingJob.id == t.skill_generation_job_id)
+            )).scalar_one_or_none()
+        if job is None or job.status in dead:
+            t.skill_generation_status = "failed"
+            reconciled += 1
+
+    if reconciled:
+        await db.commit()
+    return reconciled
 
 
 # ── internal helpers ────────────────────────────────────────────────────────────

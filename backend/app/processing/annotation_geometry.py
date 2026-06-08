@@ -20,6 +20,7 @@ from __future__ import annotations
 
 CONFIDENCE_MIN = 0.45          # below this we do not draw an exact underline
 SOFT_MARK_CONF_MIN = 0.30      # below this we don't even soft-mark
+TICK_CONF_MIN = 0.55           # below this we do not place a positive tick (skip it)
 # A path's horizontal span should be roughly the width of the target text.
 PATH_SPAN_MIN_RATIO = 0.35
 PATH_SPAN_MAX_RATIO = 2.4
@@ -223,3 +224,56 @@ def validate_and_smooth(locator_result: dict, page_size, question_bbox=None) -> 
     plan["final_comment_box"] = comment_box
     plan["reason"] = "no reliable geometry"
     return plan
+
+
+def _validate_section(sec: dict, w: int, h: int) -> dict | None:
+    """Place one positive section's tick next to the located correct line.
+
+    A tick is drawn ONLY when the locator confidently found the student's evidence
+    (a valid `evidence_box` and confidence ≥ `TICK_CONF_MIN`). Otherwise we return
+    None so the caller skips it — we never dump a tick into a blank margin at a guessed
+    spot. The tick sits just left of the evidence's first line, like a teacher's pen
+    tick beside a good point."""
+    conf = _num(sec.get("confidence")) or 0.0
+    evid = _box4(sec.get("evidence_box"), w, h)
+    if not evid or conf < TICK_CONF_MIN:
+        return None
+
+    x1, y1, x2, y2 = evid
+    # Bias the tick toward the FIRST line of the evidence (tall multi-line boxes), so it
+    # reads as a tick on the correct point rather than mid-paragraph.
+    line_est = min(max(24.0, h * 0.022), float(y2 - y1))
+    yc = _clamp(y1 + line_est / 2, 8, h - 8)
+    # Place the tick over the MIDDLE of the located line (on the text), not in the margin.
+    cx = (x1 + x2) / 2
+    tick_pt = [_clamp(cx, 6, w - 8), yc]
+    return {
+        "section": sec.get("section"),
+        "tick_point": tick_pt,
+        "evidence_box": evid,
+        "confidence": conf,
+        "source": "evidence",
+    }
+
+
+def validate_question_plan(locator_result: dict, page_size, question_bbox=None) -> dict:
+    """Validate a per-question locator result (wrong targets + positive sections).
+    Underlines use the safety ladder in `validate_and_smooth`; positive sections become
+    a tick ONLY where the evidence was confidently located (skip-on-miss — no margin
+    dumping). `question_bbox` is [x, y, w, h] or None."""
+    w, h = int(page_size[0]), int(page_size[1])
+
+    targets = [
+        validate_and_smooth(t, (w, h), question_bbox)
+        for t in (locator_result.get("targets") or []) if isinstance(t, dict)
+    ]
+    raw_sections = [s for s in (locator_result.get("section_marks") or []) if isinstance(s, dict)]
+    sections = [
+        v for v in (_validate_section(s, w, h) for s in raw_sections) if v is not None
+    ]
+    return {
+        "page_number": locator_result.get("page_number"),
+        "question_number": locator_result.get("question_number"),
+        "targets": targets,
+        "section_marks": sections,
+    }

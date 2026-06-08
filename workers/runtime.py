@@ -24,7 +24,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from celery.signals import worker_shutdown
+from celery.signals import worker_ready, worker_shutdown
 
 logger = logging.getLogger(__name__)
 
@@ -77,12 +77,14 @@ async def _record_terminal(job_id: uuid.UUID, *, status, message: str | None) ->
         logger.exception("Could not record terminal state for job %s", job_id)
 
 
-async def _already_completed(job_uuid: uuid.UUID) -> bool:
-    """True if this job already reached `completed`.
+async def _already_terminal(job_uuid: uuid.UUID) -> bool:
+    """True if this job already reached a terminal state (completed/failed/cancelled).
 
     `task_acks_late=True` means a task can be redelivered if a worker died after
-    finishing the work but before acking. Re-running non-idempotent work (e.g.
-    re-embedding a knowledge doc) would duplicate data, so we skip it.
+    finishing (or after the job was failed by startup/reaper recovery). Re-running
+    non-idempotent work would duplicate data or resurrect a job the user already
+    re-submitted, so we skip it. NOTE: a Celery *retry* leaves the job in `retrying`
+    (not terminal), so retries are unaffected.
     """
     from sqlalchemy import select
 
@@ -95,7 +97,7 @@ async def _already_completed(job_uuid: uuid.UUID) -> bool:
                 select(ProcessingJob.status).where(ProcessingJob.id == job_uuid)
             )
             status = row.scalar_one_or_none()
-            return status == JobStatus.completed
+            return status in (JobStatus.completed, JobStatus.failed, JobStatus.cancelled)
     except Exception:
         # If we can't check, fall through and let the task run normally.
         logger.exception("Could not check prior status for job %s", job_uuid)
@@ -108,8 +110,8 @@ async def _run_task(work: Callable[[Any], Awaitable[None]], *, job_id: str, time
     from app.modules.jobs.service import update_job
 
     job_uuid = uuid.UUID(job_id)
-    if await _already_completed(job_uuid):
-        logger.info("Job %s already completed; skipping redelivered task", job_uuid)
+    if await _already_terminal(job_uuid):
+        logger.info("Job %s already in a terminal state; skipping redelivered task", job_uuid)
         return
     try:
         # Mark `processing` in its OWN short session that is closed immediately.
@@ -167,6 +169,31 @@ def run_task(
         will_retry = task.request.retries < max_retries
 
     run_async(_run_task(work, job_id=job_id, timeout=timeout, will_retry=will_retry))
+
+
+@worker_ready.connect
+def _recover_orphaned_jobs_on_start(**_kwargs) -> None:
+    """When a worker boots, fail any job left `processing` by a previous run (its
+    worker died / was restarted mid-task) and reconcile the dependent answer sheets
+    / tests to `failed`. This stops the UI spinning forever and lets the student
+    re-upload. A fresh worker owns no in-flight tasks, so every `processing` row is
+    orphaned. Redelivered orphan tasks are then skipped by `_already_terminal`."""
+    async def _recover() -> None:
+        from app.core.database import AsyncSessionLocal
+        from app.modules.jobs.service import fail_orphaned_processing_jobs
+        from app.modules.subjective.service import fail_orphaned_sheets_and_tests
+
+        async with AsyncSessionLocal() as db:
+            failed = await fail_orphaned_processing_jobs(db)
+            reconciled = await fail_orphaned_sheets_and_tests(db)
+        if failed or reconciled:
+            logger.warning("Startup recovery: failed %d orphaned job(s), reconciled %d sheet(s)/test(s)",
+                           failed, reconciled)
+
+    try:
+        run_async(_recover())
+    except Exception:
+        logger.exception("Startup orphaned-job recovery failed")
 
 
 @worker_shutdown.connect

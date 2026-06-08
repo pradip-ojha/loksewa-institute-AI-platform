@@ -89,7 +89,12 @@ Key prefixes: `knowledge/`, `mcq-documents/`, `subjective-tests/`, `answer-sheet
 
 **PDF/Image:** PyMuPDF, OpenCV, Pillow. Audio: FFmpeg (via `ffmpeg-python`; the `ffmpeg` binary must be on PATH).
 
-**AI:** Azure OpenAI (primary, all tasks). No Gemini in this version.
+**AI:** Azure OpenAI for reasoning, embeddings, and transcription (the default provider).
+**Google Gemini is used for VISION ONLY** — handwritten answer-sheet OCR/extraction, the
+whole-sheet structure pass, the annotation locator, and vision-OCR fallbacks — because it
+reads Nepali/Devanagari handwriting better than GPT-5.5. Routed via `get_provider("vision")`
+(`ai/providers/gemini.py`, `google-genai` SDK). Gemini is NOT the default and is never used
+for reasoning/embeddings/transcription.
 
 ```env
 AZURE_OPENAI_API_VERSION_REASONING=2026-04-24
@@ -99,6 +104,8 @@ MODEL_REASONING=gpt-5.5
 MODEL_EMBEDDING=text-embedding-3-large
 MODEL_TRANSCRIPTION=gpt-4o-transcribe
 EMBEDDING_DIMENSIONS=3072
+GEMINI_API_KEY=<google-ai-studio-api-key>
+MODEL_VISION=gemini-3.5-flash   # vision-only (extraction, structure, locator)
 ```
 
 ---
@@ -386,18 +393,27 @@ checking guide. The question paper, marks, rubric, and rules are never embedded 
 Student uploads handwritten answer-sheet PDF/image
 → Quality check (blur, brightness, tilt, resolution, orientation)
 → If low quality: ask reupload (max 2 attempts), then continue with warning
-→ Convert pages to HIGH-QUALITY images for GPT-5.5 vision
-→ Question-level extraction (GPT-5.5 vision): per-question text + question bbox + page size + continuation
+→ Convert pages to HIGH-QUALITY images for vision
+→ Whole-sheet STRUCTURE pass (Gemini vision, all pages at once): page→question map, continuations, unclear-numbering notes (guidance only)
+→ Question-level extraction (Gemini vision, context-aware: structure map + prev/next-page hints): per-question text + question bbox + page size + continuation
 → Backend assembles whole-question answers across pages
 → Load admin test config (paper, marks, rubric/default, admin instructions) + LOCKED checking skills
   (NO large notes/books re-sent — the locked skill already distilled them)
-→ Checker decides WHAT is wrong → marks (capped at full marks) + feedback + missing points + annotation targets (by exact text)
-→ Reviewer / verification pass (second GPT-5.5 call): fix fairness, enforce max marks, prune annotation targets
-→ For each annotation target: vision Locator finds WHERE (natural underline path + comment box)
-→ Validator decides WHETHER geometry is safe (smooth / soft-mark / feedback-only fallback)
-→ Human-like renderer draws the checked PDF (curved baseline underlines, hand-style comments) → R2
-→ Student sees result + checked PDF immediately
+→ Checker (GPT-5.5) decides WHAT is wrong + SECTION-WISE breakdown (per criterion: awarded/max/status/evidence) → marks (capped at full marks) + feedback + missing points + annotation targets (wrong text) + positive sections (ticks)
+→ Reviewer / verification pass (second GPT-5.5 call): fix fairness, enforce max marks, keep section sums consistent, prune annotation targets
+→ Per question (ONE Gemini vision Locator call per question/page, on a CROP of the answer region): underline paths for wrong items + evidence box for each fully-correct section (its tick is placed beside that located line). Positive sections are routed to the page their evidence actually sits on (multi-page answers), matched via the per-page extraction text
+→ Validator decides WHETHER geometry is safe (smooth / soft-mark / feedback-only for underlines; ticks are SKIP-ON-MISS — drawn only where the evidence was confidently located, never dumped in a blank margin)
+→ Human-like renderer draws the checked PDF (curved baseline underlines, HarfBuzz-shaped Nepali red-pen comments, teacher-scale ticks beside correct lines, ONE circled question total at the END of each answer, sheet total banner) → R2
+→ Student sees result + section-wise breakdown + checked PDF immediately
 ```
+
+Nepali rendering: all annotation text is shaped by HarfBuzz (`uharfbuzz` + `freetype-py`,
+bundled Noto Sans Devanagari + Noto Sans Latin in `app/processing/fonts/`) and pasted as red
+ink — PIL's `ImageDraw.text` cannot shape Devanagari and is not used for text.
+
+Coordinate debug: `GET /api/admin/subjective/sheets/{id}/debug-pdf` re-renders the sheet
+(deterministic, same pixel space) and overlays raw vs. validated locator geometry + page
+corners, to confirm an annotation mismatch is geometry vs. rendering style.
 
 ### Extraction (question-level by default)
 The extractor captures, per question on a page: page number, question number, the full transcribed answer
@@ -491,10 +507,10 @@ Module mirrors `mcq_tests/`; base tables in migration `010_subjective`. Migratio
 `subjective_questions.topic/subtopic`, `question_specific_checking_skills.evaluation_status/evaluation_notes/iterations`,
 and `pdf_annotations.locator_plan`. Two orchestrated Celery jobs on `kvi_ai_subjective` (`workers/tasks/subjective_tasks.py`):
 - **`generate_test_skills`** (`subjective_test_processing`) — from `POST /admin/subjective/tests` and `POST .../{id}/regenerate-skills` (regenerate replaces questions + skills). Extracts questions+marks (`QuestionPaperAgent`, vision-OCR fallback via `_resolve_text`), persists `subjective_questions` (`marks` = full-marks source of truth), detects per-question topic/subtopic (`SubjectiveTopicRouterAgent`, validated vs the live subjective syllabus tree via `video.service.get_chapter_tree`), fetches supporting knowledge best-effort (`service.fetch_question_resources`, Pinecone `content_usage_type="subjective"`), then runs the multi-agent skill loop: `SkillGeneratorAgent` → `SkillEvaluatorAgent` → improve weak skills once (max 2 iterations) → lock one `question_specific_checking_skills` row per question with `skill_json` + `evaluation_status`/`evaluation_notes`/`iterations`. Sets `skill_generation_status=completed`; test **activates** only once skills completed and ≥1 question. **Knowledge is read ONLY here**, never during per-sheet checking.
-- **`check_answer_sheet`** (`answer_sheet_checking`) — from `POST /student/subjective/tests/{id}/upload-answer` (re-upload increments `upload_attempt_number`, cap 2). One job: render pages → PNG (`processing/pdf_tools`) → quality gate (`processing/image_quality`, OpenCV; **poor + attempt<2 ⇒ `needs_reupload`, no AI spent**) → **question-level** extraction per page (`AnswerExtractionAgent.extract_page`, vision) → assemble whole-question answers (`service.assemble_questionwise`, digit-tolerant qid match + `continues` carry-forward) → **checker** using locked skills + live config only, no big notes (`AnswerEvaluationAgent`, default-rubric constant when no rubric file) → **reviewer pass** (`AnswerReviewerAgent`) → per reviewed annotation target: vision **locator** (`AnnotationLocatorAgent`) → geometry **validator** (`processing/annotation_geometry.validate_and_smooth`) → human-like **renderer** (`processing/annotation`) + assemble checked PDF (`pdf_tools.build_pdf_from_images`) → upload `answer-sheets/checked/`. `service.clamp_marks` hard-caps each question (`question_results[].awarded_marks`/`max_marks`) after BOTH passes. `answer_evaluations` stores reviewed `evaluation_data` + `initial_evaluation_data` + `reviewed`/`review_notes`; `pdf_annotations` stores `annotation_instructions` (draw commands) + `locator_plan` (locator/validation audit). Per-question/per-page target caps keep the PDF uncrowded.
-- **Uniform rasterization:** every page (PDF or image) → high-DPI PNG so extraction bboxes, locator geometry, and annotation share one pixel space; checked PDF rebuilt from annotated PNGs.
-- **Agents** (`backend/app/ai/agents/`): `question_paper_agent`, `subjective_topic_router_agent`, `skill_generator_agent`, `skill_evaluator_agent`, `answer_extraction_agent`, `answer_evaluation_agent`, `answer_reviewer_agent`, `annotation_locator_agent` — all use `get_provider("reasoning")`, `audit_ctx`, active skill via `get_active_skill_text`. (`checking_skill_agent` was replaced by `skill_generator_agent`.)
-- **Result/UX:** `GET /student/subjective/tests/{id}/result` returns total + per-question marks + feedback + checked-PDF signed URL, never internal JSON. Frontend: admin `pages/admin/SubjectiveTests.tsx`, student `pages/student/StudentSubjectiveTests.tsx`, service `frontend/src/services/subjectiveTests.ts`.
+- **`check_answer_sheet`** (`answer_sheet_checking`) — from `POST /student/subjective/tests/{id}/upload-answer` (re-upload increments `upload_attempt_number`, cap 2). One job: render pages → PNG (`processing/pdf_tools`) → quality gate (`processing/image_quality`, OpenCV; **poor + attempt<2 ⇒ `needs_reupload`, no AI spent**) → **whole-sheet structure pass** (`AnswerStructureAgent`, Gemini vision over all pages, stored under `extracted_data["structure_map"]`) → **question-level** extraction per page (`AnswerExtractionAgent.extract_page`, **Gemini vision**, fed structure map + prev/next-page hints, may correct the map) → assemble whole-question answers (`service.assemble_questionwise`, digit-tolerant qid match + `continues` carry-forward; each region keeps its per-page `answer_text` for section→page routing) → **checker** using locked skills + live config only, no big notes (`AnswerEvaluationAgent`, GPT-5.5; emits `sections[]` section-wise breakdown + positive sections + annotation targets; default-rubric constant when no rubric file) → **reviewer pass** (`AnswerReviewerAgent`, GPT-5.5; carries `sections`) → **per question** ONE vision **locator** call per question/page on a CROP of the answer region (`AnnotationLocatorAgent.locate_question`, Gemini; returns underline paths for wrong items + an evidence box for each fully-correct section, crop coords mapped back via `crop_origin`) → geometry **validator** (`processing/annotation_geometry.validate_question_plan`; underline safety ladder + **ticks are skip-on-miss — placed beside the located evidence line only when confidently found (`TICK_CONF_MIN`), never margin-dumped**) → human-like **renderer** (`processing/annotation`, HarfBuzz Nepali via `processing/text_render`; teacher-scale ticks for fully-correct sections + ONE circled question total at the answer's END (last page) + sheet-total banner — no per-section fractions on the PDF) + assemble checked PDF (`pdf_tools.build_pdf_from_images`) → upload `answer-sheets/checked/`. `service.clamp_marks` hard-caps each question + clamps section sums (`_clamp_sections`) after BOTH passes. `answer_evaluations` stores reviewed `evaluation_data` + `initial_evaluation_data` + `reviewed`/`review_notes`; `pdf_annotations` stores `annotation_instructions` (draw commands) + `locator_plan` (per-question locator/validation audit). Per-question/per-page caps keep the PDF uncrowded.
+- **Uniform rasterization:** every page (PDF or image) → high-DPI PNG so extraction bboxes, locator geometry, and annotation share one pixel space; checked PDF rebuilt from annotated PNGs. Re-rendering is deterministic, which the coordinate-debug PDF (`service.build_debug_pdf` → `processing/annotation_debug`) relies on.
+- **Agents** (`backend/app/ai/agents/`): reasoning/GPT-5.5 (`get_provider("reasoning")`): `question_paper_agent`, `subjective_topic_router_agent`, `skill_generator_agent`, `skill_evaluator_agent`, `answer_evaluation_agent`, `answer_reviewer_agent`. Vision/Gemini (`get_provider("vision")`): `answer_structure_agent`, `answer_extraction_agent`, `annotation_locator_agent` (+ `_vision_ocr` fallback). All use `audit_ctx` + active skill via `get_active_skill_text`. (`checking_skill_agent` was replaced by `skill_generator_agent`.)
+- **Result/UX:** `GET /student/subjective/tests/{id}/result` returns total + per-question marks + **section-wise breakdown** + feedback + checked-PDF signed URL, never internal JSON. Admin coordinate debug: `GET /admin/subjective/sheets/{id}/debug-pdf`. Frontend: admin `pages/admin/SubjectiveTests.tsx`, student `pages/student/StudentSubjectiveTests.tsx` (renders section chips), service `frontend/src/services/subjectiveTests.ts`.
 - Knowledge-layer enrichment intentionally NOT used here — checking is grounded in the admin-configured test only.
 
 ---
@@ -700,7 +716,13 @@ Every task body delegates to `run_task(work, *, job_id, task=self)`:
 - Hard per-task timeout (`TASK_TIMEOUT_SECONDS`) via `asyncio.wait_for`.
 
 ### Stuck-job reaper (`workers/tasks/maintenance.py`, beat every 2 min)
-Backstop so **no job is stuck forever** even if a terminal write was lost. `reap_stale_jobs` (`jobs/service.py`) fails: `queued` > 10 min (never picked up — misrouted/orphaned), and `processing` past `TASK_TIMEOUT_SECONDS` + 5 min grace (worker died/wedged). *Why needed:* **Celery's hard `task_time_limit` does NOT fire under `--pool=solo` on Windows** (no signals), so on Windows the in-task `wait_for` + reaper are the real timeouts; on Linux/prefork the hard limit also applies.
+Backstop so **no job is stuck forever** even if a terminal write was lost. `reap_stale_jobs` (`jobs/service.py`) fails: `queued` > 10 min (never picked up — misrouted/orphaned), and `processing` past `TASK_TIMEOUT_SECONDS` + 5 min grace (worker died/wedged). *Why needed:* **Celery's hard `task_time_limit` does NOT fire under `--pool=solo` on Windows** (no signals), so on Windows the in-task `wait_for` + reaper are the real timeouts; on Linux/prefork the hard limit also applies. Each reaper tick also calls `subjective.service.fail_orphaned_sheets_and_tests` to propagate dead/failed jobs to their answer sheets / tests (`current_status`/`skill_generation_status` → `failed`), so the student UI leaves the spinner and re-upload is enabled.
+
+### Worker-restart recovery (`runtime.py` `worker_ready` signal)
+A hard restart (backend + worker killed mid-job) leaves jobs in `processing` with no live owner — and with `task_acks_late=True` + a 6 h `visibility_timeout`, the broker won't redeliver them for hours, so the sheet would spin forever. On boot, `_recover_orphaned_jobs_on_start` fails **all** `processing` jobs (`jobs/service.fail_orphaned_processing_jobs`) — a fresh worker owns no in-flight tasks, so every such row is orphaned — then reconciles the dependent sheets/tests to `failed`. `_already_terminal` in `run_task` skips any redelivered task whose job is now `completed`/`failed`/`cancelled` (Celery *retries* stay in `retrying`, so they are unaffected), so a late orphan redelivery can't resurrect a job the student already re-submitted.
+
+### Gemini rate-limit retry
+The Gemini free tier is rate-limited **per minute**, so `gemini._generate_content_with_retry` waits a full `GEMINI_RATE_LIMIT_RETRY_SECONDS` (60 s) on a 429 / `RESOURCE_EXHAUSTED` before retrying (up to `GEMINI_RATE_LIMIT_MAX_RETRIES`), instead of the short exponential backoff used for other transient errors.
 
 ### Queue Routing (defined in `TASK_ROUTES`)
 ```
@@ -714,7 +736,7 @@ analytics / reaper / keepalive→ kvi_ai_default
 ```
 
 ### Job Types
-knowledge_processing, mcq_extraction, mcq_generation, mcq_regeneration, mcq_test_set_generation, subjective_test_processing (skill generation: topic routing → knowledge fetch → skill generate → skill evaluate → improve → lock), question_specific_skill_generation, skill_evaluation, answer_sheet_quality_check, answer_sheet_extraction (question-level), answer_evaluation, answer_review (reviewer/verification pass), annotation_location (vision locator) + annotation geometry validation, pdf_annotation, video_audio_extraction, video_transcription, video_processing, video_timeline_generation, skill_builder_update, analytics_recalculation.
+knowledge_processing, mcq_extraction, mcq_generation, mcq_regeneration, mcq_test_set_generation, subjective_test_processing (skill generation: topic routing → knowledge fetch → skill generate → skill evaluate → improve → lock), question_specific_skill_generation, skill_evaluation, answer_sheet_quality_check, answer_sheet_structure (whole-sheet page→question map, Gemini vision), answer_sheet_extraction (question-level, Gemini vision, structure-aware), answer_evaluation (with section-wise breakdown), answer_review (reviewer/verification pass), annotation_location (per-question vision locator) + annotation geometry validation, pdf_annotation, video_audio_extraction, video_transcription, video_processing, video_timeline_generation, skill_builder_update, analytics_recalculation.
 
 The exact job decomposition for answer-sheet checking (one orchestrated job running the steps vs. chained jobs) is decided during the build; the **reviewer/verification pass must be a tracked step**. Subjective tasks live in `workers/tasks/subjective_tasks.py`, routed `workers.tasks.subjective_tasks.* → kvi_ai_subjective`.
 
@@ -846,9 +868,13 @@ class AIModelProvider:
     async def transcribe(self, audio_bytes, mime_type, **audit_ctx) -> dict: ...
 ```
 
-All agents call this interface. Never call Azure SDK directly from agent code.
+All agents call this interface via `get_provider(task_type)`. `get_provider("vision")` returns
+the **Gemini** provider (`ai/providers/gemini.py`, vision-only: `generate_with_image` +
+`generate_with_images` for the multi-page structure pass; text/embed/transcribe raise); every
+other task type returns the **Azure OpenAI** provider. Never call a vendor SDK directly from agent code.
 
-Provider logs every call to `ai_requests` table with token counts, latency, status.
+Each provider logs every call to `ai_requests` with `provider` (`azure_openai`|`gemini`), token
+counts, latency, status — so the admin debug endpoints surface Gemini and Azure calls alike.
 
 Structured JSON output required for: MCQ extraction/generation, checking skill generation, answer extraction, evaluation, PDF annotation, timeline, slide labels, skill updates.
 
@@ -915,9 +941,16 @@ MODEL_REASONING=gpt-5.5
 MODEL_EMBEDDING=text-embedding-3-large
 MODEL_TRANSCRIPTION=gpt-4o-transcribe
 
+# ── Google Gemini (VISION ONLY: handwriting extraction, structure pass, locator) ──
+GEMINI_API_KEY=<google-ai-studio-api-key>   # AQ.* and AIza* key formats are both valid
+MODEL_VISION=gemini-3.5-flash               # vision model id your key can access
+
 # ── AI / worker timeouts (seconds) ────────────────────────────────────────
 AI_REQUEST_TIMEOUT_SECONDS=180   # per Azure OpenAI call
+GEMINI_REQUEST_TIMEOUT_SECONDS=180  # per Gemini vision call
 AI_MAX_RETRIES=3                 # transient-error retries per AI call
+GEMINI_RATE_LIMIT_RETRY_SECONDS=60  # free-tier limit is per-minute → wait a full minute on 429
+GEMINI_RATE_LIMIT_MAX_RETRIES=3     # how many 60s rate-limit waits before giving up
 TASK_TIMEOUT_SECONDS=1800        # hard ceiling for a single Celery job
 
 # ── URLs ──────────────────────────────────────────────────────────────────
@@ -976,7 +1009,7 @@ Phase 12: Hardening (error handling, security, logging, deployment)
 - Expose Azure OpenAI keys in UI or API responses
 - Run heavy AI/PDF/video tasks in synchronous request handlers
 - Implement microservices
-- Use Gemini as default provider
+- Use Gemini as default provider (Gemini is VISION-ONLY: extraction/structure/locator; Azure stays default for reasoning/embeddings/transcription)
 - Build Pinecone index with dimension ≠ 3072 (current index uses 3072)
 - Share DB, Pinecone, R2 bucket, or queue names with NeuraFix Bridge
 

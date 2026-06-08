@@ -96,6 +96,13 @@ class QualityResultOut(BaseModel):
     quality_notes: str | None = None
 
 
+class SectionMarkOut(BaseModel):
+    section: str
+    awarded: float
+    max: float
+    status: str  # correct | partial | wrong
+
+
 class ResultQuestionOut(BaseModel):
     question_number: str
     question_text: str
@@ -103,6 +110,7 @@ class ResultQuestionOut(BaseModel):
     marks_possible: float
     feedback: str | None = None
     mistakes: list[str] = []
+    sections: list[SectionMarkOut] = []
 
 
 class AnswerResultOut(BaseModel):

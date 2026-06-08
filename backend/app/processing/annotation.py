@@ -7,10 +7,9 @@ to draw the validated plan.
 Two hard lessons baked in here:
   • Answer sheets are Nepali/Devanagari, so EVERY text font must render Devanagari
     (Nirmala UI / Noto Sans Devanagari) — otherwise comments come out as ▯▯▯ tofu.
-  • Real answer sheets fill the page edge-to-edge, so a bare red comment lands on top
-    of the student's writing and becomes unreadable. Comments and marks are therefore
-    drawn on a translucent white "margin-note" card with a thin red border, like a
-    teacher's sticky note — always legible regardless of what is underneath.
+  • Comments must look like a teacher wrote them with a red pen directly on the sheet:
+    plain red ink, NO box, NO background fill, NO border. The locator/validator place
+    comments in the margin / blank space so bare red text stays readable without a card.
 
 Underlines still follow the handwriting baseline as a Catmull-Rom curve with light
 jitter (never a straight bbox line). It stays uncrowded — it draws only what the
@@ -25,48 +24,19 @@ Command shapes (all coordinates in page-image pixels):
 from __future__ import annotations
 
 import io
+import math
 import random
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
+
+from app.processing import text_render
 
 RED = (213, 43, 30)
 RED_SOFT = (206, 64, 52)
-CARD_FILL = (255, 255, 252, 232)   # near-white, slightly translucent
-CARD_BORDER = (213, 43, 30)
 
-# Devanagari-capable first (Windows: Nirmala UI; Linux/prod: Noto Sans Devanagari),
-# then plain sans as a last resort. A handwriting font is intentionally NOT used for
-# body text because none of the common ones cover Devanagari.
-_FONT_CANDIDATES = [
-    "C:/Windows/Fonts/Nirmala.ttc",
-    "Nirmala.ttc",
-    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
-    "NotoSansDevanagari-Regular.ttf",
-    "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
-    "C:/Windows/Fonts/mangal.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "DejaVuSans.ttf",
-    "arial.ttf",
-]
-_BOLD_CANDIDATES = [
-    "C:/Windows/Fonts/Nirmala.ttc",
-    "Nirmala.ttc",
-    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
-    "NotoSansDevanagari-Bold.ttf",
-    "C:/Windows/Fonts/mangal.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "DejaVuSans-Bold.ttf",
-    "arialbd.ttf",
-]
-
-
-def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-    for name in (_BOLD_CANDIDATES if bold else _FONT_CANDIDATES):
-        try:
-            return ImageFont.truetype(name, size)
-        except Exception:
-            continue
-    return ImageFont.load_default()
+# All annotation text (Nepali/English) is shaped + rasterized by `text_render`
+# (HarfBuzz + freetype) so Devanagari matras/conjuncts render correctly, then pasted
+# as red "ink". PIL fonts are NOT used for text — they can't shape Devanagari.
 
 
 # ── curve maths ──────────────────────────────────────────────────────────────────
@@ -108,116 +78,122 @@ def _draw_underline_path(draw: ImageDraw.ImageDraw, points: list, base: int, rng
         draw.line([ghost[i], ghost[i + 1]], fill=RED_SOFT, width=max(1, width - 1))
 
 
-# ── text helpers ─────────────────────────────────────────────────────────────────
+# ── text helpers (HarfBuzz-shaped red ink, no boxes/backgrounds) ───────────────────
 
-def _wrap(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
-    lines: list[str] = []
-    cur = ""
-    for word in text.split():
-        trial = f"{cur} {word}".strip()
-        if draw.textbbox((0, 0), trial, font=font)[2] > max_width and cur:
-            lines.append(cur)
-            cur = word
-        else:
-            cur = trial
-    if cur:
-        lines.append(cur)
-    return lines
-
-
-def _round_rect(draw: ImageDraw.ImageDraw, box, radius: int, fill, outline, width: int) -> None:
-    try:
-        draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=width)
-    except Exception:
-        draw.rectangle(box, fill=fill, outline=outline, width=width)
+def _paste_ink(img: Image.Image, ink: Image.Image, x: int, y: int) -> None:
+    """Composite a rendered red-ink RGBA image onto the page, clamped inside it."""
+    W, H = img.size
+    x = max(2, min(int(x), W - ink.width - 2))
+    y = max(2, min(int(y), H - ink.height - 2))
+    img.alpha_composite(ink, (x, y))
 
 
 def _draw_note_card(
     img: Image.Image, text: str, box: tuple[int, int, int, int],
-    font: ImageFont.FreeTypeFont, max_lines: int = 4,
+    size: int, rng: random.Random, max_lines: int = 4,
 ) -> None:
-    """Draw red text on a translucent white card anchored at `box` top-left, sized to
-    the wrapped text and clamped to the page. Always legible over writing."""
+    """Write the comment as bare red pen ink anchored at `box` top-left, wrapped to the
+    available width and clamped to the page. No box, no background — like a real teacher."""
     W, H = img.size
     x1, y1, x2, y2 = (int(v) for v in box)
-    pad = max(6, font.size // 3)
-    avail_w = max(120, min(x2, W) - x1 - 2 * pad) if x2 > x1 else int(W * 0.26)
-    avail_w = min(avail_w, W - x1 - 2 * pad - 4)
+    avail_w = max(140, min(x2, W) - x1) if x2 > x1 else int(W * 0.28)
+    avail_w = min(avail_w, W - x1 - 6)
 
-    probe = ImageDraw.Draw(img)
-    lines = _wrap(probe, text, font, avail_w)[:max_lines]
-    if not lines:
+    ink = text_render.render_text_rgba(
+        text, size=size, color=RED, max_width=avail_w, max_lines=max_lines,
+    )
+    if ink.width <= 1:
         return
-    line_h = font.size + 6
-    text_w = max((probe.textbbox((0, 0), ln, font=font)[2] for ln in lines), default=avail_w)
-    card_w = min(W - 8, text_w + 2 * pad)
-    card_h = line_h * len(lines) + 2 * pad
-
-    # Keep the whole card on the page.
-    cx1 = max(4, min(x1, W - card_w - 4))
-    cy1 = max(4, min(y1, H - card_h - 4))
-    card = (cx1, cy1, cx1 + card_w, cy1 + card_h)
-
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
-    _round_rect(od, card, radius=max(6, pad), fill=CARD_FILL, outline=CARD_BORDER, width=2)
-    for i, ln in enumerate(lines):
-        od.text((cx1 + pad, cy1 + pad + i * line_h), ln, fill=RED, font=font)
-    img.paste(Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB"), (0, 0))
+    cx = max(4, min(x1 + int(rng.uniform(-1, 2)), W - ink.width - 6))
+    cy = max(4, min(y1 + int(rng.uniform(-1, 1)), H - ink.height - 4))
+    _paste_ink(img, ink, cx, cy)
 
 
-def _draw_mark_chip(img: Image.Image, text: str, x: int, y: int, font: ImageFont.FreeTypeFont) -> None:
-    """Small white chip with bold red marks (e.g. '6/10'), clamped to the page."""
+def _draw_hand_circle(draw: ImageDraw.ImageDraw, cx: float, cy: float, rx: float, ry: float,
+                      rng: random.Random, width: int) -> None:
+    """Draw an irregular, hand-drawn red circle (slightly past one full turn, with radius
+    jitter) — like a teacher circling marks, not a perfect ellipse."""
+    n = 46
+    turns = 1.07
+    start = rng.uniform(0, 2 * math.pi)
+    total = 2 * math.pi * turns
+    pts: list[tuple[float, float]] = []
+    for i in range(n + 1):
+        a = start + total * (i / n)
+        jr = 1.0 + rng.uniform(-0.06, 0.06)
+        pts.append((cx + rx * jr * math.cos(a), cy + ry * jr * math.sin(a)))
+    for i in range(len(pts) - 1):
+        draw.line([pts[i], pts[i + 1]], fill=RED, width=width)
+
+
+def _draw_mark_chip(img: Image.Image, text: str, x: int, y: int, size: int, rng: random.Random) -> None:
+    """Bold red marks (e.g. '6/10') inside a hand-drawn circle, centered on (x, y) —
+    like a teacher circling the marks. No background fill."""
+    ink = text_render.render_text_rgba(text, size=size, color=RED, bold=True)
+    if ink.width <= 1:
+        return
     W, H = img.size
-    probe = ImageDraw.Draw(img)
-    tb = probe.textbbox((0, 0), text, font=font)
-    tw, th = tb[2] - tb[0], tb[3] - tb[1]
-    pad = max(5, font.size // 4)
-    cw, ch = tw + 2 * pad, th + 2 * pad
-    cx1 = max(2, min(int(x), W - cw - 2))
-    cy1 = max(2, min(int(y), H - ch - 2))
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
-    _round_rect(od, (cx1, cy1, cx1 + cw, cy1 + ch), radius=max(5, pad), fill=CARD_FILL, outline=CARD_BORDER, width=2)
-    od.text((cx1 + pad - tb[0], cy1 + pad - tb[1]), text, fill=RED, font=font)
-    img.paste(Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB"), (0, 0))
+    tw, th = ink.width, ink.height
+    rx = tw / 2 + size * 0.5
+    ry = th / 2 + size * 0.38
+    # Centre, clamped so the whole circle stays on the page.
+    cx = min(max(float(x), rx + 4), W - rx - 4)
+    cy = min(max(float(y), ry + 4), H - ry - 4)
+    draw = ImageDraw.Draw(img, "RGBA")
+    _draw_hand_circle(draw, cx, cy, rx, ry, rng, max(3, int(size * 0.09)))
+    _paste_ink(img, ink, int(cx - tw / 2), int(cy - th / 2))
 
 
-def _draw_banner(img: Image.Image, text: str, font: ImageFont.FreeTypeFont) -> None:
+def _draw_banner(img: Image.Image, text: str, size: int) -> None:
+    """Total written in the top-right corner in bare red pen — no banner box, no fill."""
     W, _ = img.size
-    probe = ImageDraw.Draw(img)
+    ink = text_render.render_text_rgba(text, size=size, color=RED, bold=True)
     pad = 12
-    tb = probe.textbbox((0, 0), text, font=font)
-    tw, th = tb[2] - tb[0], tb[3] - tb[1]
-    cw, ch = tw + 2 * pad, th + 2 * pad
-    cx1 = W - cw - pad
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
-    _round_rect(od, (cx1, pad, cx1 + cw, pad + ch), radius=8, fill=(255, 255, 255, 240), outline=CARD_BORDER, width=3)
-    od.text((cx1 + pad - tb[0], pad + pad - tb[1]), text, fill=RED, font=font)
-    img.paste(Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB"), (0, 0))
+    _paste_ink(img, ink, W - ink.width - pad, pad)
+
+
+def _draw_tick(draw: ImageDraw.ImageDraw, x: int, y: int, size: int, rng: random.Random) -> None:
+    """Draw a big, bold hand-style red check mark (✓) as two strokes — font-independent.
+    (x, y) is the elbow of the tick. Drawn thick so it reads like a teacher's pen tick."""
+    s = max(16, int(size))
+    w = max(4, int(size * 0.1))
+    jx, jy = rng.uniform(-1.5, 1.5), rng.uniform(-1.5, 1.5)
+    # short down-stroke into the elbow, then a long up-stroke to the upper right
+    p0 = (x - s * 0.40 + jx, y - s * 0.05 + jy)
+    p1 = (x - s * 0.08 + jx, y + s * 0.34 + jy)
+    p2 = (x + s * 0.60 + jx, y - s * 0.55 + jy)
+    draw.line([p0, p1], fill=RED, width=w)
+    draw.line([p1, p2], fill=RED, width=w)
 
 
 # ── public entrypoint ────────────────────────────────────────────────────────────
 
 def draw_annotations(page_png: bytes, commands: list[dict]) -> bytes:
-    """Render the validated annotation plan for one page; return PNG bytes."""
-    img = Image.open(io.BytesIO(page_png)).convert("RGB")
+    """Render the validated annotation plan for one page; return PNG bytes.
+
+    Command types: underline_path, comment, mark (per-question total), banner
+    (sheet total), tick (positive check beside a correct line)."""
+    img = Image.open(io.BytesIO(page_png)).convert("RGBA")
     w, h = img.size
     base = max(16, int(h * 0.016))
+    mark_size = int(base * 1.4)        # circled per-question total (teacher-scale)
+    banner_size = int(base * 1.2)
+    tick_size = int(base * 3.2)        # correct-point tick over the line (teacher-scale)
     rng = random.Random((w * 73856093) ^ (h * 19349663) ^ len(commands or []))
 
-    font = _load_font(base)
-    mark_font = _load_font(int(base * 1.2), bold=True)
-    banner_font = _load_font(int(base * 1.3), bold=True)
-
-    # Underlines first (on the writing), then cards on top so they're never covered.
+    # Underlines + ticks first (on the writing), then text on top so it's never covered.
     draw = ImageDraw.Draw(img, "RGBA")
     for cmd in commands or []:
-        if cmd.get("type") == "underline_path":
+        ctype = cmd.get("type")
+        if ctype == "underline_path":
             for path in cmd.get("paths") or []:
                 if isinstance(path, (list, tuple)) and len(path) >= 2:
                     _draw_underline_path(draw, path, base, rng)
+        elif ctype == "tick":
+            # Keep the whole tick on-page (it spans ~0.4*size left and ~0.6*size right).
+            tx = min(max(int(cmd.get("x", 0)), int(tick_size * 0.45)), w - int(tick_size * 0.65))
+            ty = min(max(int(cmd.get("y", 0)), int(tick_size * 0.6)), h - int(tick_size * 0.6))
+            _draw_tick(draw, tx, ty, tick_size, rng)
 
     for cmd in commands or []:
         ctype = cmd.get("type")
@@ -225,16 +201,16 @@ def draw_annotations(page_png: bytes, commands: list[dict]) -> bytes:
             text = (cmd.get("text") or "").strip()
             box = cmd.get("box")
             if text and isinstance(box, (list, tuple)) and len(box) >= 4:
-                _draw_note_card(img, text[:240], tuple(int(v) for v in box[:4]), font)
+                _draw_note_card(img, text[:240], tuple(int(v) for v in box[:4]), base, rng)
         elif ctype == "mark":
             text = (cmd.get("text") or "").strip()
             if text:
-                _draw_mark_chip(img, text, int(cmd.get("x", int(w * 0.86))), int(cmd.get("y", 12)), mark_font)
+                _draw_mark_chip(img, text, int(cmd.get("x", int(w * 0.86))), int(cmd.get("y", 12)), mark_size, rng)
         elif ctype == "banner":
             text = (cmd.get("text") or "").strip()
             if text:
-                _draw_banner(img, text, banner_font)
+                _draw_banner(img, text, banner_size)
 
     out = io.BytesIO()
-    img.save(out, format="PNG")
+    img.convert("RGB").save(out, format="PNG")
     return out.getvalue()

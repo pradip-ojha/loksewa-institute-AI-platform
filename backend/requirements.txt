@@ -16,11 +16,16 @@ python-magic>=0.4.27; sys_platform != "win32"
 # Stage 4
 pinecone>=3.0.0
 openai>=1.30.0
+google-genai>=2.8.0
 PyMuPDF>=1.24.0
 python-docx>=1.1.0
 # Stage 5 (subjective answer-sheet checking: page rasterization, quality checks, annotation drawing)
 Pillow>=10.0.0
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
+# Devanagari (Nepali) text shaping for human-like checked-PDF comments
+# (bundled fonts live in app/processing/fonts/ — see MANIFEST/packaging note below)
+uharfbuzz>=0.55.0
+freetype-py>=2.5.1
 # Stage 9 (Video Tutor: audio extraction + chunking via the system ffmpeg binary)
 ffmpeg-python>=0.2.0

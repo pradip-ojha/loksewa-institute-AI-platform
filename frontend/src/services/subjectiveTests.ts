@@ -90,6 +90,13 @@ export interface QualityResult {
   quality_notes: string | null;
 }
 
+export interface SectionMark {
+  section: string;
+  awarded: number;
+  max: number;
+  status: string; // correct | partial | wrong
+}
+
 export interface ResultQuestion {
   question_number: string;
   question_text: string;
@@ -97,6 +104,7 @@ export interface ResultQuestion {
   marks_possible: number;
   feedback: string | null;
   mistakes: string[];
+  sections: SectionMark[];
 }
 
 export interface AnswerResult {

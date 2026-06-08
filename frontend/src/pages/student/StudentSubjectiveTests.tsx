@@ -284,6 +284,25 @@ function ResultView({ testId, onBack }: { testId: string; onBack: () => void }) 
                   <span className="text-sm font-semibold text-brand-700">{q.marks_awarded} / {q.marks_possible}</span>
                 </div>
                 {q.question_text && <p className="mt-1 text-xs text-gray-500">{q.question_text}</p>}
+                {q.sections && q.sections.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {q.sections.map((s, i) => (
+                      <span
+                        key={i}
+                        className={
+                          "rounded-md px-2 py-0.5 text-xs font-medium ring-1 " +
+                          (s.status === "correct"
+                            ? "bg-green-50 text-green-700 ring-green-200"
+                            : s.status === "partial"
+                            ? "bg-amber-50 text-amber-700 ring-amber-200"
+                            : "bg-red-50 text-red-700 ring-red-200")
+                        }
+                      >
+                        {s.section}: {s.awarded}/{s.max}
+                      </span>
+                    ))}
+                  </div>
+                )}
                 {q.feedback && <p className="mt-2 text-sm text-gray-700">{q.feedback}</p>}
                 {q.mistakes.length > 0 && (
                   <ul className="mt-2 list-disc pl-5 text-xs text-red-600">

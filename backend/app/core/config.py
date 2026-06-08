@@ -43,9 +43,19 @@ class Settings(BaseSettings):
     MODEL_TRANSCRIPTION: str = "whisper"
     EMBEDDING_DIMENSIONS: int = 3072
 
+    # AI Models — Google Gemini (VISION ONLY: handwriting extraction, structure pass,
+    # annotation locator). Reasoning/embeddings/transcription stay on Azure OpenAI.
+    GEMINI_API_KEY: str = ""
+    MODEL_VISION: str = ""
+
     # AI / worker timeouts (seconds)
     AI_REQUEST_TIMEOUT_SECONDS: int = 180   # per Azure OpenAI call
+    GEMINI_REQUEST_TIMEOUT_SECONDS: int = 180  # per Gemini vision call
     AI_MAX_RETRIES: int = 3                  # transient-error retries per AI call
+    # Gemini free tier is rate-limited PER MINUTE, so on a rate-limit error we wait a
+    # full minute before retrying (a short exponential backoff would just hit it again).
+    GEMINI_RATE_LIMIT_RETRY_SECONDS: int = 60
+    GEMINI_RATE_LIMIT_MAX_RETRIES: int = 3
     TASK_TIMEOUT_SECONDS: int = 1800         # hard ceiling for a single Celery job
 
     # URLs

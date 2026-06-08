@@ -23,6 +23,11 @@ EXTRACTION_PROMPT = """You are a precise handwriting OCR system for scanned exam
 
 This is page {page_number} of a student's answer sheet. The image is {width} pixels wide and {height} pixels tall (origin at top-left).
 
+STRUCTURE GUIDANCE (from a whole-sheet pass — use it to resolve unclear question numbers and continuations, but TRUST THE VISIBLE PAGE: correct this guidance if the page clearly contradicts it):
+{structure_hint}
+{prev_page_tail}
+{next_page_hint}
+
 Group the handwriting by QUESTION. For each question that has writing on THIS page return:
 - "question_number": the question this answer belongs to. Use one of the known labels when a question number is visible ("Q1", "1.", "प्रश्न नं. १"); if writing continues from the previous page with no new label, use the question it continues.
 - "answer_text": the exact full transcribed answer for that question on this page (preserve Devanagari; transcribe formulas, numbers, and table contents as written; keep line breaks with \\n).
@@ -50,15 +55,19 @@ Return ONLY valid JSON in exactly this structure:
 class AnswerExtractionAgent:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.provider = get_provider("reasoning")
+        self.provider = get_provider("vision")  # Gemini reads Nepali handwriting better
 
     async def extract_page(
         self, *, page_png: bytes, page_number: int, width: int, height: int,
         valid_numbers: list[str], sheet_id: uuid.UUID,
+        structure_hint: str = "", prev_page_tail: str = "", next_page_hint: str = "",
     ) -> dict:
         prompt = EXTRACTION_PROMPT.format(
             page_number=page_number, width=width, height=height,
             valid_numbers=", ".join(valid_numbers) if valid_numbers else "unknown",
+            structure_hint=structure_hint or "(none)",
+            prev_page_tail=prev_page_tail or "",
+            next_page_hint=next_page_hint or "",
         )
         audit_ctx = {
             "db": self.db,
