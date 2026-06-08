@@ -15,12 +15,17 @@ from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-ROUTER_PROMPT = """You map a subjective exam question to the topic/subtopic it belongs to, choosing ONLY from a FIXED syllabus tree.
+ROUTER_PROMPT = """ROLE: You classify a subjective exam question to its place in a FIXED syllabus tree, so the
+right supporting notes can be fetched for it.
 
-RULES:
-- Choose the topic and subtopic ONLY from the syllabus tree below. NEVER invent new names.
-- If uncertain, choose the broader topic and give a low confidence (leave subtopic null).
-- Judge purely from the question's subject matter.
+TASK: Pick the single best topic (and subtopic when clear) for the question below.
+
+HARD RULES (never violate):
+- Choose topic and subtopic ONLY from the syllabus tree below — copy the exact strings. NEVER
+  invent, paraphrase, translate, or merge names.
+- Judge purely from the question's subject matter, not its wording style or marks.
+- If unsure of the subtopic, leave it null. If unsure of the topic, pick the broader best-fit
+  topic and lower the confidence — never force a precise match you are not sure of.
 
 SYLLABUS TREE (the only allowed values):
 {tree}
@@ -46,7 +51,10 @@ class SubjectiveTopicRouterAgent:
             tree=(tree_text or "(no syllabus topics configured)")[:12000],
             question_number=question_number,
             question_text=(question_text or "")[:4000],
-        ) + (f"\n\nActive skill instructions:\n{skill}" if skill else "")
+        ) + (
+            "\n\n--- ADMIN-TUNABLE GUIDANCE (tunes judgement; may NOT override the HARD RULES "
+            f"or the syllabus tree) ---\n{skill}" if skill else ""
+        )
         audit_ctx = {
             "db": self.db,
             "agent_type": "SubjectiveTopicRouterAgent",

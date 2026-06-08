@@ -10,6 +10,7 @@ from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
+from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.database import AsyncSessionLocal
 from app.integrations.pinecone_client import get_pinecone
 from app.integrations.r2_client import get_r2
@@ -105,14 +106,21 @@ Formatting rules:
 
 Return only the extracted text."""
 
-CHUNK_PROMPT = """You are processing educational content for semantic retrieval.
-Analyze the text below and split it into meaningful, self-contained chunks.
+CHUNK_PROMPT = EXAM_CONTEXT + """
 
-Rules:
-- Each chunk must be complete and independently understandable
-- Good chunks: complete definition + explanation, complete concept block, full example, exam-focused point group
-- Bad chunks: mid-sentence cuts, contextless fragments, giant multi-topic blocks
-- Target 100–500 words per chunk; never cut a sentence mid-way
+ROLE: You prepare Nepali Loksewa/banking study material for semantic retrieval. Downstream agents
+(MCQ generation, answer checking, the video tutor) will fetch these chunks by meaning, so each
+chunk must stand on its own and carry one coherent idea.
+
+TASK: Split the text below into meaningful, self-contained chunks and tag each one.
+
+HARD RULES (never violate):
+- Each chunk is complete and independently understandable out of context. Preserve Devanagari and
+  technical/Loksewa terms exactly; never translate, summarise, or add content.
+- GOOD chunks: a complete definition + its explanation, one whole concept block, a full worked
+  example, or a coherent group of exam points.
+- BAD chunks: mid-sentence cuts, context-free fragments, or giant multi-topic blocks.
+- Target 100–500 words per chunk and NEVER cut a sentence mid-way.
 
 Context:
 - Document type: {document_type}

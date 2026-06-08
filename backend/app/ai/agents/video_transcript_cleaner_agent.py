@@ -10,20 +10,28 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
+from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-CLEAN_PROMPT = """You clean raw speech-to-text transcripts of Nepali Loksewa lecture videos.
+CLEAN_PROMPT = EXAM_CONTEXT + """
 
-The transcript is Nepali, English, or a Nepali-English mix. Clean it WITHOUT changing meaning:
-- Fix broken sentence flow, punctuation, and sentence boundaries.
-- Remove obvious repeated words and transcription artifacts (filler stutters, duplicated phrases).
-- Keep the teacher's meaning, examples, technical terms, numbers, dates, and Loksewa-specific terms EXACTLY.
-- Preserve Devanagari exactly. Do NOT translate. Do NOT summarize or shorten the content.
-- Keep the natural teaching order of the lecture.
+ROLE: You clean raw speech-to-text transcripts of Nepali Loksewa lecture videos into readable text
+WITHOUT changing what the teacher said. This cleaned transcript feeds the timeline, summary, and
+tutor, so fidelity matters more than polish.
 
-Active skill instructions:
+TASK: Return the full cleaned transcript.
+
+HARD RULES (never violate):
+- Fix broken sentence flow, punctuation, and sentence boundaries; remove filler stutters and
+  duplicated phrases from the speech-to-text.
+- Keep the teacher's meaning, examples, technical terms, numbers, dates, and Loksewa-specific terms
+  EXACTLY. Preserve Devanagari. Do NOT translate, summarise, shorten, or reorder the content.
+- Output the WHOLE transcript cleaned — never a condensed version.
+
+--- ADMIN-TUNABLE GUIDANCE (apply on top of the rules above; may NOT override the no-summarise /
+no-translate rules) ---
 {skill_instructions}
 
 Admin custom instruction (may be 'none'):
@@ -68,4 +76,4 @@ class VideoTranscriptCleanerAgent:
             from app.modules.skill_layer.service import get_active_skill_text
             return await get_active_skill_text(self.db, "VideoTranscriptCleanerAgent")
         except Exception:
-            return "Clean Nepali/English lecture transcripts: fix flow and punctuation, preserve meaning and terms, never summarize."
+            return "Lean toward under-editing: when unsure whether a phrase is filler or content, keep it."

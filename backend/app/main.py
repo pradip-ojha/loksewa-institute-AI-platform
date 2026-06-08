@@ -90,4 +90,55 @@ app.include_router(analytics_router, prefix="/api")
 
 @app.get("/health")
 async def health():
+    """Liveness — the process is up. Always 200 (does not touch dependencies)."""
     return {"status": "ok", "service": "neurafix-api"}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """Readiness — quick reachability probe of the core dependencies (DB, Redis,
+    Pinecone). Returns per-dependency status and 200 only if all are reachable,
+    503 otherwise. Cheap pings only (no AI calls); safe to hit during a demo to
+    confirm the backend can actually do work."""
+    import asyncio
+
+    from fastapi.responses import JSONResponse
+
+    async def _db() -> None:
+        from sqlalchemy import text
+        from app.core.database import engine
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+
+    def _redis() -> None:
+        import redis
+        url = settings.REDIS_URL
+        kwargs = {"socket_timeout": 8}
+        if url.startswith("rediss://"):
+            kwargs["ssl_cert_reqs"] = None
+        client = redis.from_url(url, **kwargs)
+        try:
+            client.ping()
+        finally:
+            client.close()
+
+    def _pinecone() -> None:
+        from app.integrations.pinecone_client import get_pinecone
+        get_pinecone()._get_index().describe_index_stats()
+
+    async def _probe(name, fn):
+        try:
+            await (fn() if asyncio.iscoroutinefunction(fn) else asyncio.to_thread(fn))
+            return name, {"ok": True}
+        except Exception as exc:  # noqa: BLE001
+            return name, {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+    results = await asyncio.gather(
+        _probe("database", _db),
+        _probe("redis", _redis),
+        _probe("pinecone", _pinecone),
+    )
+    deps = {name: status for name, status in results}
+    all_ok = all(s["ok"] for s in deps.values())
+    body = {"status": "ready" if all_ok else "degraded", "dependencies": deps}
+    return JSONResponse(body, status_code=200 if all_ok else 503)

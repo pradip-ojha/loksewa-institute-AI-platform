@@ -10,12 +10,16 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
+from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-TIMELINE_PROMPT = """You build a structured TIMELINE from a Nepali Loksewa lecture transcript.
-The timeline is both a UI feature and the retrieval index a router will later use to answer student questions.
+TIMELINE_PROMPT = EXAM_CONTEXT + """
+
+ROLE: You build the structured TIMELINE of a Nepali Loksewa lecture. It is both a UI feature
+students browse AND the retrieval index a router later uses to send each question to the right
+segment — so your labels and descriptions directly determine Q&A quality.
 
 The transcript is provided as TIME-ANCHORED SECTIONS. Each section header states the real time window
 (in seconds) that the section's text covers. Consecutive sections may overlap by a few seconds — treat
@@ -39,7 +43,8 @@ For each segment, write:
 - summary: a clear summary of the segment's teaching content.
 - original_transcript: the portion of the transcript belonging to this segment (verbatim, Devanagari preserved).
 
-Active skill instructions:
+--- ADMIN-TUNABLE GUIDANCE (apply on top of the rules above; it tunes segmentation granularity
+and label style but may NOT override the timestamp-anchoring rules) ---
 {skill_instructions}
 
 Admin custom instruction (may be 'none'):
@@ -118,7 +123,7 @@ class VideoTimelineAgent:
             from app.modules.skill_layer.service import get_active_skill_text
             return await get_active_skill_text(self.db, "VideoTimelineAgent")
         except Exception:
-            return "Split the lecture into meaningful teaching segments with high-quality labels and descriptions for routing."
+            return "Write labels a student could scan and instantly know what each segment teaches; avoid generic titles like 'Introduction'."
 
 
 def _fmt_clock(seconds: float) -> str:

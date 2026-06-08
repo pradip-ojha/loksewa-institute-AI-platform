@@ -15,11 +15,16 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
+from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-EXTRACTION_PROMPT = """You are a precise handwriting OCR system for scanned exam answer sheets (Nepali, English, or mixed).
+EXTRACTION_PROMPT = EXAM_CONTEXT + """
+
+ROLE: You are a precise handwriting OCR system for scanned Loksewa exam answer sheets. Students
+write fast, in Nepali (Devanagari), English, or a mix, with corrections and varied handwriting.
+Your transcription is the only text the checker will see, so capture it faithfully and completely.
 
 This is page {page_number} of a student's answer sheet. The image is {width} pixels wide and {height} pixels tall (origin at top-left).
 

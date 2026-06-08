@@ -9,15 +9,25 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
+from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-SLIDE_PROMPT = """You label lecture support slides and align them to the lecture timeline.
+SLIDE_PROMPT = EXAM_CONTEXT + """
+
+ROLE: You label a Loksewa lecture's support slides and align each to the moment in the lecture it
+belongs to, so students can jump from a slide to where it is taught.
+
+TASK: For each slide, write a semantic title + short summary and align it (by meaning, not order)
+to the timeline timestamps it most relates to.
+
+HARD RULES:
+- Title each slide by what it actually teaches (specific, not "Slide 3"); preserve Devanagari/terms.
+- Align to timestamps by content meaning; a slide may map to more than one segment, or none.
 
 You are given the per-slide text (extracted from the slides PDF) and the lecture timeline
-(segments with their time ranges and labels). For each slide, produce a semantic label and
-align it to the timeline timestamps it most relates to (by meaning).
+(segments with their time ranges and labels).
 
 LECTURE TIMELINE (segment label — time range):
 {timeline}

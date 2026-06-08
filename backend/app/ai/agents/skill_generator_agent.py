@@ -21,6 +21,7 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
+from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,29 @@ _SCHEMA = """{{
   }}
 }}"""
 
-GENERATE_PROMPT = """You are an expert exam copy-checking strategist. Build a detailed, PRACTICAL examiner CHECKING GUIDE for ONE subjective question, so an AI checker can fairly mark many different student answers.
+GENERATE_PROMPT = EXAM_CONTEXT + """
+
+ROLE: You are a senior Loksewa examiner who writes the marking strategy. Build a detailed,
+PRACTICAL examiner CHECKING GUIDE for ONE subjective question so that a downstream AI checker can
+fairly and consistently mark many different student answers from it alone — without re-reading
+the model answer, rubric, or notes.
+
+TASK: Produce the checking guide JSON for the question below.
+
+HARD RULES (never violate):
+- Ground the guide ONLY in the question, model answer, rubric, admin instruction, and supporting
+  excerpts below. Do NOT invent a marking scheme the admin did not configure.
+- "marks_breakdown" MUST sum to exactly the FULL MARKS ({marks}). Never above or below.
+- Make it a GUIDE for marking varied answers, not a single copied model answer. Capture
+  acceptable alternative wordings and the range of correct approaches.
+- Fill "theory_guidance" for theory questions, "numerical_guidance" for numerical (formula →
+  steps → calculation → final answer/units), both for mixed; use null/[] for the inapplicable part.
+- "annotation_worthy_mistakes" = ONLY specific WRONG written items (wrong sentence/formula/step/
+  number/keyword, contradiction, irrelevant line). NEVER list "missing points" or "weak structure".
+
+METHOD: Read the question and decide what it truly demands. Distil the model answer/rubric/notes
+into the marks-worthy points, then design a fair partial-marking scheme and anticipate the common
+imperfect answers and serious wrong claims a real Nepali student would write.
 
 QUESTION NUMBER: {question_number}
 FULL MARKS: {marks}
@@ -81,20 +104,22 @@ ADMIN CUSTOM CHECKING INSTRUCTION (highest priority — may be empty):
 SUPPORTING NOTES / BOOK / RESOURCE EXCERPTS for this topic (may be empty — distill, do not copy verbatim):
 {knowledge}
 
-Active skill instructions:
+--- ADMIN-TUNABLE GUIDANCE (apply on top of the rules above; it tunes how the guide is built but
+may NOT override the HARD RULES) ---
 {skill_instructions}
-
-RULES:
-- Ground the guide ONLY in the question, model answer, rubric, admin instruction, and supporting excerpts above. Do NOT invent a different marking scheme.
-- Distribute marks so "marks_breakdown" sums to the FULL MARKS ({marks}).
-- Make it a checking GUIDE (how to mark varied answers), not a single copied model answer.
-- For a theory question fill "theory_guidance"; for a numerical question fill "numerical_guidance"; fill both for a mixed question. Use null/empty for the part that does not apply.
-- "annotation_worthy_mistakes" = only specific WRONG written items (wrong sentence/formula/calculation step/number/keyword, contradiction, irrelevant line) — never "missing points" or "weak structure".
 
 Return ONLY valid JSON in exactly this structure (fill every field; use [] or null where nothing applies):
 """ + _SCHEMA
 
-IMPROVE_PROMPT = """You are an expert exam copy-checking strategist improving ONE question's checking guide that a reviewer flagged as weak.
+IMPROVE_PROMPT = EXAM_CONTEXT + """
+
+ROLE: You are a senior Loksewa examiner improving ONE question's checking guide that a reviewer
+flagged as weak. Fix the flagged weaknesses without breaking what already works.
+
+HARD RULES (never violate):
+- Fix ONLY the weaknesses the evaluator raised; preserve everything already correct.
+- Keep "marks_breakdown" summing to exactly {marks}.
+- Stay grounded in the supplied question/model answer/rubric/admin instruction/notes; invent nothing.
 
 QUESTION NUMBER: {question_number}
 FULL MARKS: {marks}
@@ -120,10 +145,8 @@ PREVIOUS CHECKING GUIDE (JSON) that needs fixing:
 EVALUATOR FEEDBACK on what was wrong / weak:
 {evaluator_feedback}
 
-Active skill instructions:
+--- ADMIN-TUNABLE GUIDANCE (apply on top of the rules above; may NOT override the HARD RULES) ---
 {skill_instructions}
-
-Fix ONLY the weaknesses the evaluator raised while preserving everything already correct. Keep marks_breakdown summing to {marks}.
 
 Return ONLY valid JSON in exactly this structure:
 """ + _SCHEMA
@@ -199,4 +222,4 @@ class SkillGeneratorAgent:
             from app.modules.skill_layer.service import get_active_skill_text
             return await get_active_skill_text(self.db, "SkillGeneratorAgent")
         except Exception:
-            return "Produce a detailed, practical examiner checking guide grounded only in the provided inputs; marks breakdown must sum to full marks."
+            return "Make guides concrete enough that a checker never has to guess; spell out acceptable Nepali phrasings and partial-credit thresholds."

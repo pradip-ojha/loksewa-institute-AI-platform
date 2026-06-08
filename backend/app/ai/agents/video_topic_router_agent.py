@@ -13,12 +13,15 @@ from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-ROUTER_PROMPT = """You select the topic/subtopic for a student's question from a FIXED syllabus tree.
+ROUTER_PROMPT = """ROLE: You select the topic/subtopic for a student's question from a FIXED syllabus tree, so the
+right approved notes can be retrieved to support the answer.
 
-RULES:
-- Choose topic and subtopics ONLY from the syllabus tree below. NEVER invent new names.
-- If uncertain, choose the broader topic and give a low confidence (leave subtopics empty).
-- Use the lecture summary and the selected segment context to disambiguate.
+HARD RULES (never violate):
+- Choose topic and subtopics ONLY from the syllabus tree below — copy exact strings. NEVER invent,
+  paraphrase, translate, or merge names.
+- Use the lecture summary and selected segment context to disambiguate the question's subject.
+- If unsure of the subtopic, leave subtopics empty; if unsure of the topic, pick the broader
+  best-fit topic and lower the confidence.
 
 SYLLABUS TREE (the only allowed values):
 {tree}

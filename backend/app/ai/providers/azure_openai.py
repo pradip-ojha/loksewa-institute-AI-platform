@@ -90,26 +90,37 @@ def _parse_json(text: str, *, agent_type: str | None, task_type: str | None) -> 
     return data
 
 
-async def _create_with_retry(client: AsyncAzureOpenAI, **kwargs):
-    """chat.completions.create with a hard per-call timeout and bounded retry on
-    transient errors (rate-limit / timeout / connection / 5xx)."""
+async def _call_with_retry(make_call, *, op: str):
+    """Run an async Azure SDK call (returned fresh by ``make_call`` each attempt)
+    with a bounded retry on transient errors (rate-limit / timeout / connection /
+    5xx). ``make_call`` is a zero-arg callable returning a coroutine — it is
+    re-invoked per attempt so a fresh request is issued each time."""
     attempts = max(1, settings.AI_MAX_RETRIES)
     last_exc: Exception | None = None
     for attempt in range(attempts):
         try:
-            return await client.chat.completions.create(
-                timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
-                **kwargs,
-            )
+            return await make_call()
         except _TRANSIENT_ERRORS as exc:
             last_exc = exc
             if attempt == attempts - 1:
                 break
             backoff = min(2 ** attempt, 10)
-            logger.warning("Azure OpenAI transient error (attempt %d/%d): %s — retrying in %ss",
-                           attempt + 1, attempts, exc, backoff)
+            logger.warning("Azure OpenAI transient error on %s (attempt %d/%d): %s — retrying in %ss",
+                           op, attempt + 1, attempts, exc, backoff)
             await asyncio.sleep(backoff)
-    raise ExternalServiceError("azure_openai", f"request failed after {attempts} attempts: {last_exc}")
+    raise ExternalServiceError("azure_openai", f"{op} failed after {attempts} attempts: {last_exc}")
+
+
+async def _create_with_retry(client: AsyncAzureOpenAI, **kwargs):
+    """chat.completions.create with a hard per-call timeout and bounded retry on
+    transient errors (rate-limit / timeout / connection / 5xx)."""
+    return await _call_with_retry(
+        lambda: client.chat.completions.create(
+            timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
+            **kwargs,
+        ),
+        op="chat.completions",
+    )
 
 
 async def _audit(audit_ctx: dict | None, *, model: str, api_version: str, input_tokens: int | None, output_tokens: int | None, latency_ms: int, status: str = "success", error_message: str | None = None) -> None:
@@ -244,15 +255,15 @@ class AzureOpenAIProvider(AIModelProvider):
         batch_size = 100
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
-            try:
-                response = await client.embeddings.create(
+            response = await _call_with_retry(
+                lambda b=batch: client.embeddings.create(
                     model=settings.MODEL_EMBEDDING,
-                    input=batch,
+                    input=b,
                     dimensions=settings.EMBEDDING_DIMENSIONS,
                     timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
-                )
-            except _TRANSIENT_ERRORS as exc:
-                raise ExternalServiceError("azure_openai", f"embedding request failed: {exc}") from exc
+                ),
+                op="embeddings",
+            )
             for item in sorted(response.data, key=lambda x: x.index):
                 embeddings.append(item.embedding)
 
@@ -274,8 +285,12 @@ class AzureOpenAIProvider(AIModelProvider):
         }
         sub = (mime_type or "").split("/")[-1].lower()
         ext = _ext_by_mime.get((mime_type or "").lower()) or ("mp3" if sub in ("", "mpeg", "mpga") else sub)
-        audio_file = io.BytesIO(audio_bytes)
-        audio_file.name = f"audio.{ext}"
+
+        def _make_audio_file():
+            # A fresh stream per attempt — a consumed BytesIO can't be re-read on retry.
+            f = io.BytesIO(audio_bytes)
+            f.name = f"audio.{ext}"
+            return f
 
         # gpt-4o-transcribe / gpt-4o-mini-transcribe only support "json" or "text"
         # (verbose_json — and thus segment-level timestamps — is whisper-1 only).
@@ -283,11 +298,14 @@ class AzureOpenAIProvider(AIModelProvider):
         # so we don't depend on transcription segments; request plain "json".
         t0 = time.monotonic()
         try:
-            response = await client.audio.transcriptions.create(
-                model=settings.MODEL_TRANSCRIPTION,
-                file=audio_file,
-                response_format="json",
-                timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
+            response = await _call_with_retry(
+                lambda: client.audio.transcriptions.create(
+                    model=settings.MODEL_TRANSCRIPTION,
+                    file=_make_audio_file(),
+                    response_format="json",
+                    timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
+                ),
+                op="transcription",
             )
             latency = int((time.monotonic() - t0) * 1000)
             await _audit(audit_ctx, model=settings.MODEL_TRANSCRIPTION, api_version=settings.AZURE_OPENAI_API_VERSION_TRANSCRIPTION, input_tokens=None, output_tokens=None, latency_ms=latency)

@@ -13,13 +13,15 @@ from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-MAP_PROMPT = """You map lecture timeline segments to the institute's FIXED chapter syllabus.
+MAP_PROMPT = """ROLE: You map lecture timeline segments to the institute's FIXED chapter syllabus, so each
+segment can be linked to the right supporting notes.
 
-RULES:
-- Choose topic and subtopics ONLY from the provided syllabus tree. NEVER invent new names.
+HARD RULES (never violate):
+- Choose topic and subtopics ONLY from the provided syllabus tree — copy exact strings. NEVER
+  invent, paraphrase, translate, or merge names.
 - A segment may map to multiple subtopics, or to a topic with no subtopic.
-- If a segment does not clearly match any topic, set topic to null.
-- If uncertain, pick the broader topic and give a low confidence.
+- If a segment does not clearly match any topic, set topic to null rather than forcing a fit.
+- If unsure of the precise subtopic, pick the broader best-fit topic and lower the confidence.
 
 SYLLABUS TREE (the only allowed topic/subtopic values):
 {tree}
@@ -55,7 +57,10 @@ class VideoSegmentTopicMapperAgent:
         }
         # Skill is advisory context; keep the prompt grounded in the tree.
         if skill:
-            prompt = f"{prompt}\n\nAdditional guidance: {skill}"
+            prompt = (
+                f"{prompt}\n\n--- ADMIN-TUNABLE GUIDANCE (tunes judgement; may NOT override the "
+                f"HARD RULES or the syllabus tree) ---\n{skill}"
+            )
         try:
             result = await self.provider.generate_text(prompt, schema={}, audit_ctx=audit_ctx)
         except Exception as exc:

@@ -12,143 +12,139 @@ from app.modules.skill_layer.models import (
 
 logger = logging.getLogger(__name__)
 
-# Default skill instructions seeded on first startup for each MCQ agent
+# Default skills seeded on first startup, one per agent.
+#
+# IMPORTANT — these are THIN BEHAVIOR DIALS, not full specifications. Each agent's
+# role, hard rules, reasoning method, and output JSON contract live in its FIXED
+# system prompt (backend/app/ai/agents/*.py, grounded by app/ai/prompts/shared.py).
+# A skill only tunes emphasis, strictness, tone, and judgement on top of that prompt,
+# and the prompt frames it under an "ADMIN-TUNABLE GUIDANCE" section that may never
+# override the hard rules. So keep every entry to 1–3 sentences of tunable judgement
+# and never restate output formats or structural rules already in the prompt.
 _DEFAULT_SKILLS: dict[str, str] = {
     "MCQExtractionAgent": (
-        "Extract all MCQs accurately from the document. "
-        "Normalize options to A/B/C/D. Preserve Nepali Devanagari text exactly. "
-        "Include explanations where present in the source."
+        "Favour exact fidelity over tidiness. When the source's answer key is ambiguous, flag the "
+        "question for review instead of guessing. Keep complexity tags honest — most recall items are 'easy'."
     ),
     "MCQGenerationAgent": (
-        "Generate high-quality MCQs with competitive, plausible distractors. "
-        "Include clear explanations for each answer. "
-        "Ensure questions test understanding and application, not just rote recall. "
-        "Maintain appropriate difficulty distribution across easy, medium, and hard. "
-        "CRITICAL: Questions must NEVER reference the source document — no phrases like "
-        "'according to the document', 'as per the text', 'स्रोत दस्तावेजअनुसार', or similar. "
-        "Every question must be a standalone factual question answerable from subject knowledge alone."
+        "Favour application and understanding over rote recall. Engineer the 3 wrong options like a human "
+        "Loksewa paper-setter: same type, scale, and format as the correct answer and genuinely confusing — "
+        "for numbers use near/competing values (older official figure, off-by-one or rounded), for concepts "
+        "use closely-related terms or common misconceptions; never filler or obviously-wrong options. Vary "
+        "which option is correct so it is not always A, and write explanations that name the answer by its "
+        "value/content, not its letter."
     ),
     "MCQRegenerationAgent": (
-        "Regenerate MCQs that directly address the admin rejection feedback. "
-        "Significantly improve on the rejected questions. "
-        "Maintain the same topic and subtopic coverage. "
-        "Ensure appropriate difficulty and clear explanations. "
-        "CRITICAL: Questions must NEVER reference the source document — write standalone factual questions only."
+        "Treat the rejection feedback as the brief: fix the exact weakness it names rather than just "
+        "rewording. Rebuild weak distractors into confusing same-type traps (near values for numbers, "
+        "related terms for concepts), and don't default the correct answer to option A."
     ),
     # ── Subjective answer-sheet checking agents ──────────────────────────────
     "QuestionPaperAgent": (
-        "Extract every question's number, full text, and allotted marks from a subjective "
-        "question paper. Preserve Nepali Devanagari exactly. Never answer or rephrase questions."
+        "When marks notation is ambiguous, trust the value printed beside the question over any header "
+        "total. Keep a multi-part question as one item unless each part is separately numbered with its own marks."
     ),
     "SubjectiveTopicRouterAgent": (
-        "Map each subjective question to a topic/subtopic chosen ONLY from the fixed subjective "
-        "syllabus tree; never invent names. When uncertain, pick the broader topic with low "
-        "confidence and leave the subtopic null."
+        "Judge by the core competency the question tests, not surface keywords. Prefer leaving the "
+        "subtopic null over forcing a shaky precise match."
     ),
     "SkillGeneratorAgent": (
-        "Build a detailed, practical per-question examiner checking guide (not a copied model "
-        "answer): question intent, expected points, sample answer fragments, acceptable wording "
-        "variations, a marks breakdown summing to full marks, partial-marking rules, common "
-        "mistakes, serious wrong statements, annotation-worthy mistakes, and feedback/strictness "
-        "guidance. Cover formula/steps/calculation for numerical questions. Ground it only in the "
-        "question, model answer, rubric, admin instruction, and supplied notes — distill, never copy."
+        "Make guides concrete enough that a checker never has to guess: spell out acceptable Nepali "
+        "phrasings, partial-credit thresholds, and the specific wrong statements students actually write. "
+        "Keep numerical guides step-by-step (formula → steps → calculation → final answer/units)."
     ),
     "SkillEvaluatorAgent": (
-        "Leniently verify each generated checking guide is operationally usable to mark answers "
-        "fairly. Pass if good enough; fail ONLY for serious issues (wrong question mapping, max-marks "
-        "or breakdown mismatch, major missing areas, too vague, rubric/admin ignored, numerical "
-        "lacking formula/steps, wrong topic mapping, duplicate/missing guides)."
+        "Stay lenient — a usable guide passes. Reserve failure for defects that would actually produce "
+        "unfair or impossible marking; record smaller gaps as warnings, not failures."
     ),
     "AnswerExtractionAgent": (
-        "Transcribe handwritten answer sheets question by question with a question-level bounding "
-        "box and page size. Support Nepali, English, and mixed text plus formulas, tables, and "
-        "numerical work. Preserve the student's wording. Transcribe only — never check, correct, "
-        "rewrite, translate, or summarize."
+        "When handwriting is unclear, transcribe your best honest reading and mark uncertain spans "
+        "inline rather than dropping them. Never tidy, complete, or correct the student's wording."
     ),
     "AnswerEvaluationAgent": (
-        "Mark each answer fairly within the configured max marks (a hard cap) using the locked "
-        "per-question checking guide. Priority: admin instruction > rubric > guide > general "
-        "judgement. Award partial marks; accept correct ideas in the student's own words. Create "
-        "annotation targets ONLY for specific wrong written items, quoting the exact wrong text; put "
-        "missing-point/structure feedback in the feedback field, not as annotation targets."
+        "Reward genuine conceptual understanding even when the Nepali/English phrasing is imperfect, but "
+        "be strict on numerical formula, steps, and units. Watch for textbook definitions copied without "
+        "answering the asked question. Give one concrete, encouraging improvement line per answer."
     ),
     "AnswerReviewerAgent": (
-        "Verify the checker's evaluation: ensure marks are fair and consistent, never exceed max "
-        "marks, prune annotation targets that aren't genuinely wrong written text, and keep feedback "
-        "concise. Do not rewrite things that are already fine."
+        "Adjust only what is genuinely unfair or inconsistent; resist rewriting sound marking. Be "
+        "especially alert to two similar answers receiving different marks."
     ),
     "AnnotationLocatorAgent": (
-        "Locate the exact wrong text on the answer page and return the natural underline path as "
-        "multiple ordered baseline points (not two bbox endpoints), plus a tight text box and a safe "
-        "comment box in nearby blank space. Return low confidence and an empty path if unsure."
+        "Bias hard toward precision: a missing mark is far better than a misplaced one on a student's "
+        "sheet. Keep comment boxes clear of the handwriting."
     ),
     # ── Video Tutor agents ───────────────────────────────────────────────────
     "VideoTranscriptCleanerAgent": (
-        "Clean Nepali/English lecture transcripts: fix sentence flow, punctuation, repeated words, and "
-        "transcription artifacts. Preserve meaning, examples, technical terms, numbers, dates, and "
-        "Loksewa terms exactly. Preserve Devanagari; never translate or summarize."
+        "Lean toward under-editing: when unsure whether a phrase is filler or content, keep it. Never "
+        "smooth away a teacher's example or aside."
     ),
     "VideoTimelineAgent": (
-        "Split the lecture into meaningful teaching segments (roughly 3–10 min each, but a coherent "
-        "teaching unit matters more than duration). Write high-quality labels and descriptions, since "
-        "the segment router depends on them. Keep segments ordered and covering the whole lecture."
+        "Write labels a student could scan and instantly know what each segment teaches; avoid generic "
+        "titles like 'Introduction' or 'Part 2'. Split where the topic genuinely shifts, not on a fixed clock."
     ),
     "VideoSegmentTopicMapperAgent": (
-        "Map each timeline segment to topic/subtopic chosen ONLY from the fixed syllabus tree; never "
-        "invent names. A segment may map to multiple subtopics. When uncertain, choose a broader topic "
-        "and a low confidence."
+        "Map by the segment's main teaching focus; allow multiple subtopics only when it truly covers "
+        "them. Prefer a broader topic with low confidence over a forced precise one."
     ),
     "VideoSummaryAgent": (
-        "Summarize the lecture faithfully and completely. Include a short and a detailed summary, key "
-        "points, exam-focused points, important terms, and a bank of possible questions (MCQs, short, "
-        "long). Do not invent facts not present in the lecture."
+        "Bias the summary toward what Loksewa actually tests, and keep possible_questions realistic to "
+        "the paper's real style and difficulty. Aim for completeness, not padding."
     ),
     "VideoSlideLabelAgent": (
-        "Label support slides with semantic titles, align each to the lecture timeline timestamps it "
-        "relates to, and add topics + a short summary."
+        "Title slides by the concept they teach, not their position; align by meaning even when slide "
+        "order and lecture order differ."
     ),
     "VideoSegmentRouterAgent": (
-        "Route a student question to the 1–3 most relevant timeline segments by label/description "
-        "meaning; for vague questions use the current video time. Avoid selecting too many segments."
+        "Prefer the single best segment; widen to 2–3 only when the question genuinely spans them. For "
+        "vague 'this/that point' questions, trust the current video time."
     ),
     "VideoTopicRouterAgent": (
-        "Select topic/subtopic for a question ONLY from the fixed syllabus tree; never invent. When "
-        "uncertain, pick the broader topic with low confidence."
+        "Disambiguate using the lecture's actual focus, not just question keywords. Leave subtopics "
+        "empty rather than guessing."
     ),
     "VideoTutorAgent": (
-        "Answer grounded in the selected lecture segment first (transcript > summary), then the full "
-        "lecture summary, then approved notes as secondary support. Match the question's language, "
-        "include timestamps for lecture-based answers, never attribute note-only content to the teacher, "
-        "and never hallucinate."
+        "Be a warm, concise tutor: lead with the lecture's own explanation in the student's language, "
+        "add note context only when it helps, and close with a short nudge to keep learning. Never invent "
+        "what the teacher did not say."
     ),
     # ── Skill Layer ──────────────────────────────────────────────────────────
     "SkillBuilderAgent": (
-        "Help the admin refine a backend agent's instruction. Always return the COMPLETE replacement "
-        "instruction, preserving existing correct behavior and only changing what was asked. Keep it "
-        "concise and actionable. Never weaken hard safety/quality rules unless explicitly told. If no "
-        "concrete change is requested yet, reply helpfully and propose no change."
+        "Keep proposed instructions as concise behavioral dials; never restate fixed-prompt mechanics or "
+        "weaken hard rules. When the admin's request is vague, ask one clarifying question instead of guessing."
     ),
 }
 
-SKILL_REFINEMENT_PROMPT = """You are a skill optimization system for an MCQ generation agent used in a competitive exam preparation platform.
+SKILL_REFINEMENT_PROMPT = """You maintain the ADMIN-TUNABLE BEHAVIOR DIAL for the MCQ generation agent on a Nepali
+Loksewa/banking exam-prep platform. The agent's fixed system prompt already owns its role, hard
+rules, and output format — you only tune emphasis, difficulty, style, and judgement on top of it.
 
-CURRENT MCQ GENERATION INSTRUCTIONS:
+An admin just REJECTED generated questions and left feedback. Your job is to learn the lasting
+lesson from that feedback and fold it into the dial — NOT to copy the feedback in verbatim.
+
+CURRENT MCQ GENERATION DIAL (keep its existing guidance intact):
 {current_instructions}
 
-ADMIN REJECTION FEEDBACK:
+ADMIN REJECTION FEEDBACK (the complaint to learn from):
 {feedback}
 
 SAMPLE REJECTED QUESTION TOPICS/PATTERNS:
 {rejected_samples}
 
-Based on this feedback, produce improved MCQ generation instructions that:
-1. Specifically address the issues raised in the rejection feedback
-2. Preserve all correct behaviors from the current instructions
-3. Are concise, clear, and actionable for an AI MCQ generator
-4. Include guidance on difficulty, language, style, and depth as appropriate
+HOW TO REVISE THE DIAL:
+1. Extract the GENERALISABLE lesson behind the feedback (a durable rule for future questions), not
+   the one-off specifics of these exact questions. E.g. feedback "options too obvious" → "make
+   distractors closer and more confusing"; "too easy" → "raise cognitive demand".
+2. MERGE that lesson into the current dial: ADD or sharpen a sentence while KEEPING all existing
+   guidance — especially any rules about distractor quality, confusing same-type options, and
+   varying the correct-answer position. Do not drop or weaken them.
+3. Keep the whole dial a concise behavioral instruction (a few sentences). Do NOT restate output
+   formats or hard rules the fixed prompt already enforces, and never weaken a safety/quality rule.
+4. If the feedback is a one-off (a single factual slip) or its lesson is already covered by the
+   current dial, make NO change — return an empty instruction_text.
 
 Return ONLY valid JSON with exactly these two keys:
-{{"instruction_text": "the full improved instruction text here", "change_summary": "one sentence describing what changed and why"}}"""
+{{"instruction_text": "the full revised dial text, or empty string if no change is warranted", "change_summary": "one sentence describing what changed and why, or empty string"}}"""
 
 
 async def get_active_skill_text(
@@ -217,6 +213,81 @@ async def seed_default_skills() -> None:
 
         await db.commit()
         logger.info("Default MCQ skills seeded.")
+
+
+async def refresh_default_skills() -> int:
+    """Re-point each agent's active GLOBAL skill to the current code default.
+
+    `seed_default_skills()` only creates a skill the FIRST time and then skips it,
+    so an existing database never picks up improved `_DEFAULT_SKILLS` text. This
+    helper closes that gap: for every agent whose active global instruction differs
+    from the current default, it creates a NEW active version (next version_number)
+    and archives the previously-active one — so nothing is destroyed and the change
+    is visible/revertable in the agent's version history. Agents with no skill yet
+    are created like a fresh seed. Returns the number of agents updated/created.
+
+    This OVERWRITES the currently-active global skill text with the code default, so
+    run it intentionally (e.g. via `scripts/refresh_default_skills.py`). Any prior
+    admin-tuned text is preserved as an archived version, not lost.
+    """
+    from app.core.database import AsyncSessionLocal
+    updated = 0
+    async with AsyncSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        for agent_type, instruction_text in _DEFAULT_SKILLS.items():
+            core = (
+                await db.execute(
+                    select(AgentCoreSkill).where(AgentCoreSkill.agent_type == agent_type)
+                )
+            ).scalar_one_or_none()
+
+            if core is None:
+                # No skill yet — create it exactly like a fresh seed.
+                core = AgentCoreSkill(agent_type=agent_type, current_version_id=None)
+                db.add(core)
+                await db.flush()
+                version = AgentSkillVersion(
+                    skill_id=core.id, agent_type=agent_type, scope_type="global", scope_id=None,
+                    version_number=1, instruction_text=instruction_text, status="active",
+                    activated_at=now, change_summary="Seeded default skill (refresh)",
+                )
+                db.add(version)
+                await db.flush()
+                core.current_version_id = version.id
+                updated += 1
+                continue
+
+            versions = (
+                await db.execute(
+                    select(AgentSkillVersion).where(
+                        AgentSkillVersion.agent_type == agent_type,
+                        AgentSkillVersion.scope_type == "global",
+                        AgentSkillVersion.scope_id.is_(None),
+                    )
+                )
+            ).scalars().all()
+            active = next((v for v in versions if v.status == "active"), None)
+
+            # Already up to date — nothing to do.
+            if active is not None and (active.instruction_text or "").strip() == instruction_text.strip():
+                continue
+
+            if active is not None:
+                active.status = "archived"
+            next_number = max((v.version_number for v in versions), default=0) + 1
+            new_version = AgentSkillVersion(
+                skill_id=core.id, agent_type=agent_type, scope_type="global", scope_id=None,
+                version_number=next_number, instruction_text=instruction_text, status="active",
+                activated_at=now, change_summary="Refreshed to current code default",
+            )
+            db.add(new_version)
+            await db.flush()
+            core.current_version_id = new_version.id
+            updated += 1
+
+        await db.commit()
+    logger.info("Refreshed default skills: %d agent(s) updated.", updated)
+    return updated
 
 
 async def update_skill_from_rejection(

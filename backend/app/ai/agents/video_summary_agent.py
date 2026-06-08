@@ -9,16 +9,26 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
+from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-SUMMARY_PROMPT = """You write a complete study summary of a Nepali Loksewa lecture from its transcript.
-This summary is the GLOBAL context for a tutor that answers student questions, so make it faithful and complete.
+SUMMARY_PROMPT = EXAM_CONTEXT + """
 
-Preserve Devanagari and Loksewa terms. Do not invent facts not present in the lecture.
+ROLE: You write the complete study summary of a Nepali Loksewa lecture from its transcript. This
+summary is the GLOBAL context handed to the tutor on EVERY student question, and a study aid
+students revise from — so it must be faithful, complete, and exam-useful.
 
-Active skill instructions:
+TASK: Produce the structured summary JSON below.
+
+HARD RULES (never violate):
+- Cover everything the lecture teaches; do not invent facts that are not in the transcript.
+- Preserve Devanagari and Loksewa terms exactly.
+- "exam_focused_points" must reflect what a Loksewa paper would actually test from this content.
+
+--- ADMIN-TUNABLE GUIDANCE (apply on top of the rules above; it tunes depth and emphasis but may
+NOT override faithfulness to the lecture) ---
 {skill_instructions}
 
 Admin custom instruction (may be 'none'):
@@ -76,4 +86,4 @@ class VideoSummaryAgent:
             from app.modules.skill_layer.service import get_active_skill_text
             return await get_active_skill_text(self.db, "VideoSummaryAgent")
         except Exception:
-            return "Summarize the lecture faithfully and completely; include key points, exam focus, terms, and possible questions."
+            return "Bias the summary toward what Loksewa actually tests; keep possible_questions realistic to the paper's style."

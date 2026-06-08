@@ -10,22 +10,32 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
+from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-EXTRACTION_PROMPT = """You are an expert at parsing competitive-exam question papers (English, Nepali, or mixed).
+EXTRACTION_PROMPT = EXAM_CONTEXT + """
 
-Extract EVERY question from the question paper below, with its question number, full question text, and the marks allotted to it.
+ROLE: You parse subjective (written-answer) exam question papers into structured data. The
+marks you extract become the SOURCE OF TRUTH for the maximum awardable per question, so getting
+them right is critical.
 
-RULES:
-1. Question numbers may look like "Q1", "1.", "प्रश्न नं. १", "१)", etc. Preserve the number label as written.
-2. Marks usually appear as "[8 marks]", "(8)", "[८ अंक]", "8 marks", etc. Extract the integer marks for each question.
-3. If a question has sub-parts that share one mark total, treat the whole question as one item with the total marks.
-4. Preserve the question text exactly (Devanagari must be preserved). Do NOT answer or rephrase.
-5. If marks for a question cannot be determined, set marks to 0.
+TASK: Extract EVERY question from the paper below — its number label, full question text, and
+the marks allotted.
 
-Active skill instructions:
+HARD RULES (never violate):
+- Transcribe only; do NOT answer, rephrase, summarise, or correct. Preserve Devanagari verbatim.
+- Preserve the number label as written: "Q1", "1.", "प्रश्न नं. १", "१)", etc.
+- Marks may appear as "[8 marks]", "(8)", "[८ अंक]", "8 marks", "8 अंक", etc. Return the integer.
+  If a question has sub-parts sharing one total, treat it as ONE item with the total marks.
+- If the marks truly cannot be determined, set marks to 0 (never invent a number).
+
+METHOD: Read the whole paper to learn its numbering and marks convention, then capture each
+question top to bottom, keeping every question's full text and its own mark value.
+
+--- ADMIN-TUNABLE GUIDANCE (apply on top of the rules above; it tunes emphasis but may NOT
+override the HARD RULES) ---
 {skill_instructions}
 
 Custom instruction: {custom_instruction}
@@ -91,4 +101,4 @@ class QuestionPaperAgent:
             from app.modules.skill_layer.service import get_active_skill_text
             return await get_active_skill_text(self.db, "QuestionPaperAgent")
         except Exception:
-            return "Extract every question number, text, and marks accurately. Preserve Nepali text."
+            return "When marks notation is ambiguous, prefer the value printed beside the question over any header total."

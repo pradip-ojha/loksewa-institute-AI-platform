@@ -23,23 +23,32 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
+from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-EVAL_PROMPT = """You are a QA reviewer for AI-generated exam CHECKING GUIDES (one per question). Decide whether each guide is OPERATIONALLY USABLE to mark student answers fairly. Be LENIENT — do not demand perfect, textbook-level content. Pass a guide if it is good enough to check answers fairly.
+EVAL_PROMPT = EXAM_CONTEXT + """
 
-FAIL a guide ONLY for serious issues:
-- guide belongs to the wrong question, or question-number mismatch
-- max_marks mismatch, or marks_breakdown does not sum to full marks
-- major expected answer areas missing
-- guide too vague to check answers
-- rubric or admin instruction clearly ignored
-- a numerical question's guide lacks formula/step-checking guidance
-- topic/subtopic mapping clearly wrong
-- duplicated or missing question guides
+ROLE: You are a LENIENT QA gate for AI-generated per-question exam CHECKING GUIDES. Your job is
+to catch misconfiguration and operationally-unusable guides — NOT to demand textbook-perfect
+content. A guide that lets a checker mark answers fairly PASSES, even if imperfect.
 
-For each question check: correct question mapping, correct max marks, reasonable expected points, usable marks breakdown, partial-marking guidance, common-mistake / wrong-answer guidance, no obvious contradiction with admin instruction or rubric, and that it is a CHECKING GUIDE (not just copied textbook notes).
+TASK: Give a verdict for each question's guide.
+
+HARD RULES (your bar):
+- Default to PASS. FAIL ONLY for a serious, operational defect:
+  • guide belongs to the wrong question / question-number mismatch
+  • max_marks mismatch, or marks_breakdown does not sum to full marks
+  • major expected answer areas missing
+  • guide too vague to actually mark answers
+  • rubric or admin instruction clearly ignored
+  • a numerical question's guide lacks formula/step-checking guidance
+  • topic/subtopic mapping clearly wrong
+  • duplicated or missing question guides
+- Do NOT fail for style, polish, or "could be richer". Use "passed_with_warning" for minor,
+  non-blocking gaps and put the nit in "issues".
+- When you fail/flag, "fix_feedback" must be concrete enough for the generator to act on in one pass.
 
 ADMIN CUSTOM CHECKING INSTRUCTION (may be 'none'):
 {custom_instruction}
@@ -47,7 +56,8 @@ ADMIN CUSTOM CHECKING INSTRUCTION (may be 'none'):
 THE QUESTIONS AND THEIR GENERATED CHECKING GUIDES (JSON):
 {skills_block}
 
-Active skill instructions:
+--- ADMIN-TUNABLE GUIDANCE (apply on top of the rules above; it tunes strictness within reason
+but may NOT override the leniency bar or the HARD RULES) ---
 {skill_instructions}
 
 Return ONLY valid JSON in exactly this structure (one entry per question):
@@ -104,4 +114,4 @@ class SkillEvaluatorAgent:
             from app.modules.skill_layer.service import get_active_skill_text
             return await get_active_skill_text(self.db, "SkillEvaluatorAgent")
         except Exception:
-            return "Leniently verify each checking guide is operationally usable; fail only for serious mapping/marks/coverage issues."
+            return "Stay lenient — a usable guide passes; reserve failure for defects that would actually produce unfair marks."

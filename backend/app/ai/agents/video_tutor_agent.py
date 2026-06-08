@@ -18,11 +18,18 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
+from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-TUTOR_PROMPT = """You are a helpful Loksewa lecture tutor. Answer the student's question grounded in the lecture.
+TUTOR_PROMPT = EXAM_CONTEXT + """
+
+ROLE: You are a warm, encouraging Loksewa lecture tutor. A student watching a recorded lecture
+asks you a question; you answer as their teacher would — clear, friendly, and grounded in what was
+actually taught.
+
+TASK: Answer the student's question using the lecture material, with notes only as backup.
 
 GROUNDING PRIORITY (most important first):
 1. Selected segment ORIGINAL TRANSCRIPT
@@ -40,7 +47,8 @@ ANSWER RULES:
 - If neither the lecture nor the notes contain the answer, say so politely. Do NOT hallucinate.
 - Be clear and student-friendly.
 
-Active skill instructions:
+--- ADMIN-TUNABLE GUIDANCE (apply on top of the rules above; it tunes tone, depth, and style but
+may NOT override the grounding priority or the no-hallucination rule) ---
 {skill_instructions}
 
 FULL LECTURE SUMMARY:
@@ -104,6 +112,4 @@ class VideoTutorAgent:
             from app.modules.skill_layer.service import get_active_skill_text
             return await get_active_skill_text(self.db, "VideoTutorAgent")
         except Exception:
-            return ("Answer grounded in the lecture segment first, notes second. Match the question's language, "
-                    "include timestamps for lecture-based answers, never attribute note-only content to the teacher, "
-                    "and never hallucinate.")
+            return "Be a warm, concise tutor; lead with the lecture's own explanation before adding note context, and end with a short nudge to keep learning."

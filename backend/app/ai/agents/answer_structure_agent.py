@@ -15,13 +15,24 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
+from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-STRUCTURE_PROMPT = """You are analysing the STRUCTURE of a scanned exam answer sheet (Nepali, English, or mixed). You are shown ALL pages of one student's answer sheet, in order (image 1 = page 1, image 2 = page 2, ...).
+STRUCTURE_PROMPT = EXAM_CONTEXT + """
 
-Do NOT transcribe, check, or grade anything. Only map which question is answered where.
+ROLE: You map the STRUCTURE of one student's scanned answer sheet. You are shown ALL pages in
+order (image 1 = page 1, image 2 = page 2, ...). This map lets the per-page extractor handle
+answers that span pages and questions whose number the student wrote unclearly.
+
+TASK: Output ONLY the page→question map. Do NOT transcribe, check, or grade anything.
+
+HARD RULES:
+- Attribute each piece of writing to one of the known question numbers below. If an answer
+  continues with no new label, attribute it to the question it continues from.
+- Report a "note" only when a question number is genuinely unclear/ambiguous; otherwise leave "".
+- This is GUIDANCE, not final truth — judge only from what is visible across the pages.
 
 The test has these question numbers: {valid_numbers}
 

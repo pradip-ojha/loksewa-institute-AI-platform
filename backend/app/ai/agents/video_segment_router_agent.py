@@ -14,13 +14,14 @@ from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-ROUTER_PROMPT = """You route a student's question to the most relevant lecture timeline segment(s).
+ROUTER_PROMPT = """ROLE: You route a student's question to the most relevant lecture timeline segment(s). Pick
+the smallest set that actually contains the answer, so the tutor reads focused context.
 
-RULES:
+HARD RULES (never violate):
 - If the question clearly names a concept, route by segment label/description meaning.
-- If the question is vague (e.g. "यो point फेरि explain गर्नु"), use CURRENT VIDEO TIME to choose the nearby segment.
-- If you are not confident, select 2–3 likely segments. Otherwise select just 1.
-- Do NOT select more segments than needed (never more than 3).
+- If the question is vague (e.g. "यो point फेरि explain गर्नु"), use CURRENT VIDEO TIME to choose the
+  segment the student is currently watching and its neighbours.
+- Select exactly 1 segment when confident; 2–3 only when genuinely unsure. NEVER more than 3.
 
 CURRENT VIDEO TIME: {current_time}
 

@@ -322,6 +322,29 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         ))
         await db.commit()
 
+        # If vision read NO answer text from any page (upside-down / blank / unreadable
+        # scan), checking would silently produce a 0-mark "completed" sheet. Treat that
+        # like the quality gate: ask for a clearer re-upload (no AI marking spent), or —
+        # if attempts are exhausted — fail honestly instead of recording an unfair 0.
+        extracted_chars = sum(len((q.get("answer_text") or "").strip())
+                              for q in extraction.get("questions", []))
+        if extracted_chars == 0:
+            note = "Could not read any answers from the uploaded sheet — please re-upload a clearer scan."
+            if sheet.upload_attempt_number < svc.MAX_UPLOAD_ATTEMPTS:
+                # Like the quality gate: ask for a clearer re-upload. Job ends `completed`
+                # (run_task marks it after work() returns); the sheet drives the UI.
+                sheet.current_status = "needs_reupload"
+                await db.commit()
+                await update_job(
+                    db, jid, status=JobStatus.completed, progress=100, step="Re-upload requested",
+                    output={"needs_reupload": True, "quality_notes": note},
+                )
+                return
+            # Attempts exhausted: fail honestly rather than record an unfair 0. Raising
+            # routes through the task's failure path (_mark_sheet_failed → sheet `failed`,
+            # run_task → terminal failed); a normal return here would be marked completed.
+            raise ValueError(note)
+
         # Locked per-question checking skills.
         sk_r = await db.execute(
             select(QuestionSpecificCheckingSkill, SubjectiveQuestion.question_number)

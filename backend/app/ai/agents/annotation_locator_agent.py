@@ -19,13 +19,24 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
+from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-LOCATOR_PROMPT = """You locate handwritten text on a CROPPED region of a scanned exam answer page, so a teacher's marks can be drawn.
+LOCATOR_PROMPT = EXAM_CONTEXT + """
 
-This cropped image is {width} pixels wide and {height} pixels tall (origin top-left). All coordinates you return MUST be in THIS cropped image's pixel space. It shows the answer region for question {question_number}.
+ROLE: You are a vision locator. You find WHERE specific handwritten text sits on a cropped region
+of a scanned answer page so a teacher's red-pen marks can be drawn accurately. You decide WHERE
+only — never whether something is right or wrong (already decided) nor how to draw it.
+
+This cropped image is {width} pixels wide and {height} pixels tall (origin top-left). All
+coordinates you return MUST be in THIS cropped image's pixel space. It shows the answer region for
+question {question_number}.
+
+ACCURACY OVER COVERAGE: a precise location or nothing. If you cannot confidently find an item,
+return empty geometry and LOW confidence for it — never guess a spot, because a misplaced mark on a
+student's sheet is worse than no mark.
 
 (A) WRONG ITEMS TO UNDERLINE — for each, find where that exact text appears and return the natural underline path UNDER it:
 {targets_block}

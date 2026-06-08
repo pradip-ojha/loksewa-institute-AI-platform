@@ -1,9 +1,11 @@
 import logging
+import random
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.model_router import get_provider
+from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.exceptions import AIResponseError
 from app.modules.jobs.service import update_job
 from app.modules.mcq.models import MCQDocument, MCQReviewBatch, MCQQuestion
@@ -13,22 +15,34 @@ logger = logging.getLogger(__name__)
 
 _VALID_COMPLEXITY = {"easy", "medium", "hard"}
 
-EXTRACTION_PROMPT = """You are an expert MCQ extraction system for competitive exam preparation.
+EXTRACTION_PROMPT = EXAM_CONTEXT + """
 
-Extract all multiple-choice questions from the provided document content.
+ROLE: You are a meticulous question-bank digitiser. Admins upload real exam/practice MCQ
+papers and you transcribe every question into clean structured data — faithfully, never
+"improving" or inventing.
 
-CRITICAL RULES:
-1. Each question must have EXACTLY 4 options normalized to IDs: A, B, C, D
-2. Detect the correct-answer format automatically (A/B/C/D, Nepali letters क/ख/ग/घ, numbers 1/2/3/4, Nepali numbers १/२/३/४) and normalize correct_option_ids to ["A"], ["B"], ["C"], or ["D"]
-3. Preserve question text and option text exactly as written (Nepali Devanagari must be preserved)
-4. Extract explanation exactly as written in the document
-5. If explanation is missing for a question, set explanation to null and set needs_explanation_review to true
-6. Assign complexity: definition recall = "easy", application = "medium", multi-step analysis = "hard"
-7. Assign topic and subtopic if determinable from context
+TASK: Extract ALL multiple-choice questions from the document below, exactly as written.
 
-Active skill instructions:
+HARD RULES (never violate):
+- Transcribe only what is on the page. Do NOT add, reword, correct, or invent questions,
+  options, answers, or explanations. Preserve Devanagari and all wording verbatim.
+- Each question must have EXACTLY 4 options normalised to IDs A, B, C, D in their original order.
+- The source may mark the correct answer in any format (A/B/C/D, क/ख/ग/घ, 1/2/3/4, १/२/३/४, or
+  a circled/ticked option). Detect it and map it to A/B/C/D in correct_option_ids.
+- Take the explanation only from the source. If none is present, set explanation to null and
+  needs_explanation_review to true — never write your own.
+
+METHOD: First scan the whole document to learn its layout and answer-key convention (inline,
+answer key at the end, etc.). Then walk question by question, matching each to its correct
+option and explanation. Assign complexity from cognitive demand — definition/recall = "easy",
+application = "medium", multi-step reasoning/analysis = "hard". Assign topic/subtopic only when
+the context makes it unambiguous; otherwise leave null.
+
+--- ADMIN-TUNABLE GUIDANCE (apply on top of the rules above; it tunes emphasis and judgement
+but may NOT override the HARD RULES) ---
 {skill_instructions}
 
+INPUTS:
 Topic hint: {topic_hint}
 Subtopic hint: {subtopic_hint}
 Custom instruction: {custom_instruction}
@@ -130,6 +144,70 @@ def _normalize_batch(questions_data: list) -> tuple[list[dict], list[str]]:
     return normalized, skipped
 
 
+_OPTION_IDS = ["A", "B", "C", "D"]
+
+
+def _q_get(q, key):
+    return q[key] if isinstance(q, dict) else getattr(q, key)
+
+
+def _q_set(q, key, value) -> None:
+    if isinstance(q, dict):
+        q[key] = value
+    else:
+        setattr(q, key, value)
+
+
+def balance_answer_positions(questions: list) -> None:
+    """Spread the correct-answer position evenly over A/B/C/D across a batch.
+
+    LLMs strongly bias the correct option toward the first position, so prompt
+    instructions alone do not give a uniform distribution. This deterministically
+    re-orders each question's options so the correct answer lands on a balanced,
+    randomised set of positions (equal counts of A/B/C/D, shuffled order). Only the
+    option ORDER and A/B/C/D labels change — the option texts and which text is
+    correct are untouched, and `correct_option_ids` is updated to the new label.
+
+    Works on both dict records (extraction/generation) and ORM MCQQuestion rows
+    (regeneration). Only standard single-correct, 4-distinct-option questions are
+    touched; anything unusual is left exactly as produced. Explanations must refer
+    to the answer by content, not letter (enforced in the prompts), so re-labelling
+    is safe.
+    """
+    eligible: list = []
+    for q in questions:
+        opts = _q_get(q, "options") or []
+        correct = _q_get(q, "correct_option_ids") or []
+        if len(opts) != 4 or len(correct) != 1:
+            continue
+        ids = [o.get("id") for o in opts if isinstance(o, dict)]
+        if len(ids) == 4 and len(set(ids)) == 4 and correct[0] in ids:
+            eligible.append(q)
+
+    if not eligible:
+        return
+
+    # Balanced target positions (each of 0..3 appears ~n/4 times), randomised order.
+    targets = [i % 4 for i in range(len(eligible))]
+    random.shuffle(targets)
+
+    for q, target in zip(eligible, targets):
+        opts = _q_get(q, "options")
+        correct_id = _q_get(q, "correct_option_ids")[0]
+        correct_opt = next(o for o in opts if o.get("id") == correct_id)
+        distractors = [o for o in opts if o.get("id") != correct_id]
+
+        ordered = list(distractors)
+        ordered.insert(target, correct_opt)  # place the correct option at the target slot
+
+        new_opts = [
+            {"id": _OPTION_IDS[pos], "label": _OPTION_IDS[pos], "text": str(o.get("text", ""))}
+            for pos, o in enumerate(ordered)
+        ]
+        _q_set(q, "options", new_opts)
+        _q_set(q, "correct_option_ids", [_OPTION_IDS[target]])
+
+
 def _extraction_output(saved: int, skipped: list[str], total_returned: int, batch_id) -> dict:
     """Job output_reference so the admin can see how many questions were saved
     vs. skipped (and why), instead of silently losing malformed entries."""
@@ -210,7 +288,13 @@ async def _fetch_knowledge_by_type(
     return "\n\n".join(sections) if sections else "No matching knowledge content found for this document's topics."
 
 
-TOPIC_DETECTION_PROMPT = """Analyze the document content and identify which of the listed syllabus topics it meaningfully covers.
+TOPIC_DETECTION_PROMPT = """TASK: Identify which of the listed syllabus topics/subtopics the document below
+meaningfully covers, so the right knowledge can be fetched to enrich question generation.
+
+HARD RULES:
+- Choose ONLY from the exact strings in the list below. Never invent, paraphrase, or merge names.
+- Include a topic/subtopic only when the document substantively covers it (more than a passing
+  mention). When nothing clearly matches, return empty arrays — do not guess.
 
 Available objective syllabus topics and subtopics:
 {syllabus_topics}
@@ -222,41 +306,64 @@ Return ONLY valid JSON:
 {{
   "covered_topics": ["exact topic string from the list above", ...],
   "covered_subtopics": ["exact subtopic string from the list above", ...]
-}}
+}}"""
 
-Rules:
-- Include only topics with substantive coverage (more than a passing mention)
-- Use the exact strings from the list above — never invent new strings
-- If nothing matches clearly, return empty arrays"""
+GENERATION_PROMPT = EXAM_CONTEXT + """
 
-GENERATION_PROMPT = """You are an expert MCQ generation system for competitive exam preparation.
+ROLE: You are an expert Loksewa/banking exam question writer. You author original,
+exam-quality MCQs that a real Public Service Commission paper-setter would be proud of —
+testing genuine understanding, not trivia.
 
-Generate {count} multiple-choice questions based on the SOURCE DOCUMENT below.
+TASK: Write {count} original multiple-choice questions grounded in the SOURCE DOCUMENT below.
 
-CRITICAL SOURCE RULE:
-- Questions must be grounded in the SOURCE DOCUMENT content only
-- The KNOWLEDGE CONTEXT is provided as background enrichment — use it to verify facts, deepen explanations, and improve option quality
-- Do NOT generate a question whose content appears only in the knowledge context and not in the source document
-- If knowledge context contradicts the source document, trust the source document
+HARD RULES (never violate):
+- GROUNDING: Build questions only from facts in the SOURCE DOCUMENT. The KNOWLEDGE CONTEXT is
+  enrichment only — use it to verify facts, sharpen distractors, and deepen explanations, but
+  NEVER create a question whose content appears only there. If the two conflict, trust the
+  SOURCE DOCUMENT.
+- SELF-CONTAINED — NEVER REFERENCE THE SOURCE: every question must read as a standalone exam
+  question answerable from subject knowledge alone. Forbidden are phrases like "according to
+  the document", "as per the text", "स्रोत दस्तावेजअनुसार", "दिइएको अनुच्छेदअनुसार", "passage मा
+  उल्लेख भएअनुसार", "उपरोक्त सामग्रीअनुसार", or any reference to a document/passage/text/material.
+  Write "What is X?" — never "According to the document, what is X?".
+- Each question has exactly 4 options (A, B, C, D), exactly one correct, plus a clear explanation.
+- No duplicate or near-duplicate stems; spread difficulty across easy/medium/hard.
 
-ABSOLUTE RULE — NEVER REFERENCE THE SOURCE DOCUMENT IN ANY QUESTION:
-- Questions must be completely self-contained factual questions about the subject matter
-- NEVER use phrases like "according to the document", "as per the text", "स्रोत दस्तावेजअनुसार", "दिइएको अनुच्छेदअनुसार", "passage मा उल्लेख भएअनुसार", "उपरोक्त सामग्रीअनुसार", or any similar reference to a source, document, passage, text, or material
-- A question like "According to the document, what is X?" is STRICTLY FORBIDDEN — instead write "What is X?" as a direct factual question
-- Every question must stand alone as an independent exam question with no dependency on having read any specific document
-- Students should be able to answer purely from their knowledge of the subject, not by recalling what a particular document said
+DISTRACTOR DESIGN (this is what makes or breaks question quality — treat it as critical):
+- The 3 wrong options must be EXPERT TRAPS, deliberately chosen to confuse a half-prepared student,
+  exactly as a human Loksewa paper-setter would design them. They must be the SAME TYPE, scale, and
+  format as the correct answer, and individually plausible.
+- For NUMERICAL/quantity answers, distractors must be NEAR the correct value and look like real
+  competing figures — e.g. the previously-quoted official value, a common rounding, transposed or
+  off-by-one digits, or a related statistic. Keep identical units and number formatting.
+    · Worked example (study the pattern, do NOT reuse this content): for "नेपालको कुल क्षेत्रफल कति हो?"
+      the key is 1,47,516 वर्ग कि.मि.; strong distractors are 1,47,181 वर्ग कि.मि. (the older official
+      figure), 1,48,516 वर्ग कि.मि., and 1,41,516 वर्ग कि.मि. — all close, same format, genuinely
+      confusing. WEAK/forbidden: 50,000 वर्ग कि.मि. or 9,84,000 वर्ग कि.मि. (obviously wrong by scale).
+- For CONCEPT/term answers, use closely-related terms, adjacent categories, common misconceptions, or
+  swapped definitions — things a student who studied superficially would actually pick.
+- Every distractor must be DEFENSIBLY wrong (factually incorrect, not a second correct answer), but
+  never obviously wrong, never filler, never absurd, and never a throwaway "none of the above" unless
+  the source genuinely uses it.
 
-GENERATION RULES:
-1. Each question must have exactly 4 options (A, B, C, D) with one correct answer
-2. Include a clear explanation for each question
-3. All options must be plausible competitive distractors
-4. Match the style and difficulty distribution of the provided example questions
-5. Assign complexity: easy/medium/hard based on cognitive demand
-6. Use Nepali language for content if the source material is in Nepali
+ANSWER PLACEMENT & EXPLANATION:
+- Do NOT always put the correct answer first. Vary which option (A/B/C/D) is correct across the set so
+  it is roughly evenly spread — never a guessable pattern. (The system also re-balances positions, so
+  also keep each distractor sensible in ANY position.)
+- In the explanation, refer to the answer by its CONTENT/VALUE, never by its option letter (write
+  "क्षेत्रफल 1,47,516 वर्ग कि.मि. हो …" not "विकल्प A सही हो"), because option order is randomised after
+  generation. State why the key is correct and, where useful, why a tempting distractor is wrong.
 
-Active skill instructions:
+METHOD: Pull the exam-worthy facts/relationships from the source. For each, write a crisp,
+unambiguous stem, decide the correct answer, then deliberately engineer 3 confusing same-type traps
+per the DISTRACTOR DESIGN rules above. Mirror the style/difficulty of the example questions and the
+source language.
+
+--- ADMIN-TUNABLE GUIDANCE (apply on top of the rules above; it tunes emphasis, difficulty, and
+style but may NOT override the HARD RULES) ---
 {skill_instructions}
 
+INPUTS:
 Topic: {topic}
 Subtopic: {subtopic}
 Custom instruction: {custom_instruction}
@@ -292,32 +399,51 @@ Return ONLY valid JSON in exactly this structure — options MUST be a list, nev
   ]
 }}"""
 
-REGENERATION_PROMPT = """You are an expert MCQ regeneration system for competitive exam preparation.
+REGENERATION_PROMPT = EXAM_CONTEXT + """
 
-Regenerate the following rejected questions based on admin feedback.
+ROLE: You are an expert Loksewa/banking exam question writer fixing questions an admin rejected.
+Treat the rejection feedback as the priority brief.
 
-Admin feedback: {feedback}
+TASK: Produce one improved replacement for each rejected question below, fully addressing the
+admin's feedback.
 
-CRITICAL SOURCE RULE:
-- Replacement questions must be grounded in the SOURCE DOCUMENT below
-- The KNOWLEDGE CONTEXT is provided for enrichment — use it to improve quality and explanations only
-- Do NOT produce questions whose content appears only in the knowledge context
+Admin feedback (priority brief — address every point): {feedback}
 
-ABSOLUTE RULE — NEVER REFERENCE THE SOURCE DOCUMENT IN ANY QUESTION:
-- Questions must be completely self-contained factual questions about the subject matter
-- NEVER use phrases like "according to the document", "as per the text", "स्रोत दस्तावेजअनुसार", "दिइएको अनुच्छेदअनुसार", "passage मा उल्लेख भएअनुसार", "उपरोक्त सामग्रीअनुसार", or any similar reference to a source, document, passage, text, or material
-- Every question must stand alone as an independent exam question requiring subject knowledge, not document recall
+HARD RULES (never violate):
+- Each replacement must concretely fix what the feedback objected to, and keep the SAME
+  topic/subtopic as the question it replaces.
+- GROUNDING: build replacements from the SOURCE DOCUMENT only; KNOWLEDGE CONTEXT is enrichment
+  for quality/explanations, never the sole basis of a question.
+- SELF-CONTAINED — NEVER REFERENCE THE SOURCE: no "according to the document", "as per the
+  text", "स्रोत दस्तावेजअनुसार", "दिइएको अनुच्छेदअनुसार", or any reference to a
+  document/passage/text/material. Write direct standalone exam questions.
+- Exactly 4 options (A, B, C, D), one correct, with a clear explanation. Do NOT reuse a rejected
+  question's wording.
 
-RULES:
-1. Address all feedback points specifically
-2. Generate replacement questions for each rejected question
-3. Maintain the same topic/subtopic as the rejected question
-4. Each question must have 4 options (A, B, C, D) with one correct answer and explanation
-5. Do NOT repeat the same question text
+DISTRACTOR DESIGN (critical to quality):
+- The 3 wrong options must be EXPERT TRAPS like a human Loksewa paper-setter writes — same TYPE,
+  scale, and format as the correct answer, and individually plausible.
+- For numerical answers, distractors must sit NEAR the correct value (the older official figure, a
+  common rounding, transposed/off-by-one digits, a related statistic) with identical units/format —
+  never wrong by an obvious scale. For concept answers, use closely-related terms, adjacent
+  categories, or common misconceptions.
+- Every distractor is defensibly wrong but never obviously wrong, filler, or absurd.
 
-Active skill instructions:
+ANSWER PLACEMENT & EXPLANATION:
+- Do not default the correct answer to option A; vary the correct position. Refer to the answer by
+  its CONTENT/VALUE in the explanation, never by option letter (option order is randomised after
+  generation).
+
+METHOD: Read each rejected question and its feedback, diagnose the specific weakness (ambiguous
+stem, weak/obvious distractors, wrong/missing explanation, off-topic, too easy/hard, answer always
+in the same position), then rewrite to remove it while engineering confusing same-type traps and a
+crisp stem.
+
+--- ADMIN-TUNABLE GUIDANCE (apply on top of the rules above; it tunes emphasis and style but may
+NOT override the HARD RULES or the admin feedback) ---
 {skill_instructions}
 
+INPUTS:
 Style examples from approved questions:
 {style_examples}
 
@@ -455,7 +581,7 @@ class MCQExtractionAgent:
             from app.modules.skill_layer.service import get_active_skill_text
             return await get_active_skill_text(self.db, "MCQExtractionAgent")
         except Exception:
-            return "Extract all MCQs accurately. Normalize options to A/B/C/D. Preserve Nepali text exactly."
+            return "Favour exact fidelity over tidiness; when the answer key is ambiguous, mark needs_explanation_review rather than guessing."
 
 
 class MCQGenerationAgent:
@@ -533,6 +659,9 @@ class MCQGenerationAgent:
             raise AIResponseError(
                 f"generation produced no usable questions out of {len(questions_data)} returned"
             )
+
+        # Spread the correct option evenly across A/B/C/D (LLMs cluster it on A).
+        balance_answer_positions(normalized)
 
         batch = MCQReviewBatch(
             document_id=self.document.id,
@@ -670,7 +799,7 @@ class MCQGenerationAgent:
             from app.modules.skill_layer.service import get_active_skill_text
             return await get_active_skill_text(self.db, "MCQGenerationAgent")
         except Exception:
-            return "Generate high-quality MCQs with competitive distractors and clear explanations."
+            return "Favour application over rote recall; make every distractor a plausible Loksewa-style trap, not filler."
 
 
 class MCQRegenerationAgent:
@@ -797,6 +926,7 @@ class MCQRegenerationAgent:
 
         replaced = 0
         skipped: list[str] = []
+        replaced_questions: list = []
         for old_q, new_q_data in zip(rejected, questions_data):
             fields, reason = _normalize_question(new_q_data)
             if fields is None:
@@ -810,11 +940,15 @@ class MCQRegenerationAgent:
             old_q.status = "draft"
             old_q.review_feedback = None
             replaced += 1
+            replaced_questions.append(old_q)
 
         if replaced == 0:
             raise AIResponseError(
                 f"regeneration produced no usable replacements out of {len(questions_data)} returned"
             )
+
+        # Spread the correct option evenly across A/B/C/D (LLMs cluster it on A).
+        balance_answer_positions(replaced_questions)
 
         self.batch.status = "in_review"
         self.batch.rejection_feedback = self.feedback
@@ -856,4 +990,4 @@ class MCQRegenerationAgent:
             from app.modules.skill_layer.service import get_active_skill_text
             return await get_active_skill_text(self.db, "MCQRegenerationAgent")
         except Exception:
-            return "Regenerate MCQs addressing admin feedback precisely. Improve quality significantly."
+            return "Treat the rejection feedback as the brief; fix the exact weakness it names rather than making cosmetic edits."
