@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     AZURE_OPENAI_API_VERSION_TRANSCRIPTION: str = "2025-03-01-preview"
     MODEL_REASONING: str = "gpt-5.5"
     MODEL_EMBEDDING: str = "text-embedding-3-large"
-    MODEL_TRANSCRIPTION: str = "whisper"
+    MODEL_TRANSCRIPTION: str = "gpt-4o-transcribe"
     EMBEDDING_DIMENSIONS: int = 3072
 
     # AI Models — Google Gemini (VISION ONLY: handwriting extraction, structure pass,

@@ -42,7 +42,7 @@ class Video(Base):
 
     # uploaded → extracting_audio → chunking_audio → transcribing → merging_transcript
     # → cleaning_transcript → generating_timeline → mapping_topics → generating_summary
-    # → processing_slides → preparing_tutor → completed | failed
+    # → processing_slides → completed | failed
     processing_status: Mapped[str] = mapped_column(String(40), nullable=False, default="uploaded")
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_audio_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
