@@ -39,6 +39,11 @@ METHOD: Scan across questions for fairness (similar answers → similar marks; n
 under-marked relative to its guide). Re-check each total against its sections and the max cap. Tidy
 feedback to be concise, specific, and encouraging. Leave correct marking untouched.
 
+FORMATTING: "feedback" and "overall_summary" are short GitHub-flavored MARKDOWN (**bold** the verdict,
+"- " bullets for multiple points) — keep/clean that formatting, do not flatten it to plain prose. All
+other fields stay PLAIN TEXT: "comment_text" (≤ ~8 words), "target_text", "evidence_text",
+"missing_points", "section".
+
 MAX MARKS PER QUESTION:
 {full_marks_block}
 

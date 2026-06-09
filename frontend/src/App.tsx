@@ -15,6 +15,7 @@ import { AdminSubjectiveTests } from "./pages/admin/SubjectiveTests";
 import { AdminVideoTutor } from "./pages/admin/VideoTutor";
 import { AdminSkillLayer } from "./pages/admin/SkillLayer";
 import { AdminAnalytics } from "./pages/admin/Analytics";
+import { AdminSettings } from "./pages/admin/Settings";
 import { StudentDashboard } from "./pages/student/Dashboard";
 import { StudentMCQTests } from "./pages/student/StudentMCQTests";
 import { StudentSubjectiveTests } from "./pages/student/StudentSubjectiveTests";
@@ -46,6 +47,7 @@ function App() {
               <Route path="subjective" element={<AdminSubjectiveTests />} />
               <Route path="skill-layer" element={<AdminSkillLayer />} />
               <Route path="analytics" element={<AdminAnalytics />} />
+              <Route path="settings" element={<AdminSettings />} />
             </Route>
           </Route>
 

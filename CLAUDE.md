@@ -111,7 +111,10 @@ project-root/
 
 Roles: `institute_admin`, `student`. Login: email + password (both roles), JWT access tokens.
 Admin creates students manually (name, email, password, phone optional). Student views profile +
-changes own password.
+changes own password. Admin manages own account from **Settings** (`pages/admin/Settings.tsx`,
+`/admin/settings`): change own login email (requires current password; case-insensitive uniqueness)
+and own password. Email change keeps the session valid (JWT `sub` = user id); `AuthContext.refreshUser()`
+refreshes the cached user after the change.
 
 ---
 
@@ -932,6 +935,8 @@ GET    /api/admin/students                POST   /api/admin/students
 PUT    /api/admin/students/{id}           POST   /api/admin/students/{id}/deactivate
 POST   /api/admin/students/{id}/activate  POST   /api/admin/students/{id}/reset-password
 GET    /api/student/profile               PUT    /api/student/profile/password
+GET    /api/admin/profile                 PUT    /api/admin/profile/password
+PUT    /api/admin/profile/email
 GET    /api/admin/syllabus/{type}
 GET    /api/files/{file_id}/url           GET    /api/admin/files
 POST   /api/admin/knowledge/documents     GET    /api/admin/knowledge/documents
@@ -1002,6 +1007,17 @@ Video transcription).
 
 Structured JSON output required for: MCQ extraction/generation, checking skill generation, answer
 extraction, evaluation, PDF annotation, timeline, slide labels, skill updates.
+
+**Markdown in prose fields (student-facing learning content):** selected agent system prompts instruct
+the model to emit GitHub-flavored markdown (bold key terms, `##` sub-headings, bullet lists) in their
+**prose text fields only**, so the frontend can render real hierarchy via `RichText`
+(`react-markdown` + `remark-gfm`, `prose-brand` typography theme). Markdown-emitting fields:
+`VideoSummaryAgent.detailed_summary`, `VideoTutorAgent.answer`,
+`AnswerEvaluationAgent`/`AnswerReviewerAgent` `feedback` + `overall_summary`, and the AI-authored MCQ
+`explanation` (generation/regeneration only — **extraction stays verbatim/plain**). JSON keys/structure
+are unchanged. Fields that must stay PLAIN TEXT are explicitly excluded in the prompts: annotation
+`comment_text` (≤~8 words, drives PDF margin geometry), `target_text`, `evidence_text`,
+`missing_points`, `section`, and all list-item/term/question fields.
 
 ---
 

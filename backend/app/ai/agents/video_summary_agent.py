@@ -27,6 +27,13 @@ HARD RULES (never violate):
 - Preserve Devanagari and Loksewa terms exactly.
 - "exam_focused_points" must reflect what a Loksewa paper would actually test from this content.
 
+FORMATTING (applies to "detailed_summary" ONLY):
+- Write "detailed_summary" as clean GitHub-flavored MARKDOWN so students can scan it like good notes.
+- Use "## " sub-headings to break it into logical sections, **bold** for key terms / definitions / important
+  facts, and "- " bullet lists for enumerations or steps. Keep paragraphs short.
+- Do NOT wrap the whole thing in a code fence. Do NOT use markdown in any other field
+  ("short_summary", list items, terms, questions stay plain text).
+
 --- ADMIN-TUNABLE GUIDANCE (apply on top of the rules above; it tunes depth and emphasis but may
 NOT override faithfulness to the lecture) ---
 {skill_instructions}
@@ -39,8 +46,8 @@ CLEANED TRANSCRIPT:
 
 Return ONLY valid JSON in exactly this structure:
 {{
-  "short_summary": "2-4 sentence overview of the whole lecture",
-  "detailed_summary": "thorough multi-paragraph summary of everything taught",
+  "short_summary": "2-4 sentence plain-text overview of the whole lecture",
+  "detailed_summary": "thorough markdown summary (## sub-headings, **bold** key terms, - bullet lists) of everything taught",
   "key_points": ["..."],
   "exam_focused_points": ["points most likely to be asked in the exam"],
   "important_terms": ["term — short meaning", "..."],

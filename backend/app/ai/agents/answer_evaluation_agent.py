@@ -50,6 +50,13 @@ ABSOLUTE RULES (never violate):
 - Do not over-penalise spelling/grammar unless meaning is unclear. Mark blank/irrelevant answers honestly.
 - Keep feedback concise and useful; list key missing points separately.
 
+FEEDBACK FORMATTING (the "feedback" and "overall_summary" fields ONLY):
+- Write them as short, clean GitHub-flavored MARKDOWN: **bold** the verdict / what went well or wrong,
+  and use "- " bullets when listing more than one improvement point. Keep it to a few lines — feedback
+  is per-question, the summary is one short paragraph.
+- DO NOT use markdown in any other field. "comment_text", "target_text", "evidence_text", "missing_points",
+  and "section" stay PLAIN TEXT (comment_text must remain ≤ ~8 words for the page margin).
+
 METHOD: For each question, work section by section through the guide's marks_breakdown — find what
 the student wrote for that section, decide correct/partial/wrong, and award that section's marks.
 Sum the sections for the question total (≤ max). Then write feedback and pick at most ~2 genuinely
@@ -86,14 +93,14 @@ Return ONLY valid JSON in exactly this structure (one entry per question):
 {{
   "total_awarded_marks": 0,
   "total_full_marks": 0,
-  "overall_summary": "Short overall summary.",
+  "overall_summary": "Short overall summary as brief markdown.",
   "question_results": [
     {{
       "question_number": "1",
       "page_numbers": [1],
       "awarded_marks": 6,
       "max_marks": 10,
-      "feedback": "Concise feedback.",
+      "feedback": "Concise feedback as short markdown (bold the verdict, bullet improvements).",
       "missing_points": ["..."],
       "confidence": 0.8,
       "sections": [

@@ -1,6 +1,8 @@
 import React, { useState } from "react";
+import { User, Mail, KeyRound } from "lucide-react";
 import { useAuth } from "../../context/AuthContext";
 import api from "../../services/api";
+import { PageHeader, Card, CardHeader, Button, FormField, TextInput, Alert } from "../../components/ui";
 
 export function StudentProfile() {
   const { user } = useAuth();
@@ -40,67 +42,43 @@ export function StudentProfile() {
     }
   };
 
-  return (
-    <div className="space-y-5">
-      <h2 className="text-lg font-semibold text-gray-900">Profile</h2>
+  const initials = (user?.full_name || "U").split(" ").map((p) => p[0]).slice(0, 2).join("").toUpperCase();
 
-      <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-100">
-        <h3 className="mb-4 text-sm font-semibold text-gray-700">Account Info</h3>
-        <div className="space-y-3">
-          <div>
-            <p className="text-xs text-gray-400">Full Name</p>
-            <p className="text-sm font-medium text-gray-900">{user?.full_name}</p>
+  return (
+    <div className="space-y-5 pb-20">
+      <PageHeader title="Profile" icon={<User className="h-5 w-5" />} />
+
+      <Card>
+        <div className="flex items-center gap-4">
+          <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-brand-700 text-lg font-bold text-white shadow-glow">
+            {initials}
           </div>
-          <div>
-            <p className="text-xs text-gray-400">Email</p>
-            <p className="text-sm text-gray-700">{user?.email}</p>
+          <div className="min-w-0">
+            <p className="truncate font-semibold text-gray-900 font-deva">{user?.full_name}</p>
+            <p className="flex items-center gap-1.5 truncate text-sm text-gray-500">
+              <Mail className="h-3.5 w-3.5" /> {user?.email}
+            </p>
           </div>
         </div>
-      </div>
+      </Card>
 
-      <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-100">
-        <h3 className="mb-4 text-sm font-semibold text-gray-700">Change Password</h3>
-        {success && (
-          <div className="mb-4 rounded-lg bg-green-50 px-3 py-2 text-sm text-green-700">
-            Password changed successfully.
-          </div>
-        )}
-        {error && (
-          <div className="mb-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>
-        )}
+      <Card>
+        <CardHeader title="Change Password" icon={<KeyRound className="h-4 w-4" />} />
+        {success && <Alert tone="success" className="mb-4">Password changed successfully.</Alert>}
+        {error && <Alert className="mb-4">{error}</Alert>}
         <form onSubmit={handleChangePassword} className="space-y-4">
-          <div>
-            <label className="mb-1.5 block text-sm font-medium text-gray-700">Current Password</label>
-            <input
-              type="password" required value={currentPw}
-              onChange={e => setCurrentPw(e.target.value)}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
-            />
-          </div>
-          <div>
-            <label className="mb-1.5 block text-sm font-medium text-gray-700">New Password</label>
-            <input
-              type="password" required value={newPw}
-              onChange={e => setNewPw(e.target.value)}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
-            />
-          </div>
-          <div>
-            <label className="mb-1.5 block text-sm font-medium text-gray-700">Confirm New Password</label>
-            <input
-              type="password" required value={confirmPw}
-              onChange={e => setConfirmPw(e.target.value)}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
-            />
-          </div>
-          <button
-            type="submit" disabled={loading}
-            className="w-full rounded-lg bg-brand-500 py-2.5 text-sm font-semibold text-white hover:bg-brand-600 disabled:opacity-60"
-          >
-            {loading ? "Changing…" : "Change Password"}
-          </button>
+          <FormField label="Current Password">
+            <TextInput type="password" required value={currentPw} onChange={(e) => setCurrentPw(e.target.value)} />
+          </FormField>
+          <FormField label="New Password" hint="At least 6 characters">
+            <TextInput type="password" required value={newPw} onChange={(e) => setNewPw(e.target.value)} />
+          </FormField>
+          <FormField label="Confirm New Password">
+            <TextInput type="password" required value={confirmPw} onChange={(e) => setConfirmPw(e.target.value)} />
+          </FormField>
+          <Button type="submit" fullWidth loading={loading}>Change Password</Button>
         </form>
-      </div>
+      </Card>
     </div>
   );
 }

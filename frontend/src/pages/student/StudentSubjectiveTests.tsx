@@ -1,26 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  ArrowLeft, FileCheck2, FileText, Upload, ExternalLink, AlertTriangle, Loader2, CheckCircle2,
+} from "lucide-react";
 import { JobStatusPoller } from "../../components/JobStatusPoller";
 import type { JobState } from "../../components/JobStatusPoller";
 import { subjectiveTestsService } from "../../services/subjectiveTests";
 import type { AnswerResult, StudentTestListItem } from "../../services/subjectiveTests";
 import { getErrorMessage } from "../../utils/error";
+import { PageHeader, Card, Button, Badge, StatusBadge, EmptyState, Skeleton, Alert } from "../../components/ui";
+import { RichText } from "../../components/content/RichText";
+import { SectionBreakdown } from "../../components/content/LearningContent";
 
 type View = "list" | "detail" | "result";
-
-const STATUS_LABEL: Record<string, string> = {
-  none: "Not submitted",
-  processing: "Checking…",
-  needs_reupload: "Re-upload needed",
-  checked: "Checked",
-  failed: "Failed",
-};
-const STATUS_COLOR: Record<string, string> = {
-  none: "text-gray-500",
-  processing: "text-blue-600",
-  needs_reupload: "text-yellow-600",
-  checked: "text-green-600",
-  failed: "text-red-600",
-};
 
 export function StudentSubjectiveTests() {
   const [view, setView] = useState<View>("list");
@@ -60,43 +51,47 @@ export function StudentSubjectiveTests() {
 
   return (
     <div className="pb-20">
-      <h1 className="mb-4 text-xl font-bold text-gray-900">Subjective Tests</h1>
-      {error && <p className="mb-3 text-sm text-red-600">{error}</p>}
+      <PageHeader
+        title="Subjective Tests"
+        description="उत्तरपुस्तिका अपलोड गर्नुहोस् र जाँचिएको नतिजा हेर्नुहोस्"
+        icon={<FileCheck2 className="h-5 w-5" />}
+      />
+      {error && <Alert className="mb-3">{error}</Alert>}
       {loading ? (
-        <p className="text-sm text-gray-500">Loading…</p>
+        <div className="space-y-3">{[0, 1].map((i) => <Skeleton key={i} className="h-28 w-full rounded-2xl" />)}</div>
       ) : tests.length === 0 ? (
-        <p className="text-sm text-gray-500">No subjective tests available right now.</p>
+        <EmptyState icon={<FileCheck2 className="h-6 w-6" />} title="अहिले कुनै subjective test छैन" />
       ) : (
         <div className="space-y-3">
           {tests.map((t) => (
-            <div key={t.test_id} className="rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-100">
-              <div className="flex items-start justify-between">
-                <div>
-                  <h3 className="font-semibold text-gray-800">{t.display_name}</h3>
-                  <p className="text-xs text-gray-400">
-                    {t.num_questions} questions · {t.total_marks} marks · {t.total_time_minutes} min
-                  </p>
+            <Card key={t.test_id}>
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h3 className="font-semibold text-gray-800 font-deva">{t.display_name}</h3>
+                  <div className="mt-1.5 flex flex-wrap gap-1.5">
+                    <Badge tone="neutral">{t.num_questions} questions</Badge>
+                    <Badge tone="brand">{t.total_marks} marks</Badge>
+                    <Badge tone="neutral">{t.total_time_minutes} min</Badge>
+                  </div>
                 </div>
-                <span className={`text-xs font-medium ${STATUS_COLOR[t.submission_status] ?? "text-gray-500"}`}>
-                  {STATUS_LABEL[t.submission_status] ?? t.submission_status}
-                </span>
+                <StatusBadge status={t.submission_status} />
               </div>
               <div className="mt-3 flex gap-2">
                 {t.submission_status === "checked" ? (
-                  <button onClick={() => viewResult(t.test_id)} className="rounded-lg bg-brand-600 px-3 py-1.5 text-sm font-medium text-white">
+                  <Button size="sm" icon={<CheckCircle2 className="h-4 w-4" />} onClick={() => viewResult(t.test_id)}>
                     View Result {t.total_marks_awarded != null ? `(${t.total_marks_awarded}/${t.total_marks})` : ""}
-                  </button>
+                  </Button>
                 ) : t.submission_status === "processing" ? (
-                  <button onClick={() => viewResult(t.test_id)} className="rounded-lg bg-gray-100 px-3 py-1.5 text-sm font-medium text-gray-700">
+                  <Button size="sm" variant="subtle" icon={<Loader2 className="h-4 w-4 animate-spin" />} onClick={() => viewResult(t.test_id)}>
                     Track Progress
-                  </button>
+                  </Button>
                 ) : (
-                  <button onClick={() => openTest(t.test_id)} className="rounded-lg bg-brand-600 px-3 py-1.5 text-sm font-medium text-white">
+                  <Button size="sm" icon={<Upload className="h-4 w-4" />} onClick={() => openTest(t.test_id)}>
                     {t.submission_status === "needs_reupload" ? "Re-upload Answer" : "Upload Answer"}
-                  </button>
+                  </Button>
                 )}
               </div>
-            </div>
+            </Card>
           ))}
         </div>
       )}
@@ -139,32 +134,37 @@ function UploadView({ testId, onBack, onChecked }: { testId: string; onBack: () 
 
   function handleJobComplete(job: JobState) {
     const out = job.output_reference as { needs_reupload?: boolean } | null | undefined;
-    if (out?.needs_reupload) {
-      // Stay here so the student can re-upload a clearer image.
-      return;
-    }
+    if (out?.needs_reupload) return;
     onChecked();
   }
 
   return (
     <div className="pb-20">
-      <button onClick={onBack} className="mb-3 text-sm text-brand-700">← Back</button>
-      <h1 className="mb-1 text-xl font-bold text-gray-900">{detail?.display_name ?? "Subjective Test"}</h1>
+      <button onClick={onBack} className="mb-3 inline-flex items-center gap-1 text-sm font-medium text-brand-700 hover:text-brand-800">
+        <ArrowLeft className="h-4 w-4" /> Back
+      </button>
+      <h1 className="mb-1 text-xl font-bold text-gray-900 font-deva">{detail?.display_name ?? "Subjective Test"}</h1>
       {detail?.question_paper_url && (
-        <a href={detail.question_paper_url} target="_blank" rel="noreferrer" className="mb-4 inline-block text-sm text-brand-700 hover:underline">
-          View / download question paper
+        <a href={detail.question_paper_url} target="_blank" rel="noreferrer" className="mb-4 inline-flex items-center gap-1.5 text-sm font-medium text-brand-700 hover:underline">
+          <FileText className="h-4 w-4" /> View / download question paper
         </a>
       )}
 
-      <form onSubmit={handleUpload} className="mt-3 space-y-3 rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-100">
-        <label className="block text-sm font-medium text-gray-700">Upload your answer sheet (PDF or photo)</label>
-        <input ref={fileRef} type="file" accept=".pdf,image/jpeg,image/png,image/webp" className="text-sm" />
-        <p className="text-xs text-gray-400">Make sure the photo is clear, well-lit, and not tilted. You can re-upload once if quality is poor.</p>
-        {error && <p className="text-sm text-red-600">{error}</p>}
-        <button type="submit" disabled={submitting || !!jobId} className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50">
-          {submitting ? "Uploading…" : "Submit for Checking"}
-        </button>
-      </form>
+      <Card className="mt-3" padded={false}>
+        <form onSubmit={handleUpload} className="space-y-3 p-5">
+          <label className="block text-sm font-medium text-gray-700">Upload your answer sheet (PDF or photo)</label>
+          <label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-200 bg-gray-50/50 px-4 py-8 text-center transition-colors hover:border-brand-300 hover:bg-brand-50/40">
+            <Upload className="h-7 w-7 text-brand-400" />
+            <span className="text-sm font-medium text-gray-600">Tap to choose a file</span>
+            <input ref={fileRef} type="file" accept=".pdf,image/jpeg,image/png,image/webp" className="hidden" onChange={() => setError("")} />
+          </label>
+          <p className="text-xs text-gray-400">Make sure the photo is clear, well-lit, and not tilted. You can re-upload once if quality is poor.</p>
+          {error && <Alert>{error}</Alert>}
+          <Button type="submit" loading={submitting} disabled={!!jobId} icon={<CheckCircle2 className="h-4 w-4" />}>
+            Submit for Checking
+          </Button>
+        </form>
+      </Card>
 
       {jobId && (
         <>
@@ -177,8 +177,6 @@ function UploadView({ testId, onBack, onChecked }: { testId: string; onBack: () 
 }
 
 function ReuploadHint({ jobId, onReupload }: { jobId: string; onReupload: () => void }) {
-  // Lightweight: when the poller-completed job flagged needs_reupload we surface
-  // a reset button. We re-check the job once here for the flag.
   const [needs, setNeeds] = useState(false);
   useEffect(() => {
     let active = true;
@@ -202,10 +200,10 @@ function ReuploadHint({ jobId, onReupload }: { jobId: string; onReupload: () => 
 
   if (!needs) return null;
   return (
-    <div className="mt-3 rounded-lg bg-yellow-50 p-3 text-sm text-yellow-800">
+    <Alert tone="warning" className="mt-3">
       The image quality was too low to check reliably. Please re-upload a clearer photo.
-      <button onClick={onReupload} className="ml-2 font-medium underline">Re-upload</button>
-    </div>
+      <button onClick={onReupload} className="ml-2 font-semibold underline">Re-upload</button>
+    </Alert>
   );
 }
 
@@ -225,7 +223,6 @@ function ResultView({ testId, onBack }: { testId: string; onBack: () => void }) 
 
   useEffect(() => {
     void load();
-    // Poll while still processing.
     const id = setInterval(async () => {
       try {
         const r = await subjectiveTestsService.getResult(testId);
@@ -236,80 +233,106 @@ function ResultView({ testId, onBack }: { testId: string; onBack: () => void }) 
     return () => clearInterval(id);
   }, [testId, load]);
 
-  if (error) return <div className="pb-20"><button onClick={onBack} className="mb-3 text-sm text-brand-700">← Back</button><p className="text-sm text-red-600">{error}</p></div>;
-  if (!result) return <p className="text-sm text-gray-500">Loading…</p>;
+  const backBtn = (
+    <button onClick={onBack} className="mb-3 inline-flex items-center gap-1 text-sm font-medium text-brand-700 hover:text-brand-800">
+      <ArrowLeft className="h-4 w-4" /> Back
+    </button>
+  );
+
+  if (error) return <div className="pb-20">{backBtn}<Alert>{error}</Alert></div>;
+  if (!result) return <div className="pb-20">{backBtn}<Skeleton className="h-40 w-full rounded-2xl" /></div>;
+
+  const pct =
+    result.total_marks_possible && result.total_marks_awarded != null
+      ? Math.round((result.total_marks_awarded / result.total_marks_possible) * 100)
+      : null;
+  const tone = pct == null ? "brand" : pct >= 60 ? "success" : pct >= 40 ? "warning" : "danger";
+  const toneGrad: Record<string, string> = {
+    success: "from-success-500 to-success-700",
+    warning: "from-warning-500 to-warning-600",
+    danger: "from-danger-500 to-danger-700",
+    brand: "from-brand-500 to-brand-700",
+  };
 
   return (
     <div className="pb-20">
-      <button onClick={onBack} className="mb-3 text-sm text-brand-700">← Back</button>
-      <h1 className="mb-1 text-xl font-bold text-gray-900">{result.display_name}</h1>
+      {backBtn}
+      <h1 className="mb-1 text-xl font-bold text-gray-900 font-deva">{result.display_name}</h1>
 
       {result.status === "processing" && (
-        <p className="text-sm text-blue-600">Your answer sheet is being checked. This page updates automatically…</p>
+        <Alert tone="info" className="mt-2 flex items-center gap-2">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Your answer sheet is being checked. This page updates automatically…
+        </Alert>
       )}
 
       {result.status === "needs_reupload" && (
-        <div className="rounded-lg bg-yellow-50 p-4 text-sm text-yellow-800">
-          <p className="font-medium">Re-upload needed</p>
+        <Alert tone="warning" className="mt-2">
+          <p className="flex items-center gap-1.5 font-semibold"><AlertTriangle className="h-4 w-4" /> Re-upload needed</p>
           <p className="mt-1">{result.quality?.quality_notes ?? "Image quality was too low."}</p>
           {result.can_reupload && (
-            <button onClick={onBack} className="mt-2 font-medium underline">Go back and re-upload</button>
+            <button onClick={onBack} className="mt-2 font-semibold underline">Go back and re-upload</button>
           )}
-        </div>
+        </Alert>
       )}
 
       {result.status === "failed" && (
-        <p className="text-sm text-red-600">Checking failed. Please try uploading again.</p>
+        <Alert className="mt-2">Checking failed. Please try uploading again.</Alert>
       )}
 
       {result.status === "checked" && (
         <>
-          <div className="my-4 rounded-xl bg-white p-5 text-center shadow-sm ring-1 ring-gray-100">
-            <p className="text-sm text-gray-500">Total Marks</p>
-            <p className="text-3xl font-bold text-brand-700">
-              {result.total_marks_awarded} <span className="text-lg text-gray-400">/ {result.total_marks_possible}</span>
+          <div className={`my-4 overflow-hidden rounded-2xl bg-gradient-to-br ${toneGrad[tone]} p-6 text-center text-white shadow-card`}>
+            <p className="text-sm font-medium text-white/80">Total Marks</p>
+            <p className="mt-1 text-4xl font-bold tracking-tight">
+              {result.total_marks_awarded}
+              <span className="text-xl font-medium text-white/70"> / {result.total_marks_possible}</span>
             </p>
+            {pct != null && <p className="mt-1 text-sm font-medium text-white/80">{pct}%</p>}
             {result.checked_pdf_url && (
-              <a href={result.checked_pdf_url} target="_blank" rel="noreferrer" className="mt-3 inline-block rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white">
-                View Checked PDF
+              <a
+                href={result.checked_pdf_url}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-white/20 px-4 py-2 text-sm font-semibold text-white backdrop-blur-sm transition-colors hover:bg-white/30"
+              >
+                <ExternalLink className="h-4 w-4" /> View Checked PDF
               </a>
             )}
           </div>
 
           <div className="space-y-3">
             {result.questions.map((q) => (
-              <div key={q.question_number} className="rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-100">
+              <Card key={q.question_number}>
                 <div className="flex items-center justify-between">
-                  <span className="font-medium text-gray-800">{q.question_number}</span>
-                  <span className="text-sm font-semibold text-brand-700">{q.marks_awarded} / {q.marks_possible}</span>
+                  <span className="font-semibold text-gray-800">प्रश्न {q.question_number}</span>
+                  <Badge tone="brand" className="text-sm">{q.marks_awarded} / {q.marks_possible}</Badge>
                 </div>
-                {q.question_text && <p className="mt-1 text-xs text-gray-500">{q.question_text}</p>}
+                {q.question_text && <p className="mt-1 text-xs text-gray-500 font-deva">{q.question_text}</p>}
                 {q.sections && q.sections.length > 0 && (
-                  <div className="mt-2 flex flex-wrap gap-1.5">
-                    {q.sections.map((s, i) => (
-                      <span
-                        key={i}
-                        className={
-                          "rounded-md px-2 py-0.5 text-xs font-medium ring-1 " +
-                          (s.status === "correct"
-                            ? "bg-green-50 text-green-700 ring-green-200"
-                            : s.status === "partial"
-                            ? "bg-amber-50 text-amber-700 ring-amber-200"
-                            : "bg-red-50 text-red-700 ring-red-200")
-                        }
-                      >
-                        {s.section}: {s.awarded}/{s.max}
-                      </span>
-                    ))}
+                  <div className="mt-3">
+                    <SectionBreakdown sections={q.sections} />
                   </div>
                 )}
-                {q.feedback && <p className="mt-2 text-sm text-gray-700">{q.feedback}</p>}
-                {q.mistakes.length > 0 && (
-                  <ul className="mt-2 list-disc pl-5 text-xs text-red-600">
-                    {q.mistakes.map((m, i) => <li key={i}>{m}</li>)}
-                  </ul>
+                {q.feedback && (
+                  <div className="mt-3 rounded-xl bg-gray-50/70 p-3">
+                    <RichText size="sm">{q.feedback}</RichText>
+                  </div>
                 )}
-              </div>
+                {q.mistakes.length > 0 && (
+                  <div className="mt-2">
+                    <p className="mb-1 text-xs font-semibold text-danger-600">सुधार्नुपर्ने बुँदा</p>
+                    <ul className="space-y-1">
+                      {q.mistakes.map((m, i) => (
+                        <li key={i} className="flex gap-1.5 text-xs text-danger-600 font-deva">
+                          <span className="mt-1 h-1 w-1 flex-shrink-0 rounded-full bg-danger-400" />
+                          {m}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </Card>
             ))}
           </div>
         </>

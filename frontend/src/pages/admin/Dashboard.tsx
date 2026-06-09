@@ -1,5 +1,10 @@
 import { useEffect, useState } from "react";
+import {
+  LayoutDashboard, Users, BookOpen, HelpCircle, FileText, FileCheck2, Video,
+  Clock, AlertTriangle, Activity,
+} from "lucide-react";
 import api from "../../services/api";
+import { PageHeader, Card, StatCard, EmptyState, Skeleton, Badge } from "../../components/ui";
 
 interface Stats {
   total_students: number;
@@ -16,18 +21,19 @@ interface Stats {
 interface ActivityItem {
   type: string;
   title: string;
+  status?: string;
   created_at: string;
 }
 
 const CARD_DEFS = [
-  { key: "total_students", label: "Total Students", color: "text-blue-700", bg: "bg-blue-50" },
-  { key: "total_knowledge_documents", label: "Knowledge Documents", color: "text-purple-700", bg: "bg-purple-50" },
-  { key: "total_approved_mcqs", label: "Approved MCQs", color: "text-yellow-700", bg: "bg-yellow-50" },
-  { key: "total_active_mcq_sets", label: "Active MCQ Sets", color: "text-orange-700", bg: "bg-orange-50" },
-  { key: "total_subjective_tests", label: "Subjective Tests", color: "text-pink-700", bg: "bg-pink-50" },
-  { key: "total_videos", label: "Video Lectures", color: "text-teal-700", bg: "bg-teal-50" },
-  { key: "pending_jobs", label: "Pending Jobs", color: "text-gray-700", bg: "bg-gray-50" },
-  { key: "failed_jobs", label: "Failed Jobs", color: "text-red-700", bg: "bg-red-50" },
+  { key: "total_students", label: "Total Students", icon: Users, tone: "brand" as const },
+  { key: "total_knowledge_documents", label: "Knowledge Docs", icon: BookOpen, tone: "accent" as const },
+  { key: "total_approved_mcqs", label: "Approved MCQs", icon: HelpCircle, tone: "info" as const },
+  { key: "total_active_mcq_sets", label: "Active MCQ Sets", icon: FileText, tone: "success" as const },
+  { key: "total_subjective_tests", label: "Subjective Tests", icon: FileCheck2, tone: "warning" as const },
+  { key: "total_videos", label: "Video Lectures", icon: Video, tone: "accent" as const },
+  { key: "pending_jobs", label: "Pending Jobs", icon: Clock, tone: "neutral" as const },
+  { key: "failed_jobs", label: "Failed Jobs", icon: AlertTriangle, tone: "danger" as const },
 ] as const;
 
 const TYPE_LABELS: Record<string, string> = {
@@ -56,44 +62,46 @@ export function AdminDashboard() {
 
   return (
     <div>
-      <div className="mb-6">
-        <h2 className="text-xl font-semibold text-gray-900">Dashboard</h2>
-        <p className="mt-1 text-sm text-gray-500">Platform overview</p>
-      </div>
+      <PageHeader title="Dashboard" description="Platform overview at a glance" icon={<LayoutDashboard className="h-5 w-5" />} />
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
-        {CARD_DEFS.map(card => (
-          <div key={card.key} className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-100">
-            <p className="text-xs font-medium text-gray-500">{card.label}</p>
-            <p className={`mt-2 text-2xl font-bold ${card.color}`}>
-              {loading ? "—" : stats ? String(stats[card.key]) : "—"}
-            </p>
-          </div>
-        ))}
+        {loading
+          ? CARD_DEFS.map((_, i) => <Skeleton key={i} className="h-28 rounded-2xl" />)
+          : CARD_DEFS.map((card, i) => (
+              <StatCard
+                key={card.key}
+                index={i}
+                tone={card.tone}
+                label={card.label}
+                value={stats ? String(stats[card.key]) : "—"}
+                icon={<card.icon className="h-5 w-5" />}
+                hint={card.key === "total_students" && stats ? `${stats.total_active_students} active` : undefined}
+              />
+            ))}
       </div>
 
-      <div className="mt-8 rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-100">
-        <h3 className="mb-4 text-sm font-semibold text-gray-700">Recent Activity</h3>
+      <Card className="mt-8">
+        <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-gray-800">
+          <Activity className="h-4 w-4 text-brand-500" /> Recent Activity
+        </h3>
         {activity.length === 0 ? (
-          <p className="text-sm text-gray-400">Activity feed available after content is added.</p>
+          <EmptyState icon={<Activity className="h-6 w-6" />} title="No activity yet" description="The feed populates as content is added." />
         ) : (
           <ul className="divide-y divide-gray-100">
             {activity.map((item, i) => (
-              <li key={i} className="flex items-center justify-between py-2">
-                <div>
-                  <span className="inline-block rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600 mr-2">
-                    {TYPE_LABELS[item.type] || item.type}
-                  </span>
-                  <span className="text-sm text-gray-700">{item.title}</span>
+              <li key={i} className="flex items-center justify-between gap-3 py-2.5">
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <Badge tone="neutral">{TYPE_LABELS[item.type] || item.type}</Badge>
+                  <span className="truncate text-sm text-gray-700 font-deva">{item.title}</span>
                 </div>
-                <span className="text-xs text-gray-400">
+                <span className="flex-shrink-0 text-xs text-gray-400">
                   {new Date(item.created_at).toLocaleDateString()}
                 </span>
               </li>
             ))}
           </ul>
         )}
-      </div>
+      </Card>
     </div>
   );
 }

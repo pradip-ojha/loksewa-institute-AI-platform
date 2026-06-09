@@ -353,6 +353,9 @@ ANSWER PLACEMENT & EXPLANATION:
 - In the explanation, refer to the answer by its CONTENT/VALUE, never by its option letter (write
   "क्षेत्रफल 1,47,516 वर्ग कि.मि. हो …" not "विकल्प A सही हो"), because option order is randomised after
   generation. State why the key is correct and, where useful, why a tempting distractor is wrong.
+- Format the explanation as short, clean GitHub-flavored MARKDOWN: **bold** the correct fact/value, and
+  you may add one "Common mistake:" line. Keep it to a few sentences; no headings, no code fences. Apply
+  markdown to the "explanation" field only — all other fields stay plain text.
 
 METHOD: Pull the exam-worthy facts/relationships from the source. For each, write a crisp,
 unambiguous stem, decide the correct answer, then deliberately engineer 3 confusing same-type traps
@@ -433,6 +436,9 @@ ANSWER PLACEMENT & EXPLANATION:
 - Do not default the correct answer to option A; vary the correct position. Refer to the answer by
   its CONTENT/VALUE in the explanation, never by option letter (option order is randomised after
   generation).
+- Format the explanation as short, clean GitHub-flavored MARKDOWN: **bold** the correct fact/value,
+  optionally one "Common mistake:" line. A few sentences; no headings or code fences. Markdown applies
+  to the "explanation" field only — all other fields stay plain text.
 
 METHOD: Read each rejected question and its feedback, diagnose the specific weakness (ambiguous
 stem, weak/obvious distractors, wrong/missing explanation, off-topic, too easy/hard, answer always

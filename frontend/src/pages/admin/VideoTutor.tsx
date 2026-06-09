@@ -4,6 +4,7 @@ import { videoTutorService } from "../../services/videoTutor";
 import type { VideoDetail, VideoItem } from "../../services/videoTutor";
 import { syllabusService, type SyllabusTree } from "../../services/syllabus";
 import { getErrorMessage } from "../../utils/error";
+import { RichText } from "../../components/content/RichText";
 
 type Tab = "upload" | "library";
 
@@ -376,7 +377,7 @@ function DetailView({ videoId, onBack }: { videoId: string; onBack: () => void }
       )}
       {v.summary?.detailed_summary && (
         <Section title="Detailed Summary">
-          <p className="whitespace-pre-wrap text-sm text-gray-700">{v.summary.detailed_summary}</p>
+          <RichText>{v.summary.detailed_summary}</RichText>
         </Section>
       )}
       {v.summary?.key_points?.length ? (

@@ -10,7 +10,7 @@ from app.core.exceptions import AppException
 from app.core.security import hash_password, verify_password
 from app.modules.users.models import User, UserRole, UserStatus
 from app.modules.users.schemas import UserCreate, UserOut, UserUpdate, PasswordReset
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 
 router = APIRouter(tags=["users"])
 
@@ -177,3 +177,53 @@ async def change_password(
     current_user.password_hash = hash_password(payload.new_password)
     await db.commit()
     return {"message": "Password changed successfully."}
+
+
+# ── Admin: own profile (email + password) ─────────────────────────────────────
+
+class ChangeEmailRequest(BaseModel):
+    current_password: str
+    new_email: EmailStr
+
+
+@router.get("/admin/profile", response_model=UserOut)
+async def get_admin_profile(current_admin: User = Depends(require_admin)):
+    return UserOut.model_validate(current_admin)
+
+
+@router.put("/admin/profile/password")
+async def change_admin_password(
+    payload: ChangePasswordRequest,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    if not verify_password(payload.current_password, current_admin.password_hash):
+        raise AppException(400, "wrong_password", "Current password is incorrect.")
+    if len(payload.new_password) < 6:
+        raise AppException(422, "weak_password", "New password must be at least 6 characters.")
+    current_admin.password_hash = hash_password(payload.new_password)
+    await db.commit()
+    return {"message": "Password changed successfully."}
+
+
+@router.put("/admin/profile/email", response_model=UserOut)
+async def change_admin_email(
+    payload: ChangeEmailRequest,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    # Require the current password to change the login email (security-sensitive).
+    if not verify_password(payload.current_password, current_admin.password_hash):
+        raise AppException(400, "wrong_password", "Current password is incorrect.")
+    new_email = payload.new_email.strip()
+    if new_email == current_admin.email:
+        raise AppException(422, "same_email", "The new email is the same as the current one.")
+    existing = await db.execute(
+        select(User).where(User.email.ilike(new_email), User.id != current_admin.id)
+    )
+    if existing.scalar_one_or_none():
+        raise AppException(409, "email_taken", "A user with this email already exists.")
+    current_admin.email = new_email
+    await db.commit()
+    await db.refresh(current_admin)
+    return UserOut.model_validate(current_admin)
