@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 
 # ── Admin: list / detail ─────────────────────────────────────────────────────────
@@ -134,9 +134,31 @@ class ChatMessageOut(BaseModel):
     answer: str
     language: str | None = None
     selected_segment_ids: list = []
+    selected_segments: list[AskSelectedSegment] = []
     detected_topic: str | None = None
     confidence: float | None = None
     follow_up_suggestions: list = []
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _hydrate_segments(cls, m):
+        """Pull the full clickable seek chips (label/start_time/start_seconds) out of
+        the persisted sources_json so restored history turns stay seekable."""
+        if isinstance(m, BaseModel) or isinstance(m, dict):
+            return m
+        sources = getattr(m, "sources_json", None) or {}
+        return {
+            "id": m.id,
+            "question": m.question,
+            "answer": m.answer,
+            "language": m.language,
+            "selected_segment_ids": m.selected_segment_ids or [],
+            "selected_segments": sources.get("selected_segments", []),
+            "detected_topic": m.detected_topic,
+            "confidence": m.confidence,
+            "follow_up_suggestions": m.follow_up_suggestions or [],
+            "created_at": m.created_at,
+        }

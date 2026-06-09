@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { videoTutorService } from "../../services/videoTutor";
 import type {
-  AskResponse, StudentPlayerData, StudentVideoListItem,
+  AskSelectedSegment, StudentPlayerData, StudentVideoListItem,
 } from "../../services/videoTutor";
 import { getErrorMessage } from "../../utils/error";
 
@@ -243,7 +243,9 @@ function PlayerView({ videoId, onBack }: { videoId: string; onBack: () => void }
 
 interface ChatTurn {
   question: string;
-  response?: AskResponse;
+  answer?: string;
+  segments?: AskSelectedSegment[];
+  followUps?: string[];
   loading: boolean;
   error?: string;
 }
@@ -265,7 +267,35 @@ function TutorTab({
   const [question, setQuestion] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    videoTutorService
+      .getHistory(videoId)
+      .then((items) => {
+        if (cancelled) return;
+        setTurns(
+          items.map((m) => ({
+            question: m.question,
+            answer: m.answer,
+            segments: m.selected_segments,
+            followUps: m.follow_up_suggestions,
+            loading: false,
+          })),
+        );
+      })
+      .catch(() => {
+        /* history is best-effort; a failure just starts an empty chat */
+      })
+      .finally(() => {
+        if (!cancelled) setHistoryLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [videoId]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -285,7 +315,19 @@ function TutorTab({
         chat_session_id: sessionId,
       });
       setSessionId(res.chat_session_id);
-      setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, response: res } : turn)));
+      setTurns((t) =>
+        t.map((turn, i) =>
+          i === idx
+            ? {
+                ...turn,
+                loading: false,
+                answer: res.answer,
+                segments: res.selected_segments,
+                followUps: res.follow_up_suggestions,
+              }
+            : turn,
+        ),
+      );
     } catch (err) {
       setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, error: getErrorMessage(err, "उत्तर ल्याउन सकिएन।") } : turn)));
     } finally {
@@ -296,7 +338,7 @@ function TutorTab({
   return (
     <div className="flex flex-col">
       <div className="min-h-[40vh] space-y-4">
-        {turns.length === 0 && (
+        {historyLoaded && turns.length === 0 && (
           <div className="rounded-2xl bg-gradient-to-br from-brand-50 to-white p-5 text-center ring-1 ring-brand-100">
             <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-full bg-brand-600 text-lg text-white">
               ✨
@@ -342,15 +384,15 @@ function TutorTab({
                   </div>
                 )}
                 {turn.error && <p className="text-sm text-red-600">{turn.error}</p>}
-                {turn.response && (
+                {turn.answer !== undefined && (
                   <>
-                    <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-800">{turn.response.answer}</p>
+                    <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-800">{turn.answer}</p>
 
-                    {turn.response.selected_segments.length > 0 && (
+                    {turn.segments && turn.segments.length > 0 && (
                       <div className="mt-3 border-t border-gray-100 pt-3">
                         <p className="mb-1.5 text-xs font-medium text-gray-400">📍 भिडियोमा हेर्नुहोस्</p>
                         <div className="flex flex-wrap gap-2">
-                          {turn.response.selected_segments.map((s) => (
+                          {turn.segments.map((s) => (
                             <button
                               key={s.segment_id}
                               onClick={() => seekTo(s.start_seconds)}
@@ -366,11 +408,11 @@ function TutorTab({
                       </div>
                     )}
 
-                    {turn.response.follow_up_suggestions.length > 0 && (
+                    {turn.followUps && turn.followUps.length > 0 && (
                       <div className="mt-3 border-t border-gray-100 pt-3">
                         <p className="mb-1.5 text-xs font-medium text-gray-400">सम्भावित प्रश्न</p>
                         <div className="flex flex-wrap gap-2">
-                          {turn.response.follow_up_suggestions.map((f, j) => (
+                          {turn.followUps.map((f, j) => (
                             <button
                               key={j}
                               onClick={() => ask(f)}

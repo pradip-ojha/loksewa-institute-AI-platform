@@ -129,6 +129,19 @@ export interface AskBody {
   chat_session_id?: string | null;
 }
 
+export interface ChatHistoryItem {
+  id: string;
+  question: string;
+  answer: string;
+  language: string | null;
+  selected_segment_ids: string[];
+  selected_segments: AskSelectedSegment[];
+  detected_topic: string | null;
+  confidence: number | null;
+  follow_up_suggestions: string[];
+  created_at: string;
+}
+
 export const videoTutorService = {
   // Admin
   uploadVideo: (form: FormData): Promise<JobRef> =>
@@ -158,4 +171,6 @@ export const videoTutorService = {
     api.get(`/api/student/videos/${id}`).then((r) => r.data),
   ask: (id: string, body: AskBody): Promise<AskResponse> =>
     api.post(`/api/student/videos/${id}/ask`, body, { timeout: 120_000 }).then((r) => r.data),
+  getHistory: (id: string): Promise<ChatHistoryItem[]> =>
+    api.get(`/api/student/videos/${id}/history`).then((r) => r.data),
 };
