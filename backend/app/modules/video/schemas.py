@@ -9,7 +9,8 @@ from pydantic import BaseModel, model_validator
 class VideoOut(BaseModel):
     id: uuid.UUID
     display_name: str
-    content_usage_type: str
+    exam_id: uuid.UUID
+    chapter: str | None = None
     topic: str | None = None
     subtopic: str | None = None
     processing_status: str

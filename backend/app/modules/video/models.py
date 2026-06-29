@@ -22,16 +22,19 @@ from app.core.database import Base
 
 
 class Video(Base):
-    """One uploaded lecture (video or audio). The fixed-chapter vertical slice means
-    the admin only tags topic/subtopic + which syllabus the lecture belongs to
-    (`content_usage_type`); there is no subject/chapter picker."""
+    """One uploaded lecture (video or audio). The admin tags the exam it belongs to
+    (`exam_id` → drives the syllabus tree + knowledge set) plus topic/subtopic; content
+    is organized by chapter → topic → subtopic within the exam, never by subject."""
 
     __tablename__ = "videos"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    # Which syllabus tree + knowledge set this lecture maps to: objective | subjective.
-    content_usage_type: Mapped[str] = mapped_column(String(20), nullable=False, default="objective")
+    # Which exam (and thus syllabus tree + knowledge set) this lecture maps to.
+    exam_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("exams.id"), nullable=False)
+    # Chapter is the PRIMARY retrieval dimension (CLAUDE.md §8): a lecture is uploaded under
+    # one chapter, so Q&A knowledge retrieval filters Pinecone by it (like an MCQ document).
+    chapter: Mapped[str | None] = mapped_column(String(500), nullable=True)
     topic: Mapped[str | None] = mapped_column(String(500), nullable=True)
     subtopic: Mapped[str | None] = mapped_column(String(500), nullable=True)
     custom_instruction: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -103,7 +106,9 @@ class VideoTimelineSegment(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
     original_transcript: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    # Topic/subtopic mapped from the live syllabus tree (validated; never invented).
+    # Chapter inherited from the parent video (the PRIMARY retrieval dimension);
+    # topic/subtopic mapped from the live syllabus tree (validated; never invented).
+    chapter: Mapped[str | None] = mapped_column(String(500), nullable=True)
     topic: Mapped[str | None] = mapped_column(String(500), nullable=True)
     subtopic_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # list of subtopic strings
     mapping_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)

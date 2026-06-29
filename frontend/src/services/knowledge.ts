@@ -4,7 +4,8 @@ export interface KnowledgeDocument {
   id: string;
   display_name: string;
   document_type: string;
-  content_usage_type: string;
+  exam_id: string;
+  chapter: string | null;
   topic: string | null;
   subtopic: string | null;
   processing_status: string;

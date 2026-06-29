@@ -40,6 +40,7 @@ TASK_ROUTES = {
     "workers.tasks.maintenance.*": {"queue": "kvi_ai_default"},
     "workers.tasks.keepalive.*": {"queue": "kvi_ai_default"},
     "workers.tasks.test_task.*": {"queue": "kvi_ai_default"},
+    "workers.tasks.personalization_tasks.*": {"queue": "kvi_ai_default"},
 }
 
 # Transport options shared by broker and result backend.

@@ -1,26 +1,31 @@
-import { useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { syllabusService, type SyllabusTree } from "../../services/syllabus";
-
-type SyllabusTypeKey = "objective" | "subjective";
+import { useExam } from "../../context/ExamContext";
 
 export function AdminSyllabus() {
-  const [activeTab, setActiveTab] = useState<SyllabusTypeKey>("objective");
-  const [trees, setTrees] = useState<Record<SyllabusTypeKey, SyllabusTree | null>>({ objective: null, subjective: null });
+  const { selectedExamId, selectedExam, exams } = useExam();
+  const [tree, setTree] = useState<SyllabusTree | null>(null);
   const [loading, setLoading] = useState(true);
 
   const load = async () => {
+    if (!selectedExamId) { setLoading(false); return; }
     setLoading(true);
-    const [obj, subj] = await Promise.all([syllabusService.getObjective(), syllabusService.getSubjective()]);
-    setTrees({ objective: obj, subjective: subj });
+    const t = await syllabusService.get(selectedExamId);
+    setTree(t);
     setLoading(false);
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [selectedExamId]);
 
-  const tree = trees[activeTab];
+  const update = (newTree: SyllabusTree) => setTree(newTree);
 
-  const update = (newTree: SyllabusTree) =>
-    setTrees(prev => ({ ...prev, [activeTab]: newTree }));
+  if (!selectedExamId) {
+    return (
+      <div className="flex h-48 items-center justify-center text-sm text-gray-400">
+        {exams.length === 0 ? "Create an exam first (Exams tab)." : "Select an exam in the top bar."}
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -28,21 +33,10 @@ export function AdminSyllabus() {
         <div>
           <h2 className="text-xl font-semibold text-gray-900">Syllabus</h2>
           <p className="mt-1 text-sm text-gray-500">
-            Seeded from system defaults. You can add, rename, or delete any item.
+            Editing <span className="font-medium text-gray-700">{selectedExam?.name}</span> ({selectedExam?.exam_type}).
+            Add, rename, or delete any chapter / topic / subtopic.
           </p>
         </div>
-      </div>
-
-      <div className="mb-5 flex gap-1 rounded-xl bg-gray-100 p-1 w-fit">
-        {(["objective", "subjective"] as const).map(tab => (
-          <button key={tab} onClick={() => setActiveTab(tab)}
-            className={`rounded-lg px-5 py-2 text-sm font-medium capitalize transition-colors ${
-              activeTab === tab ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"
-            }`}
-          >
-            {tab} Syllabus
-          </button>
-        ))}
       </div>
 
       {loading ? (
@@ -50,15 +44,9 @@ export function AdminSyllabus() {
       ) : (
         <div className="space-y-4">
           {tree?.chapters.map(ch => (
-            <ChapterBlock
-              key={ch.chapter}
-              chapter={ch}
-              syllabusType={activeTab}
-              onUpdate={update}
-            />
+            <ChapterBlock key={ch.chapter} chapter={ch} examId={selectedExamId} onUpdate={update} />
           ))}
-
-          <AddChapterRow syllabusType={activeTab} onUpdate={update} />
+          <AddChapterRow examId={selectedExamId} onUpdate={update} />
         </div>
       )}
     </div>
@@ -67,9 +55,9 @@ export function AdminSyllabus() {
 
 // ── Chapter block ──────────────────────────────────────────────────────────────
 
-function ChapterBlock({ chapter, syllabusType, onUpdate }: {
+function ChapterBlock({ chapter, examId, onUpdate }: {
   chapter: { chapter: string; topics: { topic: string; subtopics: { id: string; subtopic: string }[] }[] };
-  syllabusType: SyllabusTypeKey;
+  examId: string;
   onUpdate: (t: SyllabusTree) => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -79,7 +67,7 @@ function ChapterBlock({ chapter, syllabusType, onUpdate }: {
   const saveRename = async () => {
     if (name.trim() === chapter.chapter || !name.trim()) { setEditing(false); return; }
     setSaving(true);
-    const tree = await syllabusService.renameChapter(syllabusType, chapter.chapter, name.trim());
+    const tree = await syllabusService.renameChapter(examId, chapter.chapter, name.trim());
     onUpdate(tree);
     setSaving(false);
     setEditing(false);
@@ -87,13 +75,12 @@ function ChapterBlock({ chapter, syllabusType, onUpdate }: {
 
   const handleDelete = async () => {
     if (!confirm(`Delete chapter "${chapter.chapter}" and all its topics/subtopics?`)) return;
-    const tree = await syllabusService.deleteChapter(syllabusType, chapter.chapter);
+    const tree = await syllabusService.deleteChapter(examId, chapter.chapter);
     onUpdate(tree);
   };
 
   return (
     <div className="overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-gray-100">
-      {/* Chapter header */}
       <div className="flex items-center gap-2 border-b border-gray-100 bg-brand-50 px-5 py-3">
         {editing ? (
           <>
@@ -116,18 +103,11 @@ function ChapterBlock({ chapter, syllabusType, onUpdate }: {
         )}
       </div>
 
-      {/* Topics */}
       <div className="divide-y divide-gray-50 px-5">
         {chapter.topics.map(topic => (
-          <TopicBlock
-            key={topic.topic}
-            chapterName={chapter.chapter}
-            topic={topic}
-            syllabusType={syllabusType}
-            onUpdate={onUpdate}
-          />
+          <TopicBlock key={topic.topic} chapterName={chapter.chapter} topic={topic} examId={examId} onUpdate={onUpdate} />
         ))}
-        <AddTopicRow chapterName={chapter.chapter} syllabusType={syllabusType} onUpdate={onUpdate} />
+        <AddTopicRow chapterName={chapter.chapter} examId={examId} onUpdate={onUpdate} />
       </div>
     </div>
   );
@@ -135,10 +115,10 @@ function ChapterBlock({ chapter, syllabusType, onUpdate }: {
 
 // ── Topic block ────────────────────────────────────────────────────────────────
 
-function TopicBlock({ chapterName, topic, syllabusType, onUpdate }: {
+function TopicBlock({ chapterName, topic, examId, onUpdate }: {
   chapterName: string;
   topic: { topic: string; subtopics: { id: string; subtopic: string }[] };
-  syllabusType: SyllabusTypeKey;
+  examId: string;
   onUpdate: (t: SyllabusTree) => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -146,14 +126,14 @@ function TopicBlock({ chapterName, topic, syllabusType, onUpdate }: {
 
   const saveRename = async () => {
     if (name.trim() === topic.topic || !name.trim()) { setEditing(false); return; }
-    const tree = await syllabusService.renameTopic(syllabusType, chapterName, topic.topic, name.trim());
+    const tree = await syllabusService.renameTopic(examId, chapterName, topic.topic, name.trim());
     onUpdate(tree);
     setEditing(false);
   };
 
   const handleDelete = async () => {
     if (!confirm(`Delete topic "${topic.topic}" and all its subtopics?`)) return;
-    const tree = await syllabusService.deleteTopic(syllabusType, chapterName, topic.topic);
+    const tree = await syllabusService.deleteTopic(examId, chapterName, topic.topic);
     onUpdate(tree);
   };
 
@@ -180,21 +160,11 @@ function TopicBlock({ chapterName, topic, syllabusType, onUpdate }: {
         )}
       </div>
 
-      {/* Subtopics */}
       <ul className="mt-2 space-y-1 pl-4">
         {topic.subtopics.map(sub => (
-          <SubtopicRow
-            key={sub.id}
-            entry={sub}
-            onUpdate={onUpdate}
-          />
+          <SubtopicRow key={sub.id} entry={sub} onUpdate={onUpdate} />
         ))}
-        <AddSubtopicRow
-          chapterName={chapterName}
-          topicName={topic.topic}
-          syllabusType={syllabusType}
-          onUpdate={onUpdate}
-        />
+        <AddSubtopicRow chapterName={chapterName} topicName={topic.topic} examId={examId} onUpdate={onUpdate} />
       </ul>
     </div>
   );
@@ -248,15 +218,15 @@ function SubtopicRow({ entry, onUpdate }: {
 
 // ── Add rows ───────────────────────────────────────────────────────────────────
 
-function AddSubtopicRow({ chapterName, topicName, syllabusType, onUpdate }: {
-  chapterName: string; topicName: string; syllabusType: SyllabusTypeKey;
+function AddSubtopicRow({ chapterName, topicName, examId, onUpdate }: {
+  chapterName: string; topicName: string; examId: string;
   onUpdate: (t: SyllabusTree) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [val, setVal] = useState("");
   const save = async () => {
     if (!val.trim()) return;
-    const tree = await syllabusService.addItem(syllabusType, chapterName, topicName, val.trim());
+    const tree = await syllabusService.addItem(examId, chapterName, topicName, val.trim());
     onUpdate(tree);
     setVal("");
     setOpen(false);
@@ -280,15 +250,15 @@ function AddSubtopicRow({ chapterName, topicName, syllabusType, onUpdate }: {
   );
 }
 
-function AddTopicRow({ chapterName, syllabusType, onUpdate }: {
-  chapterName: string; syllabusType: SyllabusTypeKey;
+function AddTopicRow({ chapterName, examId, onUpdate }: {
+  chapterName: string; examId: string;
   onUpdate: (t: SyllabusTree) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [val, setVal] = useState("");
   const save = async () => {
     if (!val.trim()) return;
-    const tree = await syllabusService.addItem(syllabusType, chapterName, val.trim());
+    const tree = await syllabusService.addItem(examId, chapterName, val.trim());
     onUpdate(tree);
     setVal("");
     setOpen(false);
@@ -312,15 +282,15 @@ function AddTopicRow({ chapterName, syllabusType, onUpdate }: {
   );
 }
 
-function AddChapterRow({ syllabusType, onUpdate }: {
-  syllabusType: SyllabusTypeKey; onUpdate: (t: SyllabusTree) => void;
+function AddChapterRow({ examId, onUpdate }: {
+  examId: string; onUpdate: (t: SyllabusTree) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [chapter, setChapter] = useState("");
   const [topic, setTopic] = useState("");
   const save = async () => {
     if (!chapter.trim() || !topic.trim()) return;
-    const tree = await syllabusService.addItem(syllabusType, chapter.trim(), topic.trim());
+    const tree = await syllabusService.addItem(examId, chapter.trim(), topic.trim());
     onUpdate(tree);
     setChapter(""); setTopic(""); setOpen(false);
   };
@@ -370,6 +340,3 @@ function Btn({ onClick, children, variant = "ghost", size = "sm", disabled = fal
     </button>
   );
 }
-
-// React import needed for JSX type
-import React from "react";

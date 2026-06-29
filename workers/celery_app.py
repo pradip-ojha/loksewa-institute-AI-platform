@@ -23,6 +23,8 @@ import app.modules.mcq_tests.models      # noqa: F401
 import app.modules.subjective.models     # noqa: F401
 import app.modules.skill_layer.models   # noqa: F401
 import app.modules.video.models          # noqa: F401
+import app.modules.exams.models          # noqa: F401
+import app.modules.personalization.models  # noqa: F401
 
 celery_app = Celery(
     "neurafix",
@@ -38,6 +40,7 @@ celery_app = Celery(
         "workers.tasks.subjective_tasks",
         "workers.tasks.skill_tasks",
         "workers.tasks.video_tasks",
+        "workers.tasks.personalization_tasks",
     ],
 )
 
@@ -60,6 +63,8 @@ celery_app.conf.update(
 # job that got stuck (never picked up, or running past the hard timeout).
 # Start with   celery -A workers.celery_app.celery_app worker -B
 # or a separate beat:  celery -A workers.celery_app.celery_app beat
+from celery.schedules import crontab  # noqa: E402
+
 celery_app.conf.beat_schedule = {
     "upstash-keepalive": {
         "task": "workers.tasks.keepalive.ping",
@@ -68,5 +73,16 @@ celery_app.conf.beat_schedule = {
     "reap-stale-jobs": {
         "task": "workers.tasks.maintenance.reap_stale_jobs",
         "schedule": 120.0,              # every 2 minutes
+    },
+    # Personalization (spec §4.2): nightly distill of prior-day raw activity, and a
+    # NIGHTLY weekly-summary + extended-subjective-summary + student-intro refresh
+    # (run every night, not just Mondays, so the summaries stay current day-to-day).
+    "personalization-nightly-compress": {
+        "task": "workers.tasks.personalization_tasks.pers_nightly_compress",
+        "schedule": crontab(hour=0, minute=20),       # daily 00:20
+    },
+    "personalization-weekly": {
+        "task": "workers.tasks.personalization_tasks.pers_weekly",
+        "schedule": crontab(hour=1, minute=0),        # every night 01:00
     },
 }

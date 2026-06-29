@@ -8,6 +8,9 @@ from app.modules.mcq.schemas import MCQOption, normalize_options
 # ── Blueprint ─────────────────────────────────────────────────────────────────
 
 class TopicDistEntry(BaseModel):
+    # Chapter is the PRIMARY distribution dimension (CLAUDE.md §10): admins pick how many
+    # questions come from each chapter, optionally narrowed by a topic/subtopic within it.
+    chapter: str = Field(min_length=1)
     topic: str | None = None
     subtopic: str | None = None
     count: int = Field(ge=1, le=200)
@@ -23,6 +26,7 @@ class DifficultyDist(BaseModel):
 
 
 class BlueprintCreate(BaseModel):
+    exam_id: uuid.UUID
     test_name: str = Field(min_length=1, max_length=255)
     total_time_minutes: int = Field(ge=1, le=600)
     num_sets: int = Field(ge=1, le=50)

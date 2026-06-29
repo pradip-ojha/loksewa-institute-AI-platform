@@ -134,6 +134,7 @@ interface Section {
   awarded: number;
   max: number;
   status: string;
+  note?: string;
 }
 
 const SECTION_STATUS: Record<string, { bar: string; chip: string }> = {
@@ -166,6 +167,9 @@ export function SectionBreakdown({ sections }: { sections?: Section[] | null }) 
             <div className="h-1.5 overflow-hidden rounded-full bg-gray-100">
               <div className={cn("h-full rounded-full transition-all", style.bar)} style={{ width: `${pct}%` }} />
             </div>
+            {s.note && (
+              <p className="mt-1 font-deva text-xs leading-relaxed text-gray-600">{s.note}</p>
+            )}
           </div>
         );
       })}

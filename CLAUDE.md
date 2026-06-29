@@ -16,11 +16,24 @@ behavior.
 
 ## 1. Project
 
-**NeuraFix AI — Kirtipur Valley Institute AI Learning Platform.** Four systems:
+**NeuraFix AI — Kirtipur Valley Institute AI Learning Platform.** A multi-exam, personalized
+Loksewa learning platform. Systems:
 1. **MCQ** — extraction, generation, approval, question bank, admin test sets
 2. **Subjective** — answer-sheet checking, marks, feedback, checked PDF
 3. **Video Tutor** — transcript, timeline, slide labels, summary, Q&A
-4. **Skill Layer** — admin tunes AI agent behavior via chat; approved updates affect backend
+4. **Main AI Tutor** — exam-wide notes/book chatbot (topic-selector → tutor)
+5. **Skill Layer** — admin tunes AI agent behavior via chat; approved updates affect backend
+6. **Personalization** — per-student global profiles/summaries feeding the tutors (in progress)
+
+**Multi-exam hierarchy (replaces the old binary objective/subjective split):**
+`exam_type (objective|subjective) → exam → chapter → topic → subtopic`. Each exam is strictly ONE
+type; an exam with both papers becomes two exams. **`exam_id` is the universal routing key** — it
+drives the syllabus tree, knowledge-chunk metadata, every Pinecone filter, and video/tutor/MCQ/
+subjective scoping (it replaced the old `content_usage_type` string and the `SyllabusType` enum). The
+`exams` + `student_exam_enrollments` tables live in `app/modules/exams/`; admin enrolls students into
+exams and student endpoints filter to enrolled exams. Content is organized by chapter → topic →
+subtopic within an exam — never by subject. The old hardcoded `chapter`-by-usage-type logic is gone;
+`chapter` is a real admin-defined value.
 
 Two interfaces: **Institute Admin** (desktop-first) | **Student** (mobile-first).
 
@@ -34,8 +47,16 @@ Production modular monolith + separate Celery worker + managed external services
 React frontend   → deployed separately
 FastAPI backend  → deployed separately
 Celery worker    → deployed separately
-PostgreSQL (Neon) · Redis (Upstash) · Pinecone · Cloudflare R2 · Azure OpenAI   → managed
+PostgreSQL (Azure) · Redis (Upstash) · Pinecone · Cloudflare R2 · Azure OpenAI   → managed
 ```
+
+**Robustness (spec §7):** DB is **Azure Postgres** (`config.py` assembles the asyncpg URL from the
+`PG*` parts, SSL required). DB pool is right-sized per process via `DB_POOL_SIZE`/`DB_MAX_OVERFLOW`
+(default 5+10) so API + worker×concurrency + beat stay under Azure PG `max_connections`. **R2** uses
+bounded boto3 timeouts (`connect_timeout=10`, `read_timeout=30`, 3 retries); **Pinecone** sync SDK
+calls are offloaded via `asyncio.to_thread` at the async call sites so they never stall the event
+loop. Mid-task DB drops are covered by the three-session pattern, the per-task fresh sessions used by
+parallel extraction/skill-gen, and Celery task-level retry.
 
 ---
 
@@ -66,13 +87,36 @@ Do NOT share DB / Pinecone index / R2 bucket / queue names with NeuraFix Bridge.
 **Storage:** R2. **Queue:** Redis + Celery.
 **PDF/Image:** PyMuPDF, OpenCV, Pillow. **Audio:** FFmpeg (`ffmpeg-python`; `ffmpeg` binary on PATH).
 
-**AI providers (exact ids/versions in §23):**
-- **Azure OpenAI = default** for reasoning (`gpt-5.5`), embeddings (`text-embedding-3-large`),
-  transcription (`gpt-4o-transcribe`).
-- **Google Gemini = VISION ONLY** (`gemini-3.5-flash`, `google-genai` SDK, `ai/providers/gemini.py`,
-  via `get_provider("vision")`): handwritten answer-sheet OCR/extraction, whole-sheet structure pass,
-  annotation locator, vision-OCR fallback — it reads Nepali/Devanagari handwriting better than
-  GPT-5.5. Gemini is never used for reasoning/embeddings/transcription and is never the default.
+**AI providers + model tiering (exact ids/versions in §23; routing in `ai/model_router.py`):**
+Governing principle — *typed text (even scanned/printed images) → Azure OpenAI; handwritten
+Nepali/Devanagari → Gemini.* `get_provider(task_type)` selects both provider AND Azure deployment tier:
+- **Azure `gpt-5.5` (reasoning)** — `get_provider("reasoning")`, the default tier: MCQ generation,
+  checking-skill GENERATION + weak-skill regeneration, answer evaluation, reviewer pass, main tutor,
+  feedback chatbots, personalization summaries.
+- **Azure `gpt-5` (thinking)** — `get_provider("thinking")` (clear name) / `get_provider("text_extraction")`
+  / `get_provider("vision_typed")` / `get_provider("consistency_check")` (aliases): all **typed** text/vision extraction — existing-MCQ-document
+  extraction, content-PDF text for MCQ generation, scanned (image) knowledge-PDF OCR,
+  question-paper/model-answer/rubric extraction — PLUS the **skill-EVALUATION consistency pass**
+  (`SkillEvaluatorAgent`): it only flags serious structural issues, so gpt-5 is enough while gpt-5.5
+  still does the actual skill authoring/regeneration. **Also the simpler extraction/routing/cleaning
+  agents run here (gpt-5, not gpt-5.5 — their tasks don't need reasoning-tier):** `QuestionPaperAgent`,
+  `SubjectiveTopicRouterAgent`, `TutorTopicSelectorAgent`, and the video `VideoTopicRouterAgent`,
+  `VideoSegmentRouterAgent`, `VideoSlideLabelAgent`, `VideoSegmentTopicMapperAgent`,
+  `VideoTranscriptCleanerAgent` (these call `get_provider("thinking")`).
+- **Azure `gpt-5-mini` (fast)** — `get_provider("chunking")` (semantic chunking) and
+  `get_provider("routing")` (cheap routing/selection, e.g. the feedback-chat question selector
+  `AnswerFeedbackSelectorAgent` §12.1 — stays on gpt-5-mini, cheaper than gpt-5).
+- **Azure embeddings** (`text-embedding-3-large`) + **transcription** (`gpt-4o-transcribe`) use their
+  own dedicated deployments/api-versions.
+- **Google Gemini = HANDWRITING-ONLY VISION** (`gemini-3.5-flash`, `google-genai` SDK,
+  `ai/providers/gemini.py`, via `get_provider("vision")` / `"vision_handwritten"`): handwritten
+  answer-sheet structure pass, handwritten extraction, annotation locator — it reads Nepali/Devanagari
+  handwriting better than GPT-5. Gemini is never used for reasoning/embeddings/transcription/typed
+  extraction and is never the default.
+
+`AzureOpenAIProvider` is parametrized by `(model, api_version)` per tier; one AsyncAzureOpenAI client is
+cached per api-version (`ai/providers/azure_openai.py::_get_client`). `get_provider` is `@lru_cache`d by
+`task_type`, so each tier is a single shared provider instance.
 
 ---
 
@@ -87,9 +131,10 @@ project-root/
 │   ├── app/
 │   │   ├── main.py
 │   │   ├── core/        (config, database, security, auth, exceptions, logging)
-│   │   ├── modules/     (auth, users, syllabus, knowledge, mcq, mcq_tests, subjective
-│   │   │                [contains answer checking], video, skill_layer, analytics,
-│   │   │                files, jobs, dashboard, ai_audit)
+│   │   ├── modules/     (auth, users, exams [exam + student enrollment], syllabus,
+│   │   │                knowledge, mcq, mcq_tests, subjective [answer checking +
+│   │   │                feedback chatbot], video, tutor [exam-wide AI tutor],
+│   │   │                skill_layer, analytics, files, jobs, dashboard, ai_audit)
 │   │   ├── ai/          (providers/[base, azure_openai, gemini], agents/, prompts/,
 │   │   │                schemas/, model_router.py)
 │   │   ├── integrations/(r2_client, pinecone_client, redis_client)
@@ -120,24 +165,34 @@ refreshes the cached user after the change.
 
 ## 7. Syllabus
 
-Seeded from JSON on first startup; fully admin-editable from UI. Two separate trees — **objective**
-and **subjective** (may cover different chapters). Structure: exam_type → chapter → topic → subtopic.
+**One syllabus tree per exam** (scoped by `exam_id`, replacing the old objective/subjective split).
+Two default exams + their trees are seeded on first startup from JSON; fully admin-editable from UI.
+Structure within an exam: chapter → topic → subtopic.
 
 Admin can: add chapters (≥1 topic required), rename a chapter (cascades), delete a chapter (cascades
 topics+subtopics); add/rename (cascades)/delete topics; add/edit/delete subtopics.
 
-Backend routes (all admin-only):
+Backend routes (all admin-only; scoped by `exam_id`):
 ```
-GET  /api/admin/syllabus/objective
-GET  /api/admin/syllabus/subjective
-POST /api/admin/syllabus/{type}/items     → add chapter/topic/subtopic
-PUT  /api/admin/syllabus/items/{id}       → edit single item
-DELETE /api/admin/syllabus/items/{id}     → delete single item
-PUT  /api/admin/syllabus/{type}/chapter   → rename chapter (cascades)
-DELETE /api/admin/syllabus/{type}/chapter → delete chapter (cascades)
-PUT  /api/admin/syllabus/{type}/topic     → rename topic (cascades)
-DELETE /api/admin/syllabus/{type}/topic   → delete topic (cascades)
+GET    /api/admin/syllabus/exams/{exam_id}          → the exam's tree
+POST   /api/admin/syllabus/exams/{exam_id}/items    → add chapter/topic/subtopic
+PUT    /api/admin/syllabus/items/{id}               → edit single item
+DELETE /api/admin/syllabus/items/{id}               → delete single item
+PUT    /api/admin/syllabus/exams/{exam_id}/chapter  → rename chapter (cascades)
+DELETE /api/admin/syllabus/exams/{exam_id}/chapter  → delete chapter (cascades)
+PUT    /api/admin/syllabus/exams/{exam_id}/topic    → rename topic (cascades)
+DELETE /api/admin/syllabus/exams/{exam_id}/topic    → delete topic (cascades)
 ```
+
+**Exams + enrollment** (`app/modules/exams/`, all admin-only except the last):
+```
+GET    /api/admin/exams                       POST /api/admin/exams
+PUT    /api/admin/exams/{exam_id}
+GET    /api/admin/students/{id}/exams          POST /api/admin/students/{id}/exams
+DELETE /api/admin/students/{id}/exams/{exam_id}
+GET    /api/student/exams                      → the logged-in student's enrolled exams
+```
+Student listing endpoints (MCQ tests, subjective tests, videos) filter to the student's enrolled exams.
 
 ---
 
@@ -148,27 +203,44 @@ checking, video-tutor fallback). NOT used to add explanations to uploaded origin
 already have explanations).
 
 **Upload fields:** Display Name, Document Type (notes/book_content/handout/reference_material),
-Content Usage Type (`objective`/`subjective`), File, Topic (opt), Subtopic (opt), Custom Instruction.
+**Exam** (select), **Chapter** (opt), File, Topic (opt), Subtopic (opt), Custom Instruction.
 
-**Pipeline:** Upload → store R2 → extract text (parallel vision OCR if needed) → semantic chunking
-(parallel, AI-assisted) → embed (`text-embedding-3-large`, 3072d) → upsert Pinecone → metadata to PG.
-Chunking = meaningful semantic units (concepts, definitions, exam points), not blind token splits.
+**Pipeline:** Upload → store R2 → extract text (parallel **Azure gpt-5 typed-vision OCR** if the page
+is scanned/legacy-font — NOT Gemini, which is handwriting-only) → semantic chunking (parallel,
+**gpt-5-mini** `get_provider("chunking")`) → embed (`text-embedding-3-large`, 3072d) → upsert Pinecone
+→ metadata to PG. Chunking = meaningful semantic units (concepts, definitions, exam points), not blind
+token splits.
 Vision OCR parallel across pages (`asyncio.Semaphore(3)`); chunking parallel across sections
 (`asyncio.Semaphore(5)`).
+
+**CHAPTER IS THE PRIMARY RETRIEVAL DIMENSION (topic/subtopic are secondary within it).** A document is
+uploaded under one chapter, so every chunk inherits it. The chunking prompt is told the chapter and is
+fed ONLY that chapter's syllabus topics/subtopics (the LOAD phase filters `SyllabusItem` by the doc's
+`chapter`), so the model can't tag a chunk with a topic from a different chapter (no cross-chapter
+leakage). Retrieval (`_fetch_knowledge_by_type` for MCQ gen/regeneration) filters by `chapter` FIRST —
+topic/subtopic only narrow within it, and with no topic match the chapter's chunks still return.
 
 **Chunk metadata:**
 ```json
 {
-  "document_id", "document_name", "document_type", "content_usage_type",
-  "chapter": "hardcoded from content_usage_type — भूगोल, वातावरण र जनसंख्या (objective) or बैंकिङ्ग (subjective)",
-  "topic": "exact match from seeded syllabus, or empty string",
-  "subtopic": "exact match from seeded syllabus, or empty string",
+  "document_id", "document_name", "document_type", "exam_id", "exam_type",
+  "chapter": "real admin-defined chapter from the document (no longer hardcoded)",
+  "topic": "exact match from the exam's syllabus, or empty string",
+  "subtopic": "exact match from the exam's syllabus, or empty string",
   "language": "nepali_english_mixed", "content_type", "quality_status"
 }
 ```
-- `syllabus_type` removed — `content_usage_type` is sufficient (always identical).
-- `chapter` hardcoded per `content_usage_type` (not AI-generated).
-- `topic`/`subtopic` validated against the live syllabus after AI assigns them; non-syllabus values nulled.
+- Keyed on `exam_id`/`exam_type` (the old `content_usage_type`/`syllabus_type` are gone).
+- `chapter` is the admin-entered value on the document and is the PRIMARY dimension; topic/subtopic
+  are validated against that **chapter's** live syllabus after AI assigns them (non-chapter values nulled).
+- **Every Pinecone query filter includes `exam_id`** so retrieval never crosses exams; chapter is the
+  primary in-exam narrowing key. **Chapter is now threaded into EVERY retrieval path**, not just MCQ:
+  subjective skill-gen (`fetch_question_resources`), video Q&A and the main AI tutor
+  (`fetch_supporting_knowledge`) all add `chapter` to the filter when known — so retrieval never
+  crosses chapters within an exam. Chapter sources: `SubjectiveQuestion.chapter` (from the topic
+  router), `Video.chapter` (set at upload, like an MCQ document → inherited by `VideoTimelineSegment`),
+  and the tutor topic selector's returned chapter. `get_chapter_tree` returns chapters in its tree text
+  + a deterministic `topic_to_chapter` map; the syllabus routing/mapping agents now emit `chapter`.
 
 ---
 
@@ -179,12 +251,20 @@ Four workflows: (1) upload existing MCQ document, (2) generate from content, (3)
 
 ### 9.1 Existing MCQ Upload
 Extract: question text, options, correct option, explanation. Correct-answer format varies
-(A/B/C/D, क/ख/ग/घ, 1/2/3/4, १/२/३/४) — reasoning model detects, normalize internally to A/B/C/D.
-Upload fields: display name, PDF/Word file, topic (opt), subtopic (opt), custom extraction instruction.
+(A/B/C/D, क/ख/ग/घ, 1/2/3/4, १/२/३/४) — detected then normalized internally to A/B/C/D. **Typed
+documents → Azure gpt-5 typed extraction** (`MCQExtractionAgent` uses `get_provider("text_extraction")`,
+spec §6.2), not gpt-5.5/Gemini. Upload fields: display name, **Exam**, **Chapter (required)**, PDF/Word
+file, topic (opt), subtopic (opt), custom extraction instruction.
+
+**Chapter is required on every MCQ creation path (upload / generation / manual add) and is propagated
+to every produced `MCQQuestion.chapter`** — exams hold multiple chapters now, so chapter tagging is
+what makes per-chapter test sets (§10) possible. Topic detection + knowledge enrichment are scoped to
+the document's chapter (chapter primary; see §8).
 
 ### 9.2 MCQ Generation
 Inputs: uploaded content, objective syllabus, existing approved MCQs as style examples, custom
-instruction. Fields: display name, file, count, topic (opt), subtopic (opt), custom instruction.
+instruction. Fields: display name, file, **Exam**, **Chapter (required)**, count, topic (opt),
+subtopic (opt), custom instruction.
 
 ### 9.3 Review Flow (extracted + generated)
 Admin: Accept / Reject (with feedback) / Edit / Delete. Bulk: Accept All / Reject All.
@@ -232,32 +312,34 @@ draft/approved/rejected/archived.
 
 Admin creates blueprints → system generates sets from approved question pool.
 
-**Blueprint fields:** Test Name, Total Time, Number of Sets, Custom Instruction, Topic/Subtopic
-Distribution, Difficulty Distribution.
+**Blueprint fields:** Test Name, Total Time, Number of Sets, Custom Instruction, **Chapter
+Distribution** (each row = a chapter + optional topic/subtopic narrowing + per-set count — chapter is
+the primary dimension), Difficulty Distribution.
 
 **Rules:** all sets in a batch use completely unique questions (no cross-set duplicates). Insufficient
-questions → warning + shortage by topic/subtopic (NO auto-generate or borrow from nearby topics).
-Student attempts once (no retake, no negative marking); result immediate with explanations.
+questions → warning + shortage by chapter/topic/subtopic (NO auto-generate or borrow from nearby
+chapters/topics). Student attempts once (no retake, no negative marking); result immediate with explanations.
 
 **Set management:** status draft/active/archived. Admin: Preview / Activate / Deactivate / Delete.
 
 ### Implementation (`backend/app/modules/mcq_tests/`)
 Mirrors `mcq/` (`models/schemas/service/router`); tables in migration `009_mcq_tests`.
-- **Blueprint** fields: `topic_distribution` (`[{topic, subtopic|null, count}]`, count = per-set),
-  optional `difficulty_distribution` (`{easy,medium,hard}`), `num_sets`, `total_time_minutes`,
-  `custom_instruction`, `status` (`draft → generating → generated | shortage`), `generation_result`
-  (JSONB: sets_created or shortage breakdown).
+- **Blueprint** fields: `topic_distribution` (`[{chapter, topic|null, subtopic|null, count}]`, **chapter
+  required**, count = per-set), optional `difficulty_distribution` (`{easy,medium,hard}`), `num_sets`,
+  `total_time_minutes`, `custom_instruction`, `status` (`draft → generating → generated | shortage`),
+  `generation_result` (JSONB: sets_created or shortage breakdown). (Field name stays `topic_distribution`
+  for back-compat; entries now lead with `chapter`.)
 - **Generation = Celery job** `mcq_test_set_generation` on `kvi_ai_mcq`
   (`workers/tasks/mcq_test_tasks.py` → `service.generate_sets`). Created via `POST /blueprints`
   (returns `JobOut`); re-run via `POST /blueprints/{id}/regenerate`.
-- **Planning:** topic_distribution authoritative for counts; difficulty split *within* each topic
-  bucket proportionally (never adds questions). Validation rejects difficulty total > per-set total.
-- **Cross-set uniqueness:** per leaf bucket `(topic, subtopic, complexity)` pull `count × num_sets`
-  distinct approved questions, shuffle, deal round-robin → no repeats across sets. Questions claimed
-  by an earlier bucket excluded from later ones.
+- **Planning:** distribution authoritative for counts; difficulty split *within* each bucket
+  proportionally (never adds questions). Validation rejects difficulty total > per-set total.
+- **Cross-set uniqueness:** per leaf bucket `(chapter, topic, subtopic, complexity)` pull `count ×
+  num_sets` distinct approved questions (filtered by `MCQQuestion.chapter` first), shuffle, deal
+  round-robin → no repeats across sets. Questions claimed by an earlier bucket excluded from later ones.
 - **Shortage:** any bucket short of `count × num_sets` → NOTHING created, status `shortage`,
-  `generation_result.shortages` = `{topic, subtopic, complexity, required, available, shortage}`. Job
-  still completes (valid outcome). No auto-borrow.
+  `generation_result.shortages` = `{chapter, topic, subtopic, complexity, required, available, shortage}`.
+  Job still completes (valid outcome). No auto-borrow.
 - **Student attempts:** one per `(set, student)` via DB unique constraint (no retake).
   `start`/`get_or_create_attempt` race-safe (`IntegrityError → rollback → re-fetch` resumes same
   attempt); returns questions with NO answers/explanations; submitted attempt can't restart (409);
@@ -290,22 +372,33 @@ Checking Instruction (**optional**). Status: draft/active/archived.
 - **Marking Rubric** is an optional per-test file (`rubric_file_id`); no central rubric library. None
   selected → default general rubric (§11.5).
 - **Custom Checking Instruction** optional, test-specific guidance.
+- **Model answer is usually absent** (it doesn't move quality much; the distilled knowledge context is
+  the real quality driver). When supplied as an image/scan with no text layer, an admin
+  **"Model answer is handwritten" checkbox** (`subjective_tests.model_answer_is_handwritten`) routes the
+  vision read: handwritten → Gemini; typed/printed → Azure gpt-5 typed vision (CLAUDE.md §4). Question
+  paper / rubric are typed and always read by gpt-5 typed vision when they need OCR.
 
 ### 11.2 Question Paper Format
 Must have clear numbering + marks per question. Example: `Q1. ... [8 marks]` or `प्रश्न नं. १ ... [८ अंक]`.
 
 ### 11.3 Question-Specific Checking Skills (multi-agent, locked at test creation)
 Auto-generated at test creation (no admin approval). **The one place heavy resources are read:**
-detect each question's topic/subtopic, fetch supporting notes/book/rubric chunks (best-effort, from
-the subjective knowledge set via Pinecone), **distill** them into a focused examiner CHECKING GUIDE
-per question. The per-sheet checker reuses these **locked** skills and never re-reads the large
-resources (consistent, attention-focused).
+detect each question's chapter/topic/subtopic, fetch supporting notes/book/rubric chunks (best-effort,
+from the subjective knowledge set via Pinecone, **filtered by the question's `chapter` first** —
+`SubjectiveQuestion.chapter`, resolved from the routed topic), **distill** them into a focused examiner
+CHECKING GUIDE per question. The knowledge context fed to `SkillGeneratorAgent` is capped at **18k
+chars** (raised from 12k — knowledge is the dominant quality lever, so more chunks cover all questions).
+The per-sheet checker reuses these **locked** skills and never re-reads the large resources (consistent,
+attention-focused).
 
-Two GPT-5.5 agents, bounded loop (max 2 iterations):
-- **SkillGenerator** — builds the detailed per-question guide.
-- **SkillEvaluator** — lenient QA: passes a guide if operationally usable; fails ONLY for serious
-  issues (wrong-question mapping, qnum/max-marks mismatch, breakdown ≠ full marks, major missing
-  areas, too vague, rubric/admin ignored, numerical lacking formula/steps, wrong topic, duplicate/missing).
+Two agents, bounded loop (max 2 iterations):
+- **SkillGenerator** (GPT-5.5 reasoning) — builds the detailed per-question guide; also does the
+  weak-skill regeneration on iter 2.
+- **SkillEvaluator** (GPT-5 thinking, `get_provider("consistency_check")`) — lenient QA: passes a guide
+  if operationally usable; fails ONLY for serious STRUCTURAL issues (wrong-question mapping,
+  qnum/max-marks mismatch, breakdown ≠ full marks, major missing areas, too vague, rubric/admin
+  ignored, numerical lacking formula/steps, wrong topic, duplicate/missing). This is a consistency
+  check, not authoring, so it runs on the cheaper gpt-5; gpt-5.5 still generates/regenerates the guides.
 - Iter 1 generate → evaluate; only weak/failed guides improved once (iter 2) → re-evaluate → lock.
   Residual minor issues lock as `passed_with_warning` (internal audit; no admin gate, never blocks).
 
@@ -349,12 +442,13 @@ Student uploads handwritten answer-sheet PDF/image
 → Question-level extraction (Gemini vision, structure-aware + prev/next-page hints): per-question text + question bbox + page size + continuation
 → Backend assembles whole-question answers across pages
 → Load admin test config + LOCKED checking skills (NO large notes re-sent — skill already distilled them)
-→ Checker (GPT-5.5): WHAT is wrong + SECTION-WISE breakdown (per criterion: awarded/max/status/evidence) → marks (capped) + feedback + missing points + annotation targets (wrong text) + positive sections (ticks)
+→ Checker (GPT-5.5): WHAT is wrong + SECTION-WISE breakdown (per criterion: awarded/max/status/evidence + a student-facing `note` that names what was good (keep) vs what to improve) → marks (capped) + feedback + missing points + annotation targets (wrong text) + positive sections (ticks)
 → Reviewer pass (2nd GPT-5.5): fairness, enforce max marks, keep section sums consistent, prune annotation targets
+→ **PROGRESSIVE FEEDBACK SPLIT (spec §6.5):** the moment the reviewer pass is persisted the sheet flips to `feedback_ready` — the student sees **marks + section-wise feedback immediately** and the feedback chatbot unlocks, WHILE annotation continues in the background ("PDF is being annotated" indicator)
 → Per question ONE Gemini vision Locator call per question/page on a CROP of the answer region: underline paths for wrong items + evidence box for each fully-correct section (tick placed beside that line). Positive sections routed to the page their evidence sits on (matched via per-page extraction text)
 → Validator decides WHETHER geometry is safe (smooth / soft-mark / feedback-only for underlines; ticks are SKIP-ON-MISS — only where evidence confidently located, never margin-dumped)
-→ Human-like renderer draws checked PDF (curved baseline underlines, HarfBuzz-shaped Nepali red-pen comments, teacher-scale ticks, ONE circled question total at the END of each answer, sheet-total banner) → R2
-→ Student sees result + section-wise breakdown + checked PDF immediately
+→ Human-like renderer draws checked PDF (curved baseline underlines, HarfBuzz-shaped Nepali red-pen comments, teacher-scale ticks, ONE circled question total at the END of each answer, sheet-total banner) → R2; sheet flips to `checked` and the checked-PDF link appears
+→ **Annotation is best-effort:** a failure in this background phase NEVER loses the feedback — the sheet still settles to `checked` (results stand, PDF simply unavailable). The stuck-job reaper settles an orphaned `feedback_ready` sheet to `checked`, never `failed`.
 ```
 
 **Nepali rendering:** all annotation text shaped by HarfBuzz (`uharfbuzz` + `freetype-py`, bundled
@@ -433,7 +527,49 @@ wrong lines, an overall summary — clean, teacher-like.
 
 ### Result Page
 Total marks, question-wise marks + feedback, checked-PDF preview/download, processing status. Internal
-JSON (extraction/evaluation payloads) NOT exposed to normal users (debug-only). No follow-up chat.
+JSON (extraction/evaluation payloads) NOT exposed to normal users (debug-only). A **feedback chatbot**
+(§12.1) lets the student ask follow-up questions that **explain the already-completed evaluation** — it
+never re-checks the sheet and never exposes the internal JSON.
+
+### 12.1 Answer-Sheet Feedback Chatbot (explanation-only, never re-grades)
+After a sheet is `checked`, the student can ask follow-up questions ("why these marks?", "how do I
+improve?", "what was missing?", "would adding point X help?"). The bot **explains the stored
+evaluation** in a teacher-like way — it is read-only over already-generated results and **never
+re-checks the answer from scratch, never invents new marks**. "What if I added X?" gets **qualitative
+guidance only** (never a committed new official mark). Synchronous in-request multi-agent chat (NOT a
+Celery job); history persisted.
+- **Two-agent flow (cost-optimized):** a cheap **selector** runs FIRST, then the main chat agent.
+  - **Selector** `AnswerFeedbackSelectorAgent` (`answer_feedback_selector_agent.py`,
+    `get_provider("routing")` = gpt-5-mini, NOT skill-tunable). Given the student's message + recent
+    history + a compact one-line-per-question index (number — short text — awarded/max), it returns
+    `{question_numbers[], needs_all}`. So `build_feedback_context` ships ONLY the targeted question(s)'
+    heavy detail (evaluation + checking guide) instead of every question's on every turn. Fail-open:
+    broad/overall questions or any error ⇒ `needs_all=true` ⇒ full context. The test header, overall
+    result, and personalization block are ALWAYS included regardless.
+  - **Agent** `AnswerFeedbackChatAgent` (`answer_feedback_chat_agent.py`, `get_provider("reasoning")`,
+    `audit_ctx` `entity_type="student_answer_sheet"`, active skill via `get_active_skill_text`). Context
+    (assembled by `subjective.service`, stored data only — NO Pinecone, NO re-extraction): per (selected)
+    question `question_text`/`max_marks`/`awarded_marks`/`feedback`/`missing_points`/`sections[]`, the
+    student's extracted `answer_text`, the relevant `question_specific_checking_skills.skill_json` guide,
+    **plus a 5th input — personalization** (`personalization.build_subjective_feedback_context`: student
+    intro + weekly + extended subjective-mock mistake history; for tone/emphasis only, never changes the
+    marks). The **copy CHECKER never gets personalization** (it would bias grading) — only this chatbot
+    does. Each turn rolls into the chat-session summary (`pers_update_chat`). Output JSON
+    `{reply, follow_up_suggestions[]}` (`reply` markdown-allowed; rendered via `RichText`).
+- **Service** (`subjective/service.py`): `start_feedback_chat` (ownership-checked, unlocks once
+  `current_status in (feedback_ready, checked)` — i.e. right after the reviewer pass, not waiting for
+  annotation; seeds a Nepali greeting, resumes the open chat or creates one),
+  `post_feedback_question` (persists student turn → selector picks question(s) → `build_feedback_context`
+  with that filter → chat agent → persists reply, caps history at `MAX_FEEDBACK_HISTORY=10`),
+  `get_feedback_chat` (latest open chat for reload). A sheet
+  that is still processing/needs-reupload/failed rejects chat (409 `not_checked`).
+- **Endpoints** (`require_student`): `GET /api/student/subjective/sheets/{sheet_id}/feedback-chat`,
+  `POST .../feedback-chat/start`, `POST .../feedback-chat/{chat_id}/message`. Never expose raw
+  `evaluation_data`.
+- **Tables** (migration `014_chatbots`): `subjective_feedback_chats`, `subjective_feedback_messages`.
+- **Frontend:** a collapsible "Ask about your result" panel in `StudentSubjectiveTests.tsx` result view
+  (turn bubbles, `RichText` answers, follow-up chips, starter questions), service methods in
+  `frontend/src/services/subjectiveTests.ts`.
 
 ### Production Note
 Intentionally **quality-first**: question-level extraction + reviewer pass + on-demand vision
@@ -449,11 +585,15 @@ kvi_ai_subjective`):
   `POST .../{id}/regenerate-skills` (regenerate replaces questions + skills). Extract questions+marks
   (`QuestionPaperAgent`, vision-OCR fallback via `_resolve_text`), persist `subjective_questions`
   (`marks` = full-marks source of truth), detect per-question topic/subtopic
-  (`SubjectiveTopicRouterAgent`, validated vs live subjective tree via `video.service.get_chapter_tree`),
-  fetch supporting knowledge best-effort (`service.fetch_question_resources`, Pinecone
-  `content_usage_type="subjective"`), run skill loop: `SkillGeneratorAgent` → `SkillEvaluatorAgent` →
-  improve weak skills once (max 2 iter) → lock one `question_specific_checking_skills` row/question
-  with `skill_json` + `evaluation_status`/`evaluation_notes`/`iterations`. Sets
+  (`SubjectiveTopicRouterAgent`, validated vs the test's exam tree via `video.service.get_chapter_tree(exam_id)`),
+  fetch supporting knowledge best-effort (`service.fetch_question_resources`, Pinecone filtered by the
+  test's `exam_id`), run skill loop: `SkillGeneratorAgent` → `SkillEvaluatorAgent` →
+  improve weak skills once (max 2 iter) → lock one `question_specific_checking_skills` row/question.
+  **De-serialized for latency (spec §6.4):** per-question topic routing, knowledge-fetch+skill
+  generation, and weak-skill improvement all run CONCURRENTLY (`asyncio.gather` + `Semaphore`, each
+  question on its OWN short-lived session — audit logging makes one `AsyncSession` not
+  concurrency-safe); the `SkillEvaluator` is a single batched call returning per-skill verdicts.
+  Each locked row carries `skill_json` + `evaluation_status`/`evaluation_notes`/`iterations`. Sets
   `skill_generation_status=completed`; test **activates** only once skills completed and ≥1 question.
   **Knowledge read ONLY here**, never during per-sheet checking.
 - **`check_answer_sheet`** (`answer_sheet_checking`) — from
@@ -461,9 +601,12 @@ kvi_ai_subjective`):
   cap 2). One job: render pages → PNG (`processing/pdf_tools`) → quality gate
   (`processing/image_quality`, OpenCV; **poor + attempt<2 ⇒ `needs_reupload`, no AI spent**) →
   **whole-sheet structure pass** (`AnswerStructureAgent`, Gemini vision over all pages, stored under
-  `extracted_data["structure_map"]`) → **question-level** extraction per page
-  (`AnswerExtractionAgent.extract_page`, Gemini vision, fed structure map + prev/next-page hints, may
-  correct the map) → assemble whole-question answers (`service.assemble_questionwise`, digit-tolerant
+  `extracted_data["structure_map"]`) → **question-level** extraction, **all pages IN PARALLEL**
+  (`AnswerExtractionAgent.extract_page`, Gemini vision; `asyncio.gather` + `Semaphore(3)`, each page on
+  its OWN short-lived session since audit logging makes one `AsyncSession` not concurrency-safe; the
+  structure pass already mapped continuations so pages don't depend on each other; **partial success** —
+  a failing page yields an empty page output, never fails the sheet) → assemble whole-question answers
+  (`service.assemble_questionwise`, digit-tolerant
   qid match + `continues` carry-forward; each region keeps per-page `answer_text` for section→page
   routing) → **empty-extraction guard** (vision read NO answer text → `needs_reupload` when attempt<2,
   else fail honestly; never a silent 0-mark "completed") → **checker** using locked skills + live
@@ -471,7 +614,11 @@ kvi_ai_subjective`):
   + annotation targets; default-rubric constant when no rubric file) → **reviewer pass**
   (`AnswerReviewerAgent`, GPT-5.5; carries `sections`) → **per question** ONE vision **locator** call
   per question/page on a CROP (`AnnotationLocatorAgent.locate_question`, Gemini; underline paths for
-  wrong items + evidence box per fully-correct section, crop coords mapped back via `crop_origin`) →
+  wrong items + evidence box per fully-correct section, crop coords mapped back via `crop_origin`).
+  These per-(question,page) locator calls are independent and run **CONCURRENTLY** (`asyncio.gather` +
+  `Semaphore(LOCATOR_CONCURRENCY)`, each on its own short session); a deterministic PLAN pass in question
+  order selects the calls + enforces the per-page cap up front, so parallelism never changes which items
+  are marked or the on-page command order →
   geometry **validator** (`processing/annotation_geometry.validate_question_plan`; underline safety
   ladder + ticks skip-on-miss, placed beside located evidence only when confident (`TICK_CONF_MIN`),
   never margin-dumped) → human-like **renderer** (`processing/annotation`, HarfBuzz Nepali via
@@ -506,7 +653,9 @@ kvi_ai_subjective`):
 
 ### Admin Upload
 Video/audio file + Lecture Support Slides PDF (uploaded here, NOT in Knowledge Layer). Fields:
-Display Name, Video/Audio file, Support Slides PDF, Topic (opt), Subtopic (opt), Custom Instruction.
+Display Name, Video/Audio file, Support Slides PDF, **Chapter (opt, PRIMARY)**, Topic (opt), Subtopic
+(opt), Custom Instruction. A lecture is uploaded under ONE chapter (`videos.chapter`); that chapter
+anchors Q&A knowledge retrieval (like an MCQ document) and is inherited by every timeline segment.
 
 ### Pipeline
 ```
@@ -544,39 +693,81 @@ question (+ current_video_time) → SegmentRouter (picks 1–3 timeline segments
 ### Implementation (`backend/app/modules/video/`, Phase 9)
 Mirrors `subjective/`; tables in migration `011_video` (§19). Segment/chunk times in **seconds**
 (float) for precise seeking.
-- **Admin picks `content_usage_type`** (`objective`|`subjective`) per video (no subject/chapter
-  picker) — drives both the syllabus tree (routing/mapping) and the knowledge set.
+- **Video belongs to the selected `exam_id`** — drives both the syllabus tree (routing/mapping) and
+  the knowledge set (`exam_type` derived from the exam; no subject picker).
 - **One orchestrated Celery job** `video_processing` (`workers.tasks.video_tasks.process_video`,
   routed `workers.tasks.video_tasks.* → kvi_ai_video`), from `POST /admin/videos` (multipart: media
   required; slides PDF optional). `processing_status` lifecycle: `uploaded → extracting_audio →
   chunking_audio → transcribing → merging_transcript → cleaning_transcript → generating_timeline →
   mapping_topics → generating_summary → processing_slides → completed | failed`. Steps: extract audio
-  (`audio_tools.extract_audio`, FFmpeg, mono 16 kHz mp3 → R2 `audio/`) → chunk (≈8 min, 12 s overlap,
-  global offsets preserved) → transcribe per chunk (`provider.transcribe`, gpt-4o-transcribe,
-  `response_format="json"` — **no `verbose_json`, so text only, no segment timestamps**) → merge →
+  (`audio_tools.extract_audio`, FFmpeg, mono 16 kHz mp3 → R2 `audio/`) → chunk (**≈3 min**, 12 s overlap,
+  global offsets preserved — `audio_tools.DEFAULT_CHUNK_MINUTES`; smaller chunks tighten the per-chunk
+  time window the timeline anchors to, since gpt-4o-transcribe gives no per-segment timestamps and Azure
+  rejects `verbose_json` — so chunk size IS the timeline's time granularity) → transcribe per chunk
+  (`provider.transcribe`, gpt-4o-transcribe, `response_format="json"` — text only, no segment
+  timestamps) → merge →
   clean **per chunk** (`VideoTranscriptCleanerAgent`, once per chunk so each cleaned section keeps its
   global time window; languages aggregated via `_pick_language`) → timeline (`VideoTimelineAgent`, fed
   cleaned chunks as **time-anchored sections** so segment timestamps pin to real chunk windows —
   accurate on long multi-chunk lectures despite no per-segment times) → map to syllabus
-  (`VideoSegmentTopicMapperAgent`, validated vs live tree) → summary (`VideoSummaryAgent`) → slide
+  (`VideoSegmentTopicMapperAgent`, validated vs live tree; each segment also inherits `video.chapter`)
+  → summary (`VideoSummaryAgent`) → slide
   labels if slides PDF (`VideoSlideLabelAgent`, per-page text aligned to timeline). **Activate** only
   once `completed`; `POST /admin/videos/{id}/retry` re-runs (replaces prior children).
 - **Q&A is synchronous in the router** (`POST /student/videos/{id}/ask` → `service.run_qa_chain`),
-  NOT a job: `VideoSegmentRouterAgent` → `VideoTopicRouterAgent` → `service.fetch_supporting_knowledge`
-  (Pinecone filtered by `content_usage_type` + routed `topic`/`subtopic`, mapped to `knowledge_chunks`
-  by `pinecone_vector_id`; best-effort — answers lecture-only if Pinecone down) → `VideoTutorAgent`.
-  Each turn persisted to `video_chat_messages`. Response: `{answer, language, chat_session_id,
+  NOT a job: `VideoSegmentRouterAgent` → `VideoTopicRouterAgent` (also emits a **`needs_knowledge`**
+  flag) → `service.fetch_supporting_knowledge` **ONLY when `needs_knowledge` is set** (spec §5.3 — the
+  lecture transcript/summary answers most questions; reach for the book/notes layer only when the
+  question is deep enough; Pinecone filtered by `exam_id` + **`video.chapter` (PRIMARY)** + routed
+  `topic`/`subtopic`, mapped to `knowledge_chunks` by `pinecone_vector_id`; best-effort) →
+  `VideoTutorAgent` (fed a
+  `personalization.build_video_tutor_context` block — student intro + weekly). Each turn persisted to
+  `video_chat_messages` and rolled into the chat-session summary (`pers_update_chat`, best-effort).
+  Response: `{answer, language, chat_session_id,
   selected_segments, detected_topic, detected_subtopic_ids, supporting_knowledge_used, confidence,
   follow_up_suggestions}`.
-- **Agents** (`backend/app/ai/agents/video_*`): `video_transcript_cleaner_agent`,
-  `video_timeline_agent`, `video_segment_topic_mapper_agent`, `video_summary_agent`,
-  `video_slide_label_agent`, `video_segment_router_agent`, `video_topic_router_agent`,
-  `video_tutor_agent` — all `get_provider("reasoning")`, `audit_ctx` (`entity_type="video"`),
-  `get_active_skill_text`.
+- **Agents** (`backend/app/ai/agents/video_*`, `audit_ctx` `entity_type="video"`, `get_active_skill_text`):
+  `video_timeline_agent`, `video_summary_agent`, `video_tutor_agent` on `get_provider("reasoning")`
+  (gpt-5.5); the simpler `video_transcript_cleaner_agent`, `video_segment_topic_mapper_agent`,
+  `video_slide_label_agent`, `video_segment_router_agent`, `video_topic_router_agent` on
+  `get_provider("thinking")` (gpt-5 — cleaning/routing/labeling don't need reasoning tier).
 - **Frontend:** admin `pages/admin/VideoTutor.tsx` (Upload/Library/Details, activate/retry/delete via
   `JobStatusPoller`), student `pages/student/StudentVideoTutor.tsx` (player + tabs सारांश/समयरेखा/
   मुख्य बुँदा/AI Tutor; timeline + source timestamps seek player; follow-up chips), service
   `frontend/src/services/videoTutor.ts`.
+
+### 13.1 Main AI Tutor (exam-wide; Topic Selector → notes/book → Main Tutor + personalization)
+A standalone student tutor (distinct from the video-scoped Q&A above): a notes/book chatbot over a
+SELECTED EXAM's syllabus, **personalized to the student**. No video/timeline. ChatGPT-style sessions —
+each `tutor_chat_session` is scoped to one `exam_id`; the student picks the exam to start a new chat
+(must be enrolled). A **Topic Selector Agent** picks the chapter/topic/subtopic AND (activity-aware,
+spec §4.4) detects whether the question targets a specific past test; then notes/book chunks are
+fetched for that topic (exam-filtered), and the **Main Tutor Agent** answers from that content +
+personalization. Synchronous in-request multi-agent chat (NOT a Celery job); history persisted.
+
+**Flow** (`backend/app/modules/tutor/service.py::run_tutor_chain`): `get_chapter_tree(exam_id)` +
+`personalization.build_main_tutor_context` + a compact `_recent_activities` list → `TutorTopicSelectorAgent`
+(constrained to the exam tree; output `{chapter, topic, subtopics, target_activity_id, confidence, reason,
+query_rewrite}`) → **service validates** chapter/topic/subtopics against the live syllabus (`_validate`;
+chapter resolved deterministically from the validated topic via `topic_to_chapter`) and, if
+`target_activity_id` matched, attaches that activity's detail (`personalization.get_activity_detail`) →
+`fetch_supporting_knowledge(exam_id=…, chapter=…)` (chapter is the PRIMARY Pinecone filter) → `TutorAgent` answers from the retrieved content + student
+context, stays in the exam's scope, says so honestly when uncovered. After the turn, a best-effort
+`pers_update_chat` rolls it into the chat-session summary. Best-effort throughout (Pinecone down →
+still answers from scope).
+- **Agents** (`audit_ctx` `entity_type="tutor_chat_session"`, active skill):
+  `tutor_topic_selector_agent.py` (`TutorTopicSelectorAgent`, exam-wide + activity-aware, on
+  `get_provider("thinking")` = gpt-5 — routing doesn't need reasoning tier), `tutor_agent.py`
+  (`TutorAgent`, `get_provider("reasoning")` = gpt-5.5, takes a `personalization` block, output
+  `{answer, language, confidence, follow_up_suggestions}`; `answer` markdown-allowed).
+- **Endpoints** (`require_student`): `POST /api/student/tutor/ask` (`{question, exam_id?, chat_session_id?}`
+  — `exam_id` required to START a new chat, omitted when resuming → answer +
+  `detected_topic`/`detected_subtopic_ids`/`supporting_knowledge_used`/confidences/follow-ups),
+  `GET /api/student/tutor/history?session_id=`.
+- **Tables** (migration `014_chatbots`): `tutor_chat_sessions`, `tutor_chat_messages` (mirrors
+  `video_chat_messages`).
+- **Frontend:** `pages/student/StudentTutor.tsx` (full-page chat, route `/student/tutor`, 4th student
+  nav item "AI Tutor"), service `frontend/src/services/tutor.ts`.
 
 ---
 
@@ -600,14 +791,18 @@ A FIXED system prompt (`backend/app/ai/agents/*.py`) + an admin-tunable skill (D
   improved defaults — creates a new active version and **archives** the old (revertable). System-prompt
   changes apply on next backend restart, no script.
 
-### Agents with seeded default skills (`_DEFAULT_SKILLS` in `skill_layer/service.py` — 20 total)
+### Agents with seeded default skills (`_DEFAULT_SKILLS` in `skill_layer/service.py` — 27 total)
 MCQ Extraction, MCQ Generation, MCQ Review/Regeneration, Subjective Topic Router, Skill Generator,
 Skill Evaluator, Answer Extraction, Answer Evaluation (Copy Checking), Answer Reviewer/Verification,
-Annotation Locator, Skill Builder, plus the 8 Video agents (`VideoTranscriptCleanerAgent`,
-`VideoTimelineAgent`, `VideoSegmentTopicMapperAgent`, `VideoSummaryAgent`, `VideoSlideLabelAgent`,
-`VideoSegmentRouterAgent`, `VideoTopicRouterAgent`, `VideoTutorAgent`).
-(`KnowledgeProcessingAgent` exists but is intentionally NOT skill-tunable; there is no test-set-
-generation or analytics agent.)
+Annotation Locator, **AnswerFeedbackChatAgent** (subjective feedback chatbot, §12.1), Skill Builder,
+the 8 Video agents (`VideoTranscriptCleanerAgent`, `VideoTimelineAgent`,
+`VideoSegmentTopicMapperAgent`, `VideoSummaryAgent`, `VideoSlideLabelAgent`, `VideoSegmentRouterAgent`,
+`VideoTopicRouterAgent`, `VideoTutorAgent`), the 2 standalone AI-Tutor agents
+(`TutorTopicSelectorAgent`, `TutorAgent`, §13.1), plus the **4 Personalization summarizers**
+(`DailySummaryAgent`, `WeeklySummaryAgent`, `ChatSessionSummaryAgent`, `ExtendedSubjectiveSummaryAgent`,
+§Personalization).
+(`KnowledgeProcessingAgent` and `AnswerFeedbackSelectorAgent` exist but are intentionally NOT
+skill-tunable; there is no test-set-generation or analytics agent.)
 
 ### Skill Scopes
 Global agent skill / Objective chapter / Subjective chapter / Test-specific / Question-specific.
@@ -648,6 +843,54 @@ Internal question-specific checking skills: auto-generated, no approval, stored 
   `kvi_ai_skill`) is unchanged.
 - **Frontend:** admin `pages/admin/SkillLayer.tsx` (three-pane: agent selector | chat | draft+approve/
   discard + active instruction + history), service `frontend/src/services/skillLayer.ts`.
+
+---
+
+## 14A. Personalization Layer (NEW — spec §4)
+
+The platform's core differentiator. **All personalization artifacts are GLOBAL per student**
+(`student_id` only — NEVER per exam): one holistic picture mixing objective + subjective activity
+across every enrolled exam. Content retrieval/tutors stay exam-scoped; personalization is layered on top.
+
+**Summary sizing** (must hold enough useful detail, not be terse): daily / weekly / chat-session ≈ **400
+words**; the extended subjective-mock summary ≈ **800 words** (the rich long-horizon record of how the
+student writes subjective answers); the overall student **intro stays short** (1–3 sentences). Set in the
+agent prompts (`ai/agents/personalization_agents.py`).
+
+### Artifacts (`backend/app/modules/personalization/`, migration `016`)
+- **Student intro** (`student_profiles.intro_text`, short) — built from activity, refreshed nightly.
+- **Activity logger** (`student_activity_logs`) — raw records of objective/subjective tests. `raw_context`
+  holds full detail ONLY for the current day; the nightly beat distills + clears it (keeps `summary`).
+- **Rolling daily summary** (`student_daily_summaries`, ONE row/student, ≈400w) — that day's chats + activities.
+- **Weekly summary** (`student_weekly_summaries`, one row/student/week, ≈400w) — performance + key questions;
+  refreshed **every night** (not just Mondays).
+- **Chat-session summary** (`chat_session_summaries`, ≈400w, one/session across tutor/video/subjective-feedback).
+- **Extended subjective summary** (`extended_subjective_summaries`, ONE/student, ≈800w) — richer rolling
+  summary of subjective-mock mistake KINDS + questions asked; updated immediately after each subjective test.
+
+### Update triggers (`personalization/service.py`; AI roll-ups run as best-effort Celery tasks on
+`kvi_ai_default`, NOT tracked jobs — `workers/tasks/personalization_tasks.py`)
+| Artifact | When | Mechanism |
+|---|---|---|
+| Activity log (raw) | MCQ submit (`mcq_tests.service`); subjective check (`subjective_tasks`) | sync `log_activity` (fast, no AI) |
+| Rolling daily summary | each activity · chat-session end · every 5 Q-A | `pers_update_daily` / counter on the daily row |
+| Chat-session summary | after a chatbot turn | `pers_update_chat` |
+| Extended subjective summary | immediately after each subjective test | `pers_update_subjective` |
+| Weekly summary + intro refresh | **nightly (01:00 beat)** | `pers_weekly` |
+| Raw-detail expiry | nightly (00:20 beat) | `pers_nightly_compress` |
+
+The summarizers (`ai/agents/personalization_agents.py`, `get_provider("reasoning")`, skill-tunable,
+`audit_ctx` `entity_type="student"`) only DISTILL given data — they never invent. All updates are
+best-effort: a personalization failure NEVER breaks a submit/check/chat.
+
+### Context builders (consumed by the tutors — spec §4.3; wired in §13/§13.1/§12.1)
+- **Main tutor** → `build_main_tutor_context` (intro + daily + weekly + recent chat summaries).
+- **Subjective feedback tutor** → `build_subjective_feedback_context` (extended subjective + intro +
+  weekly; the chat itself adds the session + last 5 turns).
+- **Video tutor** → `build_video_tutor_context` (intro + weekly; the caller adds this video's session).
+- **Activity-aware retrieval** (spec §4.4): the main tutor's topic selector also detects whether a
+  question targets a specific past activity; only then is `get_activity_detail` attached (raw context if
+  same-day, else the distilled summary / source record).
 
 ---
 
@@ -692,8 +935,14 @@ tables. All endpoints `require_admin`.
 
 ## 16. Admin Interface (Desktop-First)
 
-**Sidebar:** Dashboard | Read-Only Syllabus | Knowledge Layer | MCQ System | MCQ Tests | Video Tutor |
+**Sidebar:** Dashboard | Exams | Syllabus | Knowledge Layer | MCQ System | MCQ Tests | Video Tutor |
 Subjective Tests | Skill Layer | Students | Analytics | Settings
+
+**Active-exam selector** in the top bar (persisted): the universal scope for every admin workspace —
+Knowledge/MCQ/MCQ-Tests/Video/Subjective uploads and the Syllabus editor all operate within it
+(`ExamContext`, `pages/admin/Exams.tsx`, `services/exams.ts`). **Exams** page = create/list/archive
+exams (each strictly objective OR subjective). **Students** page = create/edit/reset + **manage exam
+enrollment** per student.
 
 **Dashboard cards:** Total Students, Active Students, Knowledge Documents, Total MCQs, Active MCQ Sets,
 Subjective Tests, Videos, Pending Jobs, Failed Jobs. Recent activity feed.
@@ -711,12 +960,15 @@ Subjective Tests, Videos, Pending Jobs, Failed Jobs. Recent activity feed.
 
 ## 17. Student Interface (Mobile-First)
 
-**Navigation:** Dashboard | MCQ Tests | Video Tutor | Subjective Tests | Results | Profile
+**Navigation:** Dashboard | MCQ Tests | Video Tutor | AI Tutor | Subjective Tests | Results | Profile
 - **MCQ Test:** timer, question+options, palette, submit → immediate result with explanations,
   correct answers, topic/complexity. No retake.
 - **Video Tutor:** watch video, view summary+timeline, ask AI questions.
+- **AI Tutor** (`pages/student/StudentTutor.tsx`, route `/student/tutor`): exam-wide, personalized
+  notes/book tutor (§13.1). Full-page chat; student picks the exam, topic auto-selected; activity-aware.
 - **Subjective Test:** view/download question paper, upload answer sheet, quality feedback, reupload
-  up to 2x, see result + checked PDF immediately. No follow-up chat.
+  up to 2x, see result + checked PDF immediately. A **feedback chatbot** (§12.1) explains the checked
+  result (marks/improvement/missing points) — read-only, never re-checks the sheet.
 - **Results:** MCQ attempts, subjective results, checked PDFs, video activity.
 - **Profile:** name, email, change password.
 
@@ -742,16 +994,29 @@ Worker starts **without `-Q`** — with `task_queues` declared it consumes ALL d
 (consumed can't drift from declared). Sender app has **no result backend**.
 
 ### Worker Runtime (`workers/runtime.py`)
-Every task body delegates to `run_task(work, *, job_id, task=self)`:
-- Runs `work(db)` on ONE persistent event loop per worker process (lazy `get_loop()`), not a fresh
+Every task body delegates to `run_task(work, *, job_id, task=self, manage_session=True)`:
+- Runs `work` on ONE persistent event loop per worker process (lazy `get_loop()`), not a fresh
   `asyncio.run()` per task; engine disposed once on `worker_shutdown`. Fixes old "event loop is closed"
   failures. **Pools: `solo` (Win/dev) and `prefork` (Linux/prod) only — never threaded/gevent/eventlet**
   (multiple threads on the shared loop corrupt it).
-- **Short-lived sessions only.** The `processing` mark, `work(db)`, and the terminal `completed` mark
-  each use a **separate** `AsyncSessionLocal()`. *Why:* a long task runs minutes; Neon drops the idle
+- **Two session modes.** `manage_session=True` (default) calls `work(db)` with ONE session held for the
+  whole body — fine for SHORT tasks. `manage_session=False` calls `work()` with **NO** session: `work`
+  opens its own short-lived `AsyncSessionLocal()` per DB touch (**LOAD → WORK → SAVE** — borrow-per-use),
+  so a pooled connection is **never held idle across a multi-minute AI/render phase** (where Azure/Neon
+  drops it server-side, crashing the next commit). The long answer-sheet checking pipeline
+  (`check_answer_sheet`) uses `manage_session=False`: it snapshots the sheet/test/questions to plain data
+  in a LOAD session (scalar columns stay readable on the detached ORM objects since
+  `expire_on_commit=False`), runs every AI phase holding no session (each agent call + the parallel
+  annotation locator calls open their own short session for audit logging), and writes each result in its
+  own SAVE burst. `generate_test_skills` uses the SAME borrow-per-use model (snapshots the test config +
+  question rows to plain dicts in LOAD sessions, runs topic routing / knowledge-fetch+skill-gen /
+  evaluation holding no session, persists routing + locked skills in SAVE bursts).
+- **Short-lived sessions either way.** The `processing` mark and the terminal `completed` mark always
+  use a **separate** `AsyncSessionLocal()`. *Why:* a long task runs minutes; the DB drops the idle
   pooled asyncpg connection server-side, and reusing it for the final commit was the historic
-  `connection is closed` failure. `pool_pre_ping=True` (`pool_recycle=1800`/`pool_timeout=30`)
-  validates only on **checkout**, so it helps only because each phase checks out fresh.
+  `connection is closed` failure. `pool_pre_ping=True` (`pool_recycle=1800`/`pool_timeout=30`,
+  `command_timeout=60` so a hung query fails fast) validates only on **checkout**, so it helps only
+  because each phase checks out fresh.
 - **Guarantees a terminal state:** `completed` (progress 100) on success, or `failed`/`retrying` with
   sanitized `error_message` (recorded in a fresh session so a poisoned transaction can't hide failure).
 - **Long-running agents self-manage sessions** (see `KnowledgeProcessingAgent`): load metadata (short
@@ -799,8 +1064,13 @@ mcq_test_set_generation       → kvi_ai_mcq
 subjective/answer checking    → kvi_ai_subjective
 video_tasks.* (process_video) → kvi_ai_video
 skill_builder_update          → kvi_ai_skill
+personalization_tasks.*       → kvi_ai_default
 analytics / reaper / keepalive→ kvi_ai_default
 ```
+
+**Beat schedule** (`celery_app.py`): keepalive (4 min), reaper (2 min), **personalization nightly
+compress** (`crontab 00:20`), **personalization weekly** summary+intro refresh (`crontab 01:00` — runs
+every night so the weekly summaries stay current).
 
 ### Job Types
 knowledge_processing, mcq_extraction, mcq_generation, mcq_regeneration, mcq_test_set_generation,
@@ -816,7 +1086,10 @@ analytics_recalculation.
 Answer-sheet checking runs as one orchestrated job (the **reviewer/verification pass is a tracked
 step**). Subjective tasks in `workers/tasks/subjective_tasks.py`. Video Tutor uses ONE orchestrated
 job `video_processing` (all pipeline steps, incremental progress). Student Q&A is synchronous (fast
-multi-agent chat in the router), NOT a tracked job.
+multi-agent chat in the router), NOT a tracked job. The **subjective feedback chatbot** (§12.1) and the
+**standalone AI Tutor** (§13.1) are likewise synchronous in-request multi-agent chats, NOT tracked jobs.
+**Personalization roll-ups** (§14A, `personalization_tasks.*`) are fire-and-forget Celery tasks with NO
+`processing_jobs` row — best-effort, run directly on the worker loop like the reaper.
 
 ### Job Fields
 job_id, job_type, status (queued/processing/completed/failed/retrying/cancelled), progress_percent,
@@ -831,8 +1104,19 @@ created_at, started_at, completed_at, created_by.
 `users`: id, full_name, email, password_hash, phone, role (institute_admin|student), status
 (active|inactive), created_at, updated_at, last_login_at
 
+### Exams (migration `015`)
+`exams`: id, exam_type (objective|subjective), name, description, status (active|archived), created_by,
+created_at
+`student_exam_enrollments`: id, student_id (FK users CASCADE), exam_id (FK exams CASCADE), enrolled_at,
+unique(student_id, exam_id)
+**`exam_id` is added (NOT NULL FK → exams) to:** `syllabus_items`, `knowledge_documents`,
+`knowledge_chunks`, `mcq_documents`, `mcq_questions`, `mcq_test_blueprints`, `mcq_test_sets`,
+`subjective_tests`, `videos`, `tutor_chat_sessions`. The old `content_usage_type` columns
+(`knowledge_documents`, `videos`) and the `syllabus_type` enum are dropped; `knowledge_documents` gains
+a real `chapter` column.
+
 ### Syllabus
-`syllabus_items`: id, syllabus_type (objective|subjective), chapter, topic, subtopic, sort_order, is_active
+`syllabus_items`: id, exam_id (FK exams), chapter, topic, subtopic, sort_order, is_active
 
 ### Files + Jobs
 `files`: id, original_filename, display_name, mime_type, file_size, r2_key, uploaded_by, created_at
@@ -846,14 +1130,14 @@ related_entity_id
 `ai_outputs`: id, request_id (FK), output_summary, quality_notes
 
 ### Knowledge
-`knowledge_documents`: id, display_name, document_type, content_usage_type, file_id, topic, subtopic,
-custom_instruction, processing_status, chunk_count, created_by, created_at
+`knowledge_documents`: id, display_name, document_type, exam_id (FK exams), chapter, file_id, topic,
+subtopic, custom_instruction, processing_status, chunk_count, created_by, created_at
 `knowledge_chunks`: id, document_id, chunk_index, content, content_type, chapter, topic, subtopic,
 language, pinecone_vector_id, quality_status, metadata (JSONB)
 
 ### MCQ
-`mcq_documents`: id, display_name, origin_type, file_id, topic, subtopic, custom_instruction,
-processing_status, question_count, created_by, created_at
+`mcq_documents`: id, display_name, origin_type, file_id, chapter (migration `017`), topic, subtopic,
+custom_instruction, processing_status, question_count, created_by, created_at
 `mcq_review_batches`: id, document_id, batch_type, status, total_questions, accepted_count,
 rejected_count, rejection_feedback, job_id, created_by, created_at
 `mcq_questions`: id, source_document_id, review_batch_id, origin_type, question_text, options (JSONB),
@@ -863,8 +1147,9 @@ correct_option_ids (JSONB), explanation, chapter, topic, subtopic, complexity, s
 per-question feedback lives on `mcq_questions.review_feedback` — see §9.3)
 
 ### MCQ Tests
-`mcq_test_blueprints`: id, test_name, total_time_minutes, num_sets, topic_distribution (JSONB),
-difficulty_distribution (JSONB), custom_instruction, status, job_id, created_by, created_at
+`mcq_test_blueprints`: id, test_name, total_time_minutes, num_sets, topic_distribution (JSONB;
+entries `{chapter, topic|null, subtopic|null, count}` — chapter required/primary), difficulty_distribution
+(JSONB), custom_instruction, status, job_id, created_by, created_at
 `mcq_test_sets`: id, blueprint_id, set_name, num_questions, difficulty_mix (JSONB), status
 (draft|active|archived), created_at
 `mcq_test_set_questions`: id, set_id, question_id, question_order
@@ -874,10 +1159,12 @@ correct_count, time_taken_seconds, status
 
 ### Subjective
 `subjective_tests`: id, display_name, total_time_minutes, num_questions, total_marks,
-question_paper_file_id, model_answer_file_id, sample_marked_file_id, rubric_file_id (optional; default
+question_paper_file_id, model_answer_file_id, model_answer_is_handwritten (migration `018`; handwritten
+→ Gemini vision, else gpt-5 typed vision), sample_marked_file_id, rubric_file_id (optional; default
 rubric when null), custom_instruction, status, skill_generation_status, skill_generation_job_id,
 created_by, created_at
-`subjective_questions`: id, test_id, question_number, question_text, marks, question_order, topic,
+`subjective_questions`: id, test_id, question_number, question_text, marks, question_order, chapter
+(migration `018`; PRIMARY retrieval dimension, from the topic router), topic,
 subtopic (migration `013`; detected per question)
 `question_specific_checking_skills`: id, test_id, question_id, skill_json (JSONB; rich examiner guide),
 version, is_active, evaluation_status, evaluation_notes, iterations (migration `013`), created_at
@@ -894,8 +1181,19 @@ total_marks_awarded, total_marks_possible, overall_confidence, model_used, creat
 vision-locator + geometry-validation audit, migration `013`), checked_file_id, annotation_status,
 created_at
 
+### Chatbots (migration `014_chatbots`)
+`subjective_feedback_chats`: id, sheet_id (FK student_answer_sheets CASCADE), student_id (FK users
+CASCADE), status (open|closed), created_at, updated_at  (explains a checked sheet; never re-grades — §12.1)
+`subjective_feedback_messages`: id, chat_id (FK subjective_feedback_chats CASCADE), role
+(student|assistant), content, created_at
+`tutor_chat_sessions`: id, student_id (FK users CASCADE), created_at, updated_at  (standalone AI Tutor — §13.1)
+`tutor_chat_messages`: id, session_id (FK tutor_chat_sessions CASCADE), student_id (FK users), question,
+answer, language, related_mode, detected_topic, detected_subtopic_ids (JSONB), query_rewrite,
+supporting_knowledge_json (JSONB), confidence, follow_up_suggestions (JSONB), created_at
+
 ### Video (migration `011_video`; segment/chunk times in seconds)
-`videos`: id, display_name, content_usage_type (objective|subjective), topic, subtopic,
+`videos`: id, display_name, exam_id (FK exams), chapter (migration `018`; PRIMARY retrieval dimension,
+set at upload), topic, subtopic,
 custom_instruction, file_id, audio_file_id, support_slides_file_id, processing_status,
 duration_seconds, is_audio_only, status (draft|active|archived), processing_job_id, created_by, created_at
 `video_audio_chunks`: id, video_id, chunk_index, start_seconds, end_seconds, audio_file_id, status,
@@ -903,7 +1201,8 @@ raw_transcript, model_used, error_message, created_at
 `video_transcripts`: id, video_id, raw_merged_transcript, cleaned_transcript, language,
 model_used_for_cleaning, segments (JSONB), created_at
 `video_timeline_segments`: id, video_id, segment_index, start_seconds, end_seconds, label, description,
-summary, original_transcript, topic, subtopic_ids (JSONB), mapping_confidence, created_at
+summary, original_transcript, chapter (migration `018`; inherited from the video), topic,
+subtopic_ids (JSONB), mapping_confidence, created_at
 `video_summaries`: id, video_id, short_summary, detailed_summary, key_points (JSONB),
 exam_focused_points (JSONB), important_terms (JSONB), possible_questions (JSONB), created_at
 `video_support_slides`: id, video_id, file_id, slide_count, created_at
@@ -924,6 +1223,20 @@ activated_at, change_summary  (migration `008`)
 draft_version_id (FK agent_skill_versions, SET NULL), created_by, created_at  (migration `012`)
 `skill_update_messages`: id, chat_id (FK skill_update_chats, CASCADE), role (admin|assistant),
 content, created_at  (migration `012`)
+
+### Personalization (migration `016`; all GLOBAL per student — §14A)
+`student_profiles`: id, student_id (FK users CASCADE, unique), intro_text, created_at, updated_at
+`student_activity_logs`: id, student_id, activity_type (mcq_test|subjective_test), entity_type,
+entity_id, exam_id, activity_date, raw_context (JSONB; current-day only), distilled (bool), summary,
+created_at
+`student_daily_summaries`: id, student_id (unique), summary_text, summary_date, qa_since_update,
+created_at, updated_at  (ONE rolling daily summary/student)
+`student_weekly_summaries`: id, student_id, week_start, summary_text, key_questions (JSONB), created_at,
+unique(student_id, week_start)
+`chat_session_summaries`: id, student_id, session_kind (tutor|video|subjective_feedback), session_id,
+summary_text, created_at, updated_at, unique(session_kind, session_id)
+`extended_subjective_summaries`: id, student_id (unique), summary_text, mistake_kinds (JSONB),
+created_at, updated_at
 
 ---
 
@@ -958,8 +1271,12 @@ POST   /api/student/mcq-tests/{id}/submit
 POST   /api/admin/subjective/tests        GET    /api/admin/subjective/tests
 POST   /api/student/subjective/tests/{id}/upload-answer
 GET    /api/student/subjective/tests/{id}/result
+GET    /api/student/subjective/sheets/{sheet_id}/feedback-chat
+POST   /api/student/subjective/sheets/{sheet_id}/feedback-chat/start
+POST   /api/student/subjective/sheets/{sheet_id}/feedback-chat/{chat_id}/message
 POST   /api/admin/videos                  GET    /api/student/videos
 POST   /api/student/videos/{id}/ask
+POST   /api/student/tutor/ask             GET    /api/student/tutor/history
 POST   /api/admin/skills/chat/start
 POST   /api/admin/skills/chat/{id}/message
 POST   /api/admin/skills/chat/{id}/approve
@@ -992,10 +1309,13 @@ class AIModelProvider:
     async def transcribe(self, audio_bytes, mime_type, **audit_ctx) -> dict: ...
 ```
 
-All agents call this via `get_provider(task_type)`. `get_provider("vision")` returns the **Gemini**
-provider (`ai/providers/gemini.py`, vision-only: `generate_with_image` + `generate_with_images` for
-the multi-page structure pass; text/embed/transcribe raise); every other task type returns the
-**Azure OpenAI** provider. Never call a vendor SDK directly from agent code.
+All agents call this via `get_provider(task_type)`, which selects provider AND Azure deployment tier
+(see §4): `"reasoning"`→gpt-5.5, `"text_extraction"`/`"vision_typed"`→gpt-5, `"chunking"`→gpt-5-mini,
+`"vision"`/`"vision_handwritten"`→Gemini. `get_provider("vision")` returns the **Gemini** provider
+(`ai/providers/gemini.py`, vision-only: `generate_with_image` + `generate_with_images` for the
+multi-page structure pass; text/embed/transcribe raise); the Azure tiers return an
+**`AzureOpenAIProvider(model, api_version)`** instance (one client cached per api-version). Never call a
+vendor SDK directly from agent code.
 
 Each provider logs every call to `ai_requests` (`provider` azure_openai|gemini, token counts, latency,
 status) so admin debug endpoints surface Gemini and Azure alike.
@@ -1017,7 +1337,7 @@ the model to emit GitHub-flavored markdown (bold key terms, `##` sub-headings, b
 `explanation` (generation/regeneration only — **extraction stays verbatim/plain**). JSON keys/structure
 are unchanged. Fields that must stay PLAIN TEXT are explicitly excluded in the prompts: annotation
 `comment_text` (≤~8 words, drives PDF margin geometry), `target_text`, `evidence_text`,
-`missing_points`, `section`, and all list-item/term/question fields.
+`missing_points`, `section`, the per-section `note`, and all list-item/term/question fields.
 
 ---
 
@@ -1036,8 +1356,13 @@ Canonical list. Names match exactly what `backend/app/core/config.py` reads via 
 Celery queue names + routing live in `workers/celery_config.py` (not env vars).
 
 ```env
-# ── Database (Neon — asyncpg driver required) ──────────────────────────────
+# ── Database (Azure Postgres — asyncpg driver required) ────────────────────
+# Either set DATABASE_URL directly, or provide the discrete PG* parts (config.py
+# assembles the asyncpg URL with ssl=require). Pool sizing is right-sized per process:
 DATABASE_URL=postgresql+asyncpg://<user>:<pass>@<host>/<db>?ssl=require
+# PGHOST=<server>.postgres.database.azure.com   PGUSER=...   PGPASSWORD=...   PGDATABASE=...
+DB_POOL_SIZE=5
+DB_MAX_OVERFLOW=10
 
 # ── Auth ───────────────────────────────────────────────────────────────────
 JWT_SECRET=<generate: python -c "import secrets; print(secrets.token_hex(32))">
@@ -1066,13 +1391,17 @@ PINECONE_INDEX_HOST=https://kritipur-valley-demo-index-<id>.svc.<env>.pinecone.i
 PINECONE_ENVIRONMENT=<pinecone_environment>
 EMBEDDING_DIMENSIONS=3072
 
-# ── Azure OpenAI (default: reasoning, embeddings, transcription) ───────────
+# ── Azure OpenAI (default: reasoning, embeddings, transcription; tiers: thinking, fast) ──
 AZURE_OPENAI_ENDPOINT=https://<resource-name>.openai.azure.com/
 AZURE_OPENAI_API_KEY=<azure_openai_api_key>
 AZURE_OPENAI_API_VERSION_REASONING=2026-04-24
 AZURE_OPENAI_API_VERSION_EMBEDDING=2025-01-01-preview
 AZURE_OPENAI_API_VERSION_TRANSCRIPTION=2025-03-01-preview
-MODEL_REASONING=gpt-5.5
+AZURE_OPENAI_API_VERSION_THINKING=2025-01-01-preview   # api-version for the gpt-5 (thinking) deployment
+AZURE_OPENAI_API_VERSION_FAST=2025-01-01-preview        # api-version for the gpt-5-mini (fast) deployment
+MODEL_REASONING=gpt-5.5         # reasoning tier (default)
+MODEL_CHAT_THINKING=gpt-5       # typed text/vision extraction tier
+MODEL_CHAT_FAST=gpt-5-mini      # semantic-chunking tier
 MODEL_EMBEDDING=text-embedding-3-large
 MODEL_TRANSCRIPTION=gpt-4o-transcribe
 
@@ -1133,7 +1462,14 @@ Phase 12: Hardening (error handling, security, logging, deployment)
 - Add batch/group system for students
 - Allow students to generate MCQ tests
 - Allow MCQ retakes or negative marking
-- Add subjective follow-up chat
+- Re-check / re-grade a subjective answer sheet in the feedback chatbot, or let it invent new marks
+  (it ONLY explains the already-completed evaluation; "what if I added X" is qualitative guidance only)
+- Let the AI Tutor or its Topic Selector answer outside the selected exam's syllabus, or return a
+  topic/subtopic that isn't in that exam's live syllabus tree
+- Dump all of a student's activity into the tutor every turn — attach a specific past activity ONLY
+  when the topic selector flags `target_activity_id`
+- Let any personalization update break a core flow, or invent facts about the student beyond the
+  stored summaries (personalization is best-effort + grounded)
 - Require admin approval for internal question-paper-specific checking skills
 - Upload lecture slides or marking rubrics from Knowledge Layer
 - Use notes to generate explanations for original uploaded MCQs
@@ -1201,6 +1537,12 @@ abstraction maintained so another provider can be added later.
 # Worker + beat in one process (no -Q: consumes all queues declared in
 # workers/celery_config.py automatically). --pool=solo on Windows.
 celery -A workers.celery_app.celery_app worker -B -l info --pool=solo
+
+# LINUX / PROD: use the prefork pool with concurrency ≥ 2 so the queues aren't
+# serialized behind one long task (spec §7 #4). `workers/runtime.py` is prefork-safe
+# (one persistent loop per process). Size DB_POOL_SIZE/DB_MAX_OVERFLOW (and Azure PG
+# max_connections) for API + worker×concurrency + beat.
+#   celery -A workers.celery_app.celery_app worker -B -l info --pool=prefork --concurrency=2
 
 # Or run beat separately:
 celery -A workers.celery_app.celery_app worker -l info --pool=solo

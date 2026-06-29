@@ -4,6 +4,7 @@ import type { MCQOption, PagedResult } from "./mcq";
 // ── Blueprints ────────────────────────────────────────────────────────────────
 
 export interface TopicDistEntry {
+  chapter: string;
   topic?: string | null;
   subtopic?: string | null;
   count: number;
@@ -35,6 +36,7 @@ export interface Blueprint {
 }
 
 export interface ShortageEntry {
+  chapter?: string | null;
   topic: string | null;
   subtopic: string | null;
   complexity: string | null;
@@ -44,6 +46,7 @@ export interface ShortageEntry {
 }
 
 export interface BlueprintCreatePayload {
+  exam_id: string;
   test_name: string;
   total_time_minutes: number;
   num_sets: number;

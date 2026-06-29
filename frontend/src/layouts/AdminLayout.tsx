@@ -1,6 +1,7 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import {
   LayoutDashboard,
+  GraduationCap,
   ListTree,
   BookOpen,
   HelpCircle,
@@ -14,9 +15,11 @@ import {
   LogOut,
 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
+import { useExam } from "../context/ExamContext";
 
 const NAV_ITEMS = [
   { to: "/admin/dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { to: "/admin/exams", label: "Exams", icon: GraduationCap },
   { to: "/admin/syllabus", label: "Syllabus", icon: ListTree },
   { to: "/admin/knowledge", label: "Knowledge", icon: BookOpen },
   { to: "/admin/mcq", label: "MCQ System", icon: HelpCircle },
@@ -31,6 +34,7 @@ const NAV_ITEMS = [
 
 export function AdminLayout() {
   const { user, logout } = useAuth();
+  const { exams, selectedExamId, setSelectedExamId } = useExam();
   const navigate = useNavigate();
 
   const handleLogout = () => {
@@ -119,9 +123,28 @@ export function AdminLayout() {
           <div className="text-sm font-medium text-gray-600">
             Welcome back, <span className="font-semibold text-gray-900">{user?.full_name}</span>
           </div>
-          <span className="rounded-full bg-brand-50 px-3 py-1 text-xs font-semibold text-brand-700 ring-1 ring-brand-100">
-            Institute Admin
-          </span>
+          <div className="flex items-center gap-3">
+            {/* Active exam — the universal scope for every admin workspace. */}
+            <div className="flex items-center gap-2">
+              <GraduationCap className="h-4 w-4 text-gray-400" />
+              <select
+                value={selectedExamId ?? ""}
+                onChange={(e) => setSelectedExamId(e.target.value)}
+                className="cursor-pointer rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-xs font-medium text-gray-700 focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-100"
+                title="Active exam"
+              >
+                {exams.length === 0 && <option value="">No exams — create one</option>}
+                {exams.map((e) => (
+                  <option key={e.id} value={e.id}>
+                    {e.name} ({e.exam_type})
+                  </option>
+                ))}
+              </select>
+            </div>
+            <span className="rounded-full bg-brand-50 px-3 py-1 text-xs font-semibold text-brand-700 ring-1 ring-brand-100">
+              Institute Admin
+            </span>
+          </div>
         </header>
 
         <main className="flex-1 overflow-y-auto p-6 scrollbar-thin">

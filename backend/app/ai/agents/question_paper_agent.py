@@ -54,7 +54,7 @@ Return ONLY valid JSON in exactly this structure:
 class QuestionPaperAgent:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.provider = get_provider("reasoning")
+        self.provider = get_provider("thinking")
 
     async def extract(self, *, paper_text: str, custom_instruction: str | None, test_id: uuid.UUID) -> list[dict]:
         skill = await self._get_skill()

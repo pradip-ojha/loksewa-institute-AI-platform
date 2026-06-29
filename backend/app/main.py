@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
 from app.modules.auth.router import router as auth_router
 from app.modules.users.router import router as users_router
+from app.modules.exams.router import router as exams_router
 from app.modules.syllabus.router import router as syllabus_router
 from app.modules.files.router import router as files_router
 from app.modules.jobs.router import router as jobs_router
@@ -16,6 +17,7 @@ from app.modules.mcq.router import router as mcq_router
 from app.modules.mcq_tests.router import router as mcq_tests_router
 from app.modules.subjective.router import router as subjective_router
 from app.modules.video.router import router as video_router
+from app.modules.tutor.router import router as tutor_router
 from app.modules.skill_layer.router import router as skill_router
 from app.modules.dashboard.router import router as dashboard_router
 from app.modules.analytics.router import router as analytics_router
@@ -75,6 +77,7 @@ register_exception_handlers(app)
 
 app.include_router(auth_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
+app.include_router(exams_router, prefix="/api")
 app.include_router(syllabus_router, prefix="/api")
 app.include_router(files_router, prefix="/api")
 app.include_router(jobs_router, prefix="/api")
@@ -83,6 +86,7 @@ app.include_router(mcq_router, prefix="/api")
 app.include_router(mcq_tests_router, prefix="/api")
 app.include_router(subjective_router, prefix="/api")
 app.include_router(video_router, prefix="/api")
+app.include_router(tutor_router, prefix="/api")
 app.include_router(skill_router, prefix="/api")
 app.include_router(dashboard_router, prefix="/api")
 app.include_router(analytics_router, prefix="/api")

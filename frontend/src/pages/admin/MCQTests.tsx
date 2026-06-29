@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { JobStatusPoller } from "../../components/JobStatusPoller";
 import type { JobState } from "../../components/JobStatusPoller";
 import { mcqTestsService } from "../../services/mcqTests";
 import type { Blueprint, TestSet, TestSetPreview, TopicDistEntry } from "../../services/mcqTests";
 import { syllabusService } from "../../services/syllabus";
 import type { ChapterNode } from "../../services/syllabus";
+import { useExam } from "../../context/ExamContext";
 import { getErrorMessage } from "../../utils/error";
 import { MCQAnalyticsView } from "./Analytics";
 
@@ -25,13 +26,13 @@ const BP_STATUS_BADGE: Record<string, string> = {
 // ── Create Blueprint Tab ──────────────────────────────────────────────────────
 
 function CreateBlueprintTab({ chapters, onGenerated }: { chapters: ChapterNode[]; onGenerated: () => void }) {
-  const allTopics = useMemo(() => chapters.flatMap((c) => c.topics), [chapters]);
+  const { selectedExamId } = useExam();
 
   const [testName, setTestName] = useState("");
   const [totalTime, setTotalTime] = useState("60");
   const [numSets, setNumSets] = useState("1");
   const [customInstruction, setCustomInstruction] = useState("");
-  const [rows, setRows] = useState<TopicDistEntry[]>([{ topic: "", subtopic: "", count: 5 }]);
+  const [rows, setRows] = useState<TopicDistEntry[]>([{ chapter: "", topic: "", subtopic: "", count: 5 }]);
   const [useDifficulty, setUseDifficulty] = useState(false);
   const [difficulty, setDifficulty] = useState({ easy: 0, medium: 0, hard: 0 });
 
@@ -46,7 +47,7 @@ function CreateBlueprintTab({ chapters, onGenerated }: { chapters: ChapterNode[]
     setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
   }
   function addRow() {
-    setRows((prev) => [...prev, { topic: "", subtopic: "", count: 5 }]);
+    setRows((prev) => [...prev, { chapter: "", topic: "", subtopic: "", count: 5 }]);
   }
   function removeRow(i: number) {
     setRows((prev) => prev.filter((_, idx) => idx !== i));
@@ -56,17 +57,21 @@ function CreateBlueprintTab({ chapters, onGenerated }: { chapters: ChapterNode[]
     e.preventDefault();
     setError("");
     if (!testName.trim()) return setError("Test name is required.");
-    if (rows.length === 0 || perSetTotal === 0) return setError("Add at least one topic row with a question count.");
+    if (!selectedExamId) return setError("Select an exam in the top bar first.");
+    if (rows.length === 0 || perSetTotal === 0) return setError("Add at least one chapter row with a question count.");
+    if (rows.some((r) => !r.chapter)) return setError("Every distribution row needs a chapter.");
     if (useDifficulty && diffTotal > perSetTotal)
       return setError("Difficulty totals cannot exceed total questions per set.");
 
     setLoading(true);
     try {
       const job = await mcqTestsService.createBlueprint({
+        exam_id: selectedExamId,
         test_name: testName.trim(),
         total_time_minutes: Number(totalTime),
         num_sets: Number(numSets),
         topic_distribution: rows.map((r) => ({
+          chapter: r.chapter,
           topic: r.topic || null,
           subtopic: r.subtopic || null,
           count: Number(r.count),
@@ -107,18 +112,25 @@ function CreateBlueprintTab({ chapters, onGenerated }: { chapters: ChapterNode[]
         <div className="flex items-end text-sm text-gray-500">{perSetTotal} questions / set</div>
       </div>
 
-      {/* Topic / subtopic distribution */}
+      {/* Chapter (primary) / topic / subtopic distribution */}
       <div>
-        <label className="mb-2 block text-sm font-medium text-gray-700">Topic / Subtopic Distribution *</label>
+        <label className="mb-2 block text-sm font-medium text-gray-700">Chapter Distribution * <span className="font-normal text-gray-400">(topic/subtopic optional within a chapter)</span></label>
         <div className="space-y-2">
           {rows.map((row, i) => {
-            const subtopics = allTopics.find((t) => t.topic === row.topic)?.subtopics ?? [];
+            const chapterTopics = chapters.find((c) => c.chapter === row.chapter)?.topics ?? [];
+            const subtopics = chapterTopics.find((t) => t.topic === row.topic)?.subtopics ?? [];
             return (
-              <div key={i} className="grid grid-cols-[1fr_1fr_90px_auto] gap-2">
+              <div key={i} className="grid grid-cols-[1fr_1fr_1fr_80px_auto] gap-2">
+                <select aria-label="Chapter" className="rounded-lg border border-gray-300 px-2 py-2 text-sm bg-white"
+                  value={row.chapter ?? ""} onChange={(e) => updateRow(i, { chapter: e.target.value, topic: "", subtopic: "" })}>
+                  <option value="">Select chapter</option>
+                  {chapters.map((c) => <option key={c.chapter} value={c.chapter}>{c.chapter}</option>)}
+                </select>
                 <select aria-label="Topic" className="rounded-lg border border-gray-300 px-2 py-2 text-sm bg-white"
-                  value={row.topic ?? ""} onChange={(e) => updateRow(i, { topic: e.target.value, subtopic: "" })}>
+                  value={row.topic ?? ""} onChange={(e) => updateRow(i, { topic: e.target.value, subtopic: "" })}
+                  disabled={!row.chapter}>
                   <option value="">Any topic</option>
-                  {allTopics.map((t) => <option key={t.topic} value={t.topic}>{t.topic}</option>)}
+                  {chapterTopics.map((t) => <option key={t.topic} value={t.topic}>{t.topic}</option>)}
                 </select>
                 <select aria-label="Subtopic" className="rounded-lg border border-gray-300 px-2 py-2 text-sm bg-white"
                   value={row.subtopic ?? ""} onChange={(e) => updateRow(i, { subtopic: e.target.value })}
@@ -135,7 +147,7 @@ function CreateBlueprintTab({ chapters, onGenerated }: { chapters: ChapterNode[]
           })}
         </div>
         <button type="button" onClick={addRow} className="mt-2 text-sm font-medium text-brand-600 hover:text-brand-700">
-          + Add topic row
+          + Add chapter row
         </button>
       </div>
 
@@ -206,14 +218,15 @@ function BlueprintList({ blueprints, onRegenerate }: { blueprints: Blueprint[]; 
               <table className="mt-2 w-full text-xs text-red-800">
                 <thead>
                   <tr className="text-left text-red-500">
-                    <th className="py-1 pr-2">Topic</th><th className="pr-2">Subtopic</th><th className="pr-2">Difficulty</th>
+                    <th className="py-1 pr-2">Chapter</th><th className="pr-2">Topic</th><th className="pr-2">Subtopic</th><th className="pr-2">Difficulty</th>
                     <th className="pr-2">Need</th><th className="pr-2">Have</th><th>Short</th>
                   </tr>
                 </thead>
                 <tbody>
                   {bp.generation_result.shortages.map((s, i) => (
                     <tr key={i}>
-                      <td className="py-0.5 pr-2">{s.topic ?? "Any"}</td>
+                      <td className="py-0.5 pr-2">{s.chapter ?? "Any"}</td>
+                      <td className="pr-2">{s.topic ?? "Any"}</td>
                       <td className="pr-2">{s.subtopic ?? "Any"}</td>
                       <td className="pr-2 capitalize">{s.complexity ?? "Any"}</td>
                       <td className="pr-2">{s.required}</td>
@@ -326,6 +339,7 @@ function PreviewModal({ preview, onClose }: { preview: TestSetPreview; onClose: 
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export function AdminMCQTests() {
+  const { selectedExamId } = useExam();
   const [tab, setTab] = useState<Tab>("create");
   const [chapters, setChapters] = useState<ChapterNode[]>([]);
   const [blueprints, setBlueprints] = useState<Blueprint[]>([]);
@@ -334,8 +348,9 @@ export function AdminMCQTests() {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    syllabusService.getObjective().then((t) => setChapters(t.chapters)).catch(() => setChapters([]));
-  }, []);
+    if (!selectedExamId) { setChapters([]); return; }
+    syllabusService.get(selectedExamId).then((t) => setChapters(t.chapters)).catch(() => setChapters([]));
+  }, [selectedExamId]);
 
   const refreshBlueprints = useCallback(async () => {
     try {

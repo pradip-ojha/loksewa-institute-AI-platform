@@ -30,6 +30,7 @@ export interface MCQDocument {
   display_name: string;
   origin_type: string;
   file_id: string | null;
+  chapter: string | null;
   topic: string | null;
   subtopic: string | null;
   processing_status: string;
@@ -124,6 +125,7 @@ export const mcqService = {
   },
 
   async createQuestion(payload: {
+    exam_id: string;
     question_text: string;
     options: MCQOption[];
     correct_option_ids: string[];

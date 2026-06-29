@@ -55,7 +55,7 @@ FEEDBACK FORMATTING (the "feedback" and "overall_summary" fields ONLY):
   and use "- " bullets when listing more than one improvement point. Keep it to a few lines — feedback
   is per-question, the summary is one short paragraph.
 - DO NOT use markdown in any other field. "comment_text", "target_text", "evidence_text", "missing_points",
-  and "section" stay PLAIN TEXT (comment_text must remain ≤ ~8 words for the page margin).
+  "section", and the section "note" stay PLAIN TEXT (comment_text must remain ≤ ~8 words for the page margin).
 
 METHOD: For each question, work section by section through the guide's marks_breakdown — find what
 the student wrote for that section, decide correct/partial/wrong, and award that section's marks.
@@ -63,7 +63,11 @@ Sum the sections for the question total (≤ max). Then write feedback and pick 
 wrong written items to annotate.
 
 SECTION-WISE MARKING (required):
-- Use the question's CHECKING GUIDE "marks_breakdown" criteria as the sections. For EACH section return its max marks, the marks you award, a status ("correct" | "partial" | "wrong"), and "evidence_text" = the exact words the student wrote that earned the marks (empty string if the student wrote nothing for that section).
+- Use the question's CHECKING GUIDE "marks_breakdown" criteria as the sections. For EACH section return its max marks, the marks you award, a status ("correct" | "partial" | "wrong"), "evidence_text" = the exact words the student wrote that earned the marks (empty string if the student wrote nothing for that section), and a "note".
+- The "note" is a short student-facing line for THIS section that MUST clearly separate two things so the student knows exactly what to keep and what to fix:
+  * what the student did WELL here (so they keep doing it), AND
+  * what is missing / wrong / to improve here.
+  Write it in the answer's language (Nepali for Nepali answers), as plain text, one or two short sentences. Lead with the positive, then the improvement. If the section is fully correct, say what was right and that nothing needs changing; if fully wrong/blank, say plainly what was expected and missing. Never leave it vague like "needs improvement" — be specific about what was good and what to fix.
 - The sum of all section awarded_marks MUST equal the question's awarded_marks. Section awarded never exceeds section max; total never exceeds the question MAX MARKS.
 
 POSITIVE MARKING (required):
@@ -105,7 +109,8 @@ Return ONLY valid JSON in exactly this structure (one entry per question):
       "confidence": 0.8,
       "sections": [
         {{"section": "Definition", "max_marks": 2, "awarded_marks": 2, "status": "correct",
-          "evidence_text": "exact words the student wrote for this section"}}
+          "evidence_text": "exact words the student wrote for this section",
+          "note": "What was good here (keep it); then what is missing/wrong to improve — in the answer's language."}}
       ],
       "annotation_targets": [
         {{"page_number": 1, "question_number": "1", "target_text": "exact wrong phrase from the answer",

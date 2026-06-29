@@ -22,6 +22,10 @@ HARD RULES (never violate):
 - Use the lecture summary and selected segment context to disambiguate the question's subject.
 - If unsure of the subtopic, leave subtopics empty; if unsure of the topic, pick the broader
   best-fit topic and lower the confidence.
+- `needs_knowledge`: set true ONLY when the question is deep enough that the lecture transcript +
+  summary alone likely won't fully answer it and supporting book/notes would genuinely help
+  (definitions, deeper theory, exam-style depth, "explain more / give an example beyond the lecture").
+  For simple recall/clarification answerable from the lecture itself, set false.
 
 SYLLABUS TREE (the only allowed values):
 {tree}
@@ -36,13 +40,13 @@ STUDENT QUESTION:
 {question}
 
 Return ONLY valid JSON in exactly this structure:
-{{"topic": "exact topic string or null", "subtopic_ids": ["exact subtopic string", ...], "confidence": 0.0}}"""
+{{"topic": "exact topic string or null", "subtopic_ids": ["exact subtopic string", ...], "needs_knowledge": false, "confidence": 0.0}}"""
 
 
 class VideoTopicRouterAgent:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.provider = get_provider("reasoning")
+        self.provider = get_provider("thinking")
 
     async def route(self, *, question: str, lecture_summary: str, segment_context: str, tree_text: str, video_id: uuid.UUID) -> dict:
         prompt = ROUTER_PROMPT.format(
@@ -68,5 +72,6 @@ class VideoTopicRouterAgent:
         return {
             "topic": result.get("topic") or None,
             "subtopic_ids": [str(s) for s in subs] if isinstance(subs, list) else [],
+            "needs_knowledge": bool(result.get("needs_knowledge", False)),
             "confidence": float(result.get("confidence", 0) or 0),
         }

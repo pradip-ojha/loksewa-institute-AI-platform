@@ -1,11 +1,10 @@
 import uuid
 from pydantic import BaseModel
-from app.modules.syllabus.models import SyllabusType
 
 
 class SyllabusItemOut(BaseModel):
     id: uuid.UUID
-    syllabus_type: SyllabusType
+    exam_id: uuid.UUID
     chapter: str
     topic: str
     subtopic: str | None
@@ -30,5 +29,5 @@ class ChapterNode(BaseModel):
 
 
 class SyllabusTree(BaseModel):
-    syllabus_type: SyllabusType
+    exam_id: uuid.UUID
     chapters: list[ChapterNode]

@@ -15,9 +15,9 @@ from app.modules.jobs.service import create_job, update_job
 from app.modules.subjective import service as svc
 from app.modules.subjective.models import StudentAnswerSheet, SubjectiveTest
 from app.modules.subjective.schemas import (
-    AnswerResultOut, StudentTestDetailOut, StudentTestListItem,
-    SubjectiveQuestionOut, SubjectiveTestDetailOut, SubjectiveTestOut,
-    SubmissionOut, TestListOut,
+    AnswerResultOut, FeedbackChatMessageIn, FeedbackChatOut, FeedbackChatReplyOut,
+    StudentTestDetailOut, StudentTestListItem, SubjectiveQuestionOut,
+    SubjectiveTestDetailOut, SubjectiveTestOut, SubmissionOut, TestListOut,
 )
 from app.modules.users.models import User
 
@@ -35,9 +35,11 @@ async def _job_out(db: AsyncSession, job_id: uuid.UUID) -> JobOut:
 @router.post("/admin/subjective/tests", response_model=JobOut, status_code=201)
 async def create_test(
     display_name: str = Form(...),
+    exam_id: uuid.UUID = Form(...),
     total_time_minutes: int = Form(60),
     total_marks: int = Form(0),
     custom_instruction: str | None = Form(None),
+    model_answer_is_handwritten: bool = Form(False),
     question_paper: UploadFile = File(...),
     model_answer: UploadFile | None = File(None),
     sample_marked: UploadFile | None = File(None),
@@ -48,6 +50,8 @@ async def create_test(
     """Create + configure a subjective test. Stores the supplied files, then runs
     a background job that extracts the questions/marks from the paper and
     generates the internal per-question checking guides."""
+    from app.modules.exams.service import get_exam_or_404
+    await get_exam_or_404(db, exam_id)
     paper = await store_upload(
         question_paper, context="subjective-tests",
         display_name=f"{display_name} — Question Paper",
@@ -74,11 +78,13 @@ async def create_test(
 
     test = SubjectiveTest(
         display_name=display_name,
+        exam_id=exam_id,
         total_time_minutes=total_time_minutes,
         total_marks=total_marks,
         custom_instruction=custom_instruction,
         question_paper_file_id=paper.id,
         model_answer_file_id=model_file.id if model_file else None,
+        model_answer_is_handwritten=model_answer_is_handwritten,
         sample_marked_file_id=sample_file.id if sample_file else None,
         rubric_file_id=rubric_file.id if rubric_file else None,
         status="draft",
@@ -377,3 +383,38 @@ async def student_result(
         raise AppException(404, "no_submission", "You have not submitted an answer sheet for this test.")
     result = await svc.build_student_result(db, sheet)
     return AnswerResultOut(**result)
+
+
+# ── Student: answer-sheet feedback chatbot ───────────────────────────────────────
+
+@router.get("/student/subjective/sheets/{sheet_id}/feedback-chat", response_model=FeedbackChatOut)
+async def feedback_chat_history(
+    sheet_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_student),
+):
+    return FeedbackChatOut(**await svc.get_feedback_chat(db, sheet_id, current_user.id))
+
+
+@router.post("/student/subjective/sheets/{sheet_id}/feedback-chat/start", response_model=FeedbackChatOut, status_code=201)
+async def feedback_chat_start(
+    sheet_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_student),
+):
+    return FeedbackChatOut(**await svc.start_feedback_chat(db, sheet_id, current_user.id))
+
+
+@router.post("/student/subjective/sheets/{sheet_id}/feedback-chat/{chat_id}/message", response_model=FeedbackChatReplyOut)
+async def feedback_chat_message(
+    sheet_id: uuid.UUID,
+    chat_id: uuid.UUID,
+    body: FeedbackChatMessageIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_student),
+):
+    question = (body.message or "").strip()
+    if not question:
+        raise AppException(422, "empty_question", "Question cannot be empty.")
+    result = await svc.post_feedback_question(db, sheet_id, chat_id, question, current_user.id)
+    return FeedbackChatReplyOut(**result)

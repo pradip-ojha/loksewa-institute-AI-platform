@@ -74,6 +74,11 @@ _DEFAULT_SKILLS: dict[str, str] = {
         "Bias hard toward precision: a missing mark is far better than a misplaced one on a student's "
         "sheet. Keep comment boxes clear of the handwriting."
     ),
+    "AnswerFeedbackChatAgent": (
+        "Be warm and specific: name one thing the student did well before what to improve, and tie "
+        "every point to their actual sections and marks. For 'what if I added this?' give honest "
+        "qualitative guidance, never a promised new mark. Keep replies short and encouraging."
+    ),
     # ── Video Tutor agents ───────────────────────────────────────────────────
     "VideoTranscriptCleanerAgent": (
         "Lean toward under-editing: when unsure whether a phrase is filler or content, keep it. Never "
@@ -107,6 +112,33 @@ _DEFAULT_SKILLS: dict[str, str] = {
         "Be a warm, concise tutor: lead with the lecture's own explanation in the student's language, "
         "add note context only when it helps, and close with a short nudge to keep learning. Never invent "
         "what the teacher did not say."
+    ),
+    # ── Standalone AI Tutor agents ───────────────────────────────────────────
+    "TutorTopicSelectorAgent": (
+        "Route by the core concept the question is about, not surface keywords. Never stretch to a "
+        "topic outside the two demo chapters — prefer 'shared' with low confidence over a forced match, "
+        "and leave subtopics empty when unsure."
+    ),
+    "TutorAgent": (
+        "Be a warm, concise tutor grounded in the retrieved notes; lead with a direct answer and a "
+        "short example, and end with a small nudge to keep learning. If the demo notes don't cover it, "
+        "say so honestly rather than inventing content beyond the demo chapters."
+    ),
+    # ── Personalization summarizers ──────────────────────────────────────────
+    "DailySummaryAgent": (
+        "Keep the rolling daily summary tight and specific — name the topics practiced, the mistake "
+        "patterns, and the gist of what was asked; drop trivia. Never invent beyond the given events."
+    ),
+    "WeeklySummaryAgent": (
+        "Emphasize progress and recurring weak areas over raw scores; make the refreshed intro a crisp, "
+        "useful 1–3 sentence picture of the student's level and study style. Base everything on the data."
+    ),
+    "ChatSessionSummaryAgent": (
+        "Capture what the student wanted, where they struggled, and what to revisit — concise, not a transcript."
+    ),
+    "ExtendedSubjectiveSummaryAgent": (
+        "Focus on the KINDS of subjective-answer mistakes that recur (structure, examples, formula steps, "
+        "conclusions) so a tutor can give concrete improvement guidance. Never invent."
     ),
     # ── Skill Layer ──────────────────────────────────────────────────────────
     "SkillBuilderAgent": (

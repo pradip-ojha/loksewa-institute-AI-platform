@@ -52,11 +52,12 @@ def _split_by_difficulty(count: int, diff: dict | None) -> list[tuple[str | None
 
 
 def _build_buckets(blueprint: MCQTestBlueprint) -> list[dict]:
-    """Flatten the blueprint into leaf buckets: one (topic, subtopic, complexity)
-    requirement with a per-set count."""
+    """Flatten the blueprint into leaf buckets: one (chapter, topic, subtopic, complexity)
+    requirement with a per-set count. Chapter is the primary dimension."""
     buckets: list[dict] = []
     diff = blueprint.difficulty_distribution
     for entry in blueprint.topic_distribution or []:
+        chapter = entry.get("chapter") or None
         topic = entry.get("topic") or None
         subtopic = entry.get("subtopic") or None
         count = int(entry.get("count") or 0)
@@ -64,14 +65,19 @@ def _build_buckets(blueprint: MCQTestBlueprint) -> list[dict]:
             continue
         for complexity, n in _split_by_difficulty(count, diff):
             buckets.append({
-                "topic": topic, "subtopic": subtopic,
+                "chapter": chapter, "topic": topic, "subtopic": subtopic,
                 "complexity": complexity, "per_set": n,
             })
     return buckets
 
 
-async def _approved_ids(db: AsyncSession, bucket: dict, exclude: set[uuid.UUID]) -> list[uuid.UUID]:
-    q = select(MCQQuestion.id).where(MCQQuestion.status == "approved")
+async def _approved_ids(db: AsyncSession, bucket: dict, exclude: set[uuid.UUID], exam_id) -> list[uuid.UUID]:
+    q = select(MCQQuestion.id).where(
+        MCQQuestion.status == "approved",
+        MCQQuestion.exam_id == exam_id,
+    )
+    if bucket.get("chapter"):
+        q = q.where(MCQQuestion.chapter == bucket["chapter"])
     if bucket["topic"]:
         q = q.where(MCQQuestion.topic == bucket["topic"])
     if bucket["subtopic"]:
@@ -109,13 +115,14 @@ async def generate_sets(db: AsyncSession, blueprint: MCQTestBlueprint) -> dict:
     for bucket in buckets:
         per_set = bucket["per_set"]
         required_total = per_set * num_sets
-        ids = await _approved_ids(db, bucket, used)
+        ids = await _approved_ids(db, bucket, used, blueprint.exam_id)
         take = ids[:required_total]
         # Reserve whatever is available so later buckets don't double-count it,
         # keeping the shortage report internally consistent.
         used.update(take)
         if len(ids) < required_total:
             shortages.append({
+                "chapter": bucket.get("chapter"),
                 "topic": bucket["topic"],
                 "subtopic": bucket["subtopic"],
                 "complexity": bucket["complexity"],
@@ -149,6 +156,7 @@ async def generate_sets(db: AsyncSession, blueprint: MCQTestBlueprint) -> dict:
         mix: dict[str, int] = {}
         test_set = MCQTestSet(
             blueprint_id=blueprint.id,
+            exam_id=blueprint.exam_id,
             set_name=f"{blueprint.test_name} — Set {set_index + 1}",
             num_questions=len(entries),
             status="draft",
@@ -245,9 +253,12 @@ async def list_student_tests(db: AsyncSession, student_id: uuid.UUID):
     )
     attempts = {a.set_id: a for a in att_r.scalars().all()}
 
-    # Active sets + the sets this student has attempts on.
+    # Active sets within the student's ENROLLED exams, PLUS the sets this student
+    # already has an attempt on (so an in-progress attempt stays visible).
+    from app.modules.exams.service import get_enrolled_exam_ids
+    enrolled = await get_enrolled_exam_ids(db, student_id)
     set_ids = set(attempts.keys())
-    cond = MCQTestSet.status == "active"
+    cond = (MCQTestSet.status == "active") & MCQTestSet.exam_id.in_(enrolled or [uuid.uuid4()])
     if set_ids:
         cond = cond | MCQTestSet.id.in_(set_ids)
     r = await db.execute(
@@ -355,6 +366,47 @@ async def submit_attempt(
     attempt.submitted_at = datetime.now(timezone.utc)
     attempt.status = "submitted"
     await db.commit()
+
+    # ── Personalization (best-effort; never block/break a submit) ────────────────
+    try:
+        await _log_mcq_activity(db, attempt, pairs, selected_map, correct_count)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _log_mcq_activity(db, attempt, pairs, selected_map, correct_count) -> None:
+    """Record the MCQ attempt as a personalization activity + enqueue the daily roll-up."""
+    from app.modules.personalization import service as pers
+    # Per-topic correctness → highlights weak topics for the tutor.
+    topics: dict[str, list[int]] = {}
+    for question, _order in pairs:
+        t = question.topic or "general"
+        ok = _is_correct(selected_map.get(str(question.id)), question.correct_option_ids)
+        bucket = topics.setdefault(t, [0, 0])
+        bucket[0] += 1 if ok else 0
+        bucket[1] += 1
+    weak = [t for t, (c, n) in topics.items() if n and c / n < 0.6]
+    total = len(pairs)
+    test_set = (await db.execute(select(MCQTestSet).where(MCQTestSet.id == attempt.set_id))).scalar_one_or_none()
+    raw = {
+        "score": correct_count, "total": total,
+        "per_topic": {t: {"correct": c, "total": n} for t, (c, n) in topics.items()},
+        "weak_topics": weak,
+    }
+    summary = (f"Objective test '{test_set.set_name if test_set else 'MCQ'}': {correct_count}/{total} correct"
+               + (f"; weak: {', '.join(weak)}" if weak else ""))
+    await pers.log_activity(
+        db, student_id=attempt.student_id, activity_type="mcq_test", entity_id=attempt.id,
+        exam_id=(test_set.exam_id if test_set else None), raw_context=raw, summary_line=summary,
+    )
+    try:
+        from app.core.celery_client import get_celery
+        get_celery().send_task(
+            "workers.tasks.personalization_tasks.pers_update_daily",
+            args=[str(attempt.student_id)], queue="kvi_ai_default",
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def get_attempt(db: AsyncSession, attempt_id: uuid.UUID) -> MCQAttempt | None:

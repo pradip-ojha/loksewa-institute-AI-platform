@@ -74,11 +74,14 @@ class MCQQuestionOut(BaseModel):
 
 
 class MCQQuestionCreate(BaseModel):
+    exam_id: uuid.UUID
     question_text: str
     options: list[MCQOption] = Field(min_length=2, max_length=4)
     correct_option_ids: list[str]
     explanation: str | None = None
-    chapter: str | None = None
+    # Chapter is the PRIMARY syllabus dimension and is required so every question can be
+    # placed in a chapter-scoped test set (CLAUDE.md §9, §10).
+    chapter: str = Field(min_length=1)
     topic: str | None = None
     subtopic: str | None = None
     complexity: Literal["easy", "medium", "hard"] = "medium"
@@ -111,7 +114,9 @@ class MCQDocumentOut(BaseModel):
     id: uuid.UUID
     display_name: str
     origin_type: str
+    exam_id: uuid.UUID
     file_id: uuid.UUID | None
+    chapter: str | None
     topic: str | None
     subtopic: str | None
     processing_status: str

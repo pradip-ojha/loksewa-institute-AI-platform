@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 import uuid
@@ -237,20 +238,31 @@ async def _fetch_knowledge_by_type(
     db: AsyncSession,
     topics: set[str],
     subtopics: set[str],
+    exam_id=None,
+    chapter: str | None = None,
 ) -> str:
     """
-    Fetch up to CHUNKS_PER_TYPE chunks from each knowledge document_type
-    whose topic or subtopic matches the given sets.
+    Fetch up to CHUNKS_PER_TYPE chunks from each knowledge document_type for the
+    given exam, scoped to a CHAPTER first (the primary syllabus dimension) and then
+    narrowed by topic/subtopic when provided.
+
+    Chapter is primary (CLAUDE.md §8/§9): when a chapter is given, only that chapter's
+    chunks are eligible, and topic/subtopic merely narrow within it. When no topic/subtopic
+    is supplied we still return the chapter's chunks (chapter alone is enough to ground
+    generation). With neither chapter nor topics there is nothing to scope to.
     Returns a formatted string with a labeled section per document type.
     """
-    if not topics and not subtopics:
-        return "No matching knowledge content found for this document's topics."
+    if not chapter and not topics and not subtopics:
+        return "No matching knowledge content found for this document's chapter/topics."
 
     from sqlalchemy import select, or_
     from app.modules.knowledge.models import KnowledgeChunk, KnowledgeDocument
 
     topic_filter = KnowledgeChunk.topic.in_(topics) if topics else False
     subtopic_filter = KnowledgeChunk.subtopic.in_(subtopics) if subtopics else False
+    # Topic/subtopic only NARROW within the chapter; with a chapter and no topics we keep
+    # the whole chapter rather than returning nothing.
+    narrow = [or_(topic_filter, subtopic_filter)] if (topics or subtopics) else []
 
     sections: list[str] = []
 
@@ -259,10 +271,11 @@ async def _fetch_knowledge_by_type(
             select(KnowledgeChunk)
             .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
             .where(
-                KnowledgeDocument.content_usage_type == "objective",
+                *( [KnowledgeDocument.exam_id == exam_id] if exam_id is not None else [] ),
+                *( [KnowledgeChunk.chapter == chapter] if chapter else [] ),
                 KnowledgeDocument.processing_status == "completed",
                 KnowledgeDocument.document_type == doc_type,
-                or_(topic_filter, subtopic_filter),
+                *narrow,
             )
             .order_by(KnowledgeChunk.topic, KnowledgeChunk.chunk_index)
             .limit(CHUNKS_PER_TYPE)
@@ -490,7 +503,9 @@ class MCQExtractionAgent:
         self.db = db
         self.job_id = job_id
         self.document = document
-        self.provider = get_provider("reasoning")
+        # Existing MCQ documents are TYPED (printed) → Azure gpt-5 typed text/vision
+        # extraction (spec §6.2), not the gpt-5.5 reasoning tier.
+        self.provider = get_provider("text_extraction")
 
     async def process(self) -> MCQReviewBatch:
         await update_job(self.db, self.job_id, progress=5, step="Downloading source document")
@@ -505,7 +520,7 @@ class MCQExtractionAgent:
         if not file_record:
             raise ValueError("Source file not found")
 
-        file_bytes = get_r2().download_fileobj(file_record.r2_key)
+        file_bytes = await asyncio.to_thread(get_r2().download_fileobj, file_record.r2_key)
 
         await update_job(self.db, self.job_id, progress=20, step="Extracting text from document")
 
@@ -559,11 +574,13 @@ class MCQExtractionAgent:
             self.db.add(MCQQuestion(
                 source_document_id=self.document.id,
                 review_batch_id=batch.id,
+                exam_id=self.document.exam_id,
                 origin_type="uploaded_extracted",
                 question_text=f["question_text"],
                 options=f["options"],
                 correct_option_ids=f["correct_option_ids"],
                 explanation=f["explanation"],
+                chapter=self.document.chapter,
                 topic=f["topic"] or self.document.topic,
                 subtopic=f["subtopic"] or self.document.subtopic,
                 complexity=f["complexity"],
@@ -610,7 +627,7 @@ class MCQGenerationAgent:
         if not file_record:
             raise ValueError("Source file not found")
 
-        file_bytes = get_r2().download_fileobj(file_record.r2_key)
+        file_bytes = await asyncio.to_thread(get_r2().download_fileobj, file_record.r2_key)
 
         await update_job(self.db, self.job_id, progress=20, step="Extracting text from content")
         from app.processing.document_text import extract_text_from_bytes
@@ -684,11 +701,13 @@ class MCQGenerationAgent:
             self.db.add(MCQQuestion(
                 source_document_id=self.document.id,
                 review_batch_id=batch.id,
+                exam_id=self.document.exam_id,
                 origin_type="ai_generated",
                 question_text=f["question_text"],
                 options=f["options"],
                 correct_option_ids=f["correct_option_ids"],
                 explanation=f["explanation"],
+                chapter=self.document.chapter,
                 topic=f["topic"] or self.document.topic,
                 subtopic=f["subtopic"] or self.document.subtopic,
                 complexity=f["complexity"],
@@ -707,16 +726,19 @@ class MCQGenerationAgent:
         return batch
 
     async def _detect_covered_topics(self, document_text: str) -> tuple[list[str], list[str]]:
-        """Identify which objective syllabus topics this document covers."""
+        """Identify which of the exam's syllabus topics this document covers."""
         from sqlalchemy import select
-        from app.modules.syllabus.models import SyllabusItem, SyllabusType
+        from app.modules.syllabus.models import SyllabusItem
 
-        rows = await self.db.execute(
-            select(SyllabusItem).where(
-                SyllabusItem.syllabus_type == SyllabusType.objective,
-                SyllabusItem.is_active == True,
-            )
-        )
+        # CHAPTER IS PRIMARY: restrict candidate topics to the document's chapter so
+        # detection can't drift to topics from other chapters of the same exam.
+        _where = [
+            SyllabusItem.exam_id == self.document.exam_id,
+            SyllabusItem.is_active == True,
+        ]
+        if self.document.chapter:
+            _where.append(SyllabusItem.chapter == self.document.chapter)
+        rows = await self.db.execute(select(SyllabusItem).where(*_where))
         items = rows.scalars().all()
 
         if not items:
@@ -766,24 +788,33 @@ class MCQGenerationAgent:
         covered_topics: list[str],
         covered_subtopics: list[str],
     ) -> str:
-        """Fetch 25 chunks per document type for the detected topics."""
+        """Fetch 25 chunks per document type for the document's chapter, narrowed to the
+        detected topics. Chapter is the primary scope."""
         return await _fetch_knowledge_by_type(
             self.db,
             topics=set(covered_topics),
             subtopics=set(covered_subtopics),
+            exam_id=self.document.exam_id,
+            chapter=self.document.chapter,
         )
 
     async def _get_style_examples(self) -> str:
         from sqlalchemy import select
         result = await self.db.execute(
             select(MCQQuestion)
-            .where(MCQQuestion.status == "approved", MCQQuestion.topic == self.document.topic)
+            .where(
+                MCQQuestion.exam_id == self.document.exam_id,
+                MCQQuestion.status == "approved",
+                MCQQuestion.topic == self.document.topic,
+            )
             .limit(8)
         )
         examples = result.scalars().all()
         if not examples:
             result = await self.db.execute(
-                select(MCQQuestion).where(MCQQuestion.status == "approved").limit(8)
+                select(MCQQuestion)
+                .where(MCQQuestion.exam_id == self.document.exam_id, MCQQuestion.status == "approved")
+                .limit(8)
             )
             examples = result.scalars().all()
 
@@ -877,7 +908,7 @@ class MCQRegenerationAgent:
                     file_r = await self.db.execute(select(File).where(File.id == doc.file_id))
                     file_record = file_r.scalar_one_or_none()
                     if file_record:
-                        file_bytes = get_r2().download_fileobj(file_record.r2_key)
+                        file_bytes = await asyncio.to_thread(get_r2().download_fileobj, file_record.r2_key)
                         document_text = extract_text_from_bytes(file_bytes, file_record.mime_type)[:20000]
 
         await update_job(self.db, self.job_id, progress=35, step="Fetching knowledge enrichment")
@@ -989,7 +1020,13 @@ class MCQRegenerationAgent:
             topics.add(doc_topic)
         if doc_subtopic:
             subtopics.add(doc_subtopic)
-        return await _fetch_knowledge_by_type(self.db, topics=topics, subtopics=subtopics)
+        exam_id = next((q.exam_id for q in rejected_questions if getattr(q, "exam_id", None)), None)
+        # Chapter is primary: all rejected questions in a batch share the source document's
+        # chapter, so scope enrichment to it.
+        chapter = next((q.chapter for q in rejected_questions if getattr(q, "chapter", None)), None)
+        return await _fetch_knowledge_by_type(
+            self.db, topics=topics, subtopics=subtopics, exam_id=exam_id, chapter=chapter,
+        )
 
     async def _get_skill(self) -> str:
         try:

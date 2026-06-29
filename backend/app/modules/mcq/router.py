@@ -66,12 +66,18 @@ class UploadResult(BaseModel):
 async def upload_mcq_document(
     file: UploadFile = FastAPIFile(...),
     display_name: str = Form(...),
+    exam_id: uuid.UUID = Form(...),
+    chapter: str = Form(...),
     topic: str = Form(""),
     subtopic: str = Form(""),
     custom_instruction: str = Form(""),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
+    from app.modules.exams.service import get_exam_or_404
+    await get_exam_or_404(db, exam_id)
+    if not chapter.strip():
+        raise AppException(422, "chapter_required", "Chapter is required.")
     file_record = await store_upload(
         file,
         context="mcq-documents",
@@ -83,7 +89,9 @@ async def upload_mcq_document(
     doc = MCQDocument(
         display_name=display_name,
         origin_type="uploaded_document",
+        exam_id=exam_id,
         file_id=file_record.id,
+        chapter=chapter.strip(),
         topic=topic or None,
         subtopic=subtopic or None,
         custom_instruction=custom_instruction or None,
@@ -117,6 +125,8 @@ async def upload_mcq_document(
 async def generate_mcqs_from_content(
     file: UploadFile = FastAPIFile(...),
     display_name: str = Form(...),
+    exam_id: uuid.UUID = Form(...),
+    chapter: str = Form(...),
     count: int = Form(10),
     topic: str = Form(""),
     subtopic: str = Form(""),
@@ -126,6 +136,10 @@ async def generate_mcqs_from_content(
 ):
     if count < 1 or count > 100:
         raise AppException(422, "invalid_count", "Count must be between 1 and 100.")
+    from app.modules.exams.service import get_exam_or_404
+    await get_exam_or_404(db, exam_id)
+    if not chapter.strip():
+        raise AppException(422, "chapter_required", "Chapter is required.")
 
     file_record = await store_upload(
         file,
@@ -138,7 +152,9 @@ async def generate_mcqs_from_content(
     doc = MCQDocument(
         display_name=display_name,
         origin_type="generation_source",
+        exam_id=exam_id,
         file_id=file_record.id,
+        chapter=chapter.strip(),
         topic=topic or None,
         subtopic=subtopic or None,
         custom_instruction=custom_instruction or None,
@@ -379,9 +395,12 @@ async def create_question(
         raise AppException(422, "invalid_options", "Exactly 4 options required.")
     if not payload.correct_option_ids:
         raise AppException(422, "invalid_answer", "At least one correct option is required.")
+    from app.modules.exams.service import get_exam_or_404
+    await get_exam_or_404(db, payload.exam_id)
 
     q = MCQQuestion(
         origin_type="manual",
+        exam_id=payload.exam_id,
         question_text=payload.question_text,
         options=[o.model_dump() for o in payload.options],
         correct_option_ids=payload.correct_option_ids,

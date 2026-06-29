@@ -7,6 +7,7 @@ from app.core.auth import require_admin
 from app.core.database import get_db
 from app.core.exceptions import AppException
 from app.integrations.pinecone_client import get_pinecone
+from app.modules.exams.service import get_exam_or_404
 from app.modules.files.service import store_upload
 from app.modules.jobs.service import create_job, update_job
 from app.modules.jobs.models import JobStatus
@@ -28,14 +29,14 @@ from app.modules.users.models import User
 router = APIRouter(prefix="/admin/knowledge", tags=["knowledge"])
 
 VALID_DOC_TYPES = {"notes", "book_content", "handout", "reference_material"}
-VALID_USAGE_TYPES = {"objective", "subjective"}
 
 
 @router.post("/documents", response_model=KnowledgeDocumentWithJob, status_code=201)
 async def upload_knowledge_document(
     display_name: str = Form(...),
     document_type: str = Form(...),
-    content_usage_type: str = Form(...),
+    exam_id: uuid.UUID = Form(...),
+    chapter: str | None = Form(None),
     topic: str | None = Form(None),
     subtopic: str | None = Form(None),
     custom_instruction: str | None = Form(None),
@@ -45,8 +46,7 @@ async def upload_knowledge_document(
 ) -> KnowledgeDocumentWithJob:
     if document_type not in VALID_DOC_TYPES:
         raise AppException(422, "invalid_document_type", f"document_type must be one of: {', '.join(VALID_DOC_TYPES)}")
-    if content_usage_type not in VALID_USAGE_TYPES:
-        raise AppException(422, "invalid_usage_type", f"content_usage_type must be one of: {', '.join(VALID_USAGE_TYPES)}")
+    await get_exam_or_404(db, exam_id)
 
     file_record = await store_upload(
         file,
@@ -59,7 +59,8 @@ async def upload_knowledge_document(
     doc = KnowledgeDocument(
         display_name=display_name,
         document_type=document_type,
-        content_usage_type=content_usage_type,
+        exam_id=exam_id,
+        chapter=(chapter or None),
         file_id=file_record.id,
         topic=topic or None,
         subtopic=subtopic or None,

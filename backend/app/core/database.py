@@ -9,20 +9,28 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Pool sizing note: the API process and each Celery worker get their own pool.
-# Workers run with --pool=solo (one task at a time), so concurrency per worker is
-# low; pool_size=10 is comfortable. pool_recycle guards against Neon dropping
-# idle connections (it closes them server-side after a few minutes, which would
-# otherwise surface as "connection was closed" mid-query). Revisit pool_size if
-# we ever move workers to the prefork pool with concurrency > 1.
+# Pool sizing (spec §7 #5): the API process and each Celery worker get their OWN pool.
+# Sized via DB_POOL_SIZE/DB_MAX_OVERFLOW so total connections —
+# (FastAPI + worker×concurrency + beat) — stay under Azure PG max_connections. Defaults
+# (5 + 10 overflow = 15/process) comfortably cover the in-task asyncio concurrency
+# (parallel page extraction / skill-gen check out a few short-lived sessions at once).
+# pool_pre_ping validates a connection on checkout; pool_recycle guards against the
+# server dropping idle connections (surfaces otherwise as "connection was closed"
+# mid-query). Raise the env values on a larger PG tier or higher worker concurrency.
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
-    pool_recycle=1800,   # recycle connections older than 30 min (Neon idle cutoff)
+    pool_size=settings.DB_POOL_SIZE,
+    max_overflow=settings.DB_MAX_OVERFLOW,
+    pool_recycle=1800,   # recycle connections older than 30 min (idle cutoff)
     pool_timeout=30,     # fail fast instead of hanging when the pool is exhausted
+    # asyncpg: per-statement timeout prevents a hung query from blocking a worker
+    # forever; application_name makes sessions identifiable in pg_stat_activity.
+    connect_args={
+        "command_timeout": 60,
+        "server_settings": {"application_name": "neurafix"},
+    },
 )
 
 AsyncSessionLocal = async_sessionmaker(

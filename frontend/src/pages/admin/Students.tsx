@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { studentsService, type CreateStudentPayload } from "../../services/students";
+import { examsService, type Exam } from "../../services/exams";
 import type { User } from "../../types";
 
 export function AdminStudents() {
@@ -12,6 +13,7 @@ export function AdminStudents() {
   const [showCreate, setShowCreate] = useState(false);
   const [showEdit, setShowEdit] = useState<User | null>(null);
   const [showReset, setShowReset] = useState<User | null>(null);
+  const [showExams, setShowExams] = useState<User | null>(null);
 
   const load = async () => {
     setLoading(true);
@@ -88,6 +90,7 @@ export function AdminStudents() {
                 <td className="px-5 py-3">
                   <div className="flex gap-2">
                     <button onClick={() => setShowEdit(s)} className="text-xs text-brand-600 hover:underline">Edit</button>
+                    <button onClick={() => setShowExams(s)} className="text-xs text-brand-600 hover:underline">Exams</button>
                     <button onClick={() => setShowReset(s)} className="text-xs text-gray-500 hover:underline">Reset PW</button>
                     <button onClick={() => handleDeactivate(s)} className={`text-xs hover:underline ${s.status === "active" ? "text-red-500" : "text-green-600"}`}>
                       {s.status === "active" ? "Deactivate" : "Activate"}
@@ -111,7 +114,76 @@ export function AdminStudents() {
       {showCreate && <CreateStudentModal onClose={() => setShowCreate(false)} onCreated={load} />}
       {showEdit && <EditStudentModal student={showEdit} onClose={() => setShowEdit(null)} onSaved={load} />}
       {showReset && <ResetPasswordModal student={showReset} onClose={() => setShowReset(null)} />}
+      {showExams && <ManageExamsModal student={showExams} onClose={() => setShowExams(null)} />}
     </div>
+  );
+}
+
+function ManageExamsModal({ student, onClose }: { student: User; onClose: () => void }) {
+  const [exams, setExams] = useState<Exam[]>([]);
+  const [enrolled, setEnrolled] = useState<Set<string>>(new Set());
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  useEffect(() => {
+    Promise.all([examsService.list(), examsService.listStudentExams(student.id)])
+      .then(([all, mine]) => {
+        setExams(all.filter((e) => e.status === "active"));
+        setEnrolled(new Set(mine.map((m) => m.exam_id)));
+      })
+      .finally(() => setLoading(false));
+  }, [student.id]);
+
+  const toggle = async (examId: string) => {
+    setBusy(examId);
+    try {
+      if (enrolled.has(examId)) {
+        await examsService.unenroll(student.id, examId);
+        setEnrolled((s) => { const n = new Set(s); n.delete(examId); return n; });
+      } else {
+        await examsService.enroll(student.id, examId);
+        setEnrolled((s) => new Set(s).add(examId));
+      }
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <Modal title={`Exams — ${student.full_name}`} onClose={onClose}>
+      {loading ? (
+        <p className="py-6 text-center text-sm text-gray-400">Loading…</p>
+      ) : exams.length === 0 ? (
+        <p className="py-6 text-center text-sm text-gray-400">No active exams. Create one first.</p>
+      ) : (
+        <div className="space-y-2">
+          {exams.map((e) => {
+            const on = enrolled.has(e.id);
+            return (
+              <button
+                key={e.id}
+                onClick={() => toggle(e.id)}
+                disabled={busy === e.id}
+                className={`flex w-full items-center justify-between rounded-lg border px-3 py-2 text-left text-sm transition-colors disabled:opacity-50 ${
+                  on ? "border-brand-200 bg-brand-50" : "border-gray-200 hover:bg-gray-50"
+                }`}
+              >
+                <span>
+                  <span className="font-medium text-gray-900">{e.name}</span>
+                  <span className="ml-2 text-xs text-gray-400">{e.exam_type}</span>
+                </span>
+                <span className={`text-xs font-medium ${on ? "text-brand-600" : "text-gray-400"}`}>
+                  {on ? "Enrolled ✓" : "Enroll"}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+      <div className="flex justify-end pt-4">
+        <button onClick={onClose} className="rounded-lg bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-600">Done</button>
+      </div>
+    </Modal>
   );
 }
 

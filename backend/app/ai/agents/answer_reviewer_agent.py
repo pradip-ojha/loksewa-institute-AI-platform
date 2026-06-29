@@ -30,6 +30,9 @@ HARD RULES (never violate):
 - Keep the section breakdown consistent: each section's awarded ≤ its max, and section awarded
   marks SUM to the question's awarded_marks. Where the answer has any correct content, keep at
   least one "correct"/"partial" section with a non-empty evidence_text (positive marking).
+- Keep each section's "note" and make sure it clearly states BOTH what the student did well here
+  (to keep) AND what is missing/wrong to improve, in the answer's language, plain text. Tighten
+  vague notes ("needs improvement") into specific good-vs-improve wording consistent with the marks.
 - Prune annotation_targets to ONLY specific wrong written items (wrong sentence/formula/step/
   number/keyword, contradiction, irrelevant line). Drop targets for missing points / weak
   explanation / structure / general advice. NEVER invent new targets; keep each target_text exactly.
@@ -42,7 +45,7 @@ feedback to be concise, specific, and encouraging. Leave correct marking untouch
 FORMATTING: "feedback" and "overall_summary" are short GitHub-flavored MARKDOWN (**bold** the verdict,
 "- " bullets for multiple points) — keep/clean that formatting, do not flatten it to plain prose. All
 other fields stay PLAIN TEXT: "comment_text" (≤ ~8 words), "target_text", "evidence_text",
-"missing_points", "section".
+"missing_points", "section", and the section "note".
 
 MAX MARKS PER QUESTION:
 {full_marks_block}
@@ -58,7 +61,7 @@ Return ONLY valid JSON in exactly this structure (same shape as the input), plus
   "question_results": [
     {{"question_number": "1", "page_numbers": [1], "awarded_marks": 6, "max_marks": 10,
       "feedback": "...", "missing_points": ["..."], "confidence": 0.8,
-      "sections": [{{"section": "Definition", "max_marks": 2, "awarded_marks": 2, "status": "correct", "evidence_text": "..."}}],
+      "sections": [{{"section": "Definition", "max_marks": 2, "awarded_marks": 2, "status": "correct", "evidence_text": "...", "note": "what was good (keep) + what to improve, in the answer's language"}}],
       "annotation_targets": [{{"page_number": 1, "question_number": "1", "target_text": "...",
         "comment_text": "...", "annotation_action": "underline_with_comment"}}]}}
   ],

@@ -19,12 +19,20 @@ class R2Client:
         endpoint = settings.R2_PUBLIC_OR_ENDPOINT_URL or (
             f"https://{settings.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
         )
+        # Bounded connect/read timeouts + a small retry so a slow/stalled R2 call can
+        # never block a worker's event loop indefinitely (spec §7 #1). Callers that run
+        # inside the async loop offload these (blocking) S3 calls via asyncio.to_thread.
         self._client = boto3.client(
             "s3",
             endpoint_url=endpoint,
             aws_access_key_id=settings.R2_ACCESS_KEY_ID,
             aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
-            config=Config(signature_version="s3v4"),
+            config=Config(
+                signature_version="s3v4",
+                connect_timeout=10,
+                read_timeout=30,
+                retries={"max_attempts": 3, "mode": "standard"},
+            ),
             region_name="auto",
         )
         self.bucket = settings.R2_BUCKET_NAME

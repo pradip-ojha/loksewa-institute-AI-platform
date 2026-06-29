@@ -104,7 +104,7 @@ async def _already_terminal(job_uuid: uuid.UUID) -> bool:
         return False
 
 
-async def _run_task(work: Callable[[Any], Awaitable[None]], *, job_id: str, timeout: int, will_retry: bool) -> None:
+async def _run_task(work: Callable[..., Awaitable[None]], *, job_id: str, timeout: int, will_retry: bool, manage_session: bool) -> None:
     from app.core.database import AsyncSessionLocal
     from app.modules.jobs.models import JobStatus
     from app.modules.jobs.service import update_job
@@ -123,8 +123,18 @@ async def _run_task(work: Callable[[Any], Awaitable[None]], *, job_id: str, time
         async with AsyncSessionLocal() as mark_db:
             await update_job(mark_db, job_uuid, status=JobStatus.processing, step="Starting…")
 
-        async with AsyncSessionLocal() as db:
-            await asyncio.wait_for(work(db), timeout=timeout)
+        if manage_session:
+            # Legacy mode: `work` receives one session held open for its whole run.
+            # Simple, but that connection sits IDLE during long AI/render phases and
+            # can be dropped server-side mid-task. Use only for short tasks.
+            async with AsyncSessionLocal() as db:
+                await asyncio.wait_for(work(db), timeout=timeout)
+        else:
+            # Borrow-per-use mode: `work` takes NO session and opens its own
+            # short-lived sessions for each DB touch, returning the connection to
+            # the pool during AI/render phases. No connection is ever held idle
+            # across a long phase, so the server can't drop it from under us.
+            await asyncio.wait_for(work(), timeout=timeout)
 
         # Guarantee a terminal success state in a FRESH session, never the one
         # held open across `work`. Agents report progress/steps but several never
@@ -142,18 +152,26 @@ async def _run_task(work: Callable[[Any], Awaitable[None]], *, job_id: str, time
 
 
 def run_task(
-    work: Callable[[Any], Awaitable[None]],
+    work: Callable[..., Awaitable[None]],
     *,
     job_id: str,
     timeout: int | None = None,
     task: Any | None = None,
+    manage_session: bool = True,
 ) -> None:
     """Run a task coroutine on the persistent loop with job-status + timeout safety.
 
-    `work` is an async callable receiving an open AsyncSession. It should do the
-    actual job and set the job to `completed` (with output) on success. If it
-    raises, this helper records the failure (as `retrying` while Celery retries
-    remain, otherwise `failed`) and re-raises so the Celery task can retry.
+    `work` should do the actual job and set the job to `completed` (with output)
+    on success. If it raises, this helper records the failure (as `retrying` while
+    Celery retries remain, otherwise `failed`) and re-raises so the Celery task can
+    retry.
+
+    `manage_session` (default True): `work` is called as `work(db)` with one open
+    AsyncSession held for its whole run — fine for SHORT tasks. Set False for LONG
+    tasks (multi-minute AI/render pipelines): `work` is then called as `work()` with
+    NO session and must open its own short-lived sessions per DB touch, so a pooled
+    connection is never held idle across a long phase (where the server would drop
+    it). See `check_answer_sheet` for the borrow-per-use pattern.
 
     Pass the bound Celery `self` as `task` so the final-vs-retry distinction is
     accurate.
@@ -168,7 +186,7 @@ def run_task(
         max_retries = getattr(task, "max_retries", 0) or 0
         will_retry = task.request.retries < max_retries
 
-    run_async(_run_task(work, job_id=job_id, timeout=timeout, will_retry=will_retry))
+    run_async(_run_task(work, job_id=job_id, timeout=timeout, will_retry=will_retry, manage_session=manage_session))
 
 
 @worker_ready.connect

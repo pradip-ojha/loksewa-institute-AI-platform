@@ -95,6 +95,7 @@ export interface SectionMark {
   awarded: number;
   max: number;
   status: string; // correct | partial | wrong
+  note?: string; // what was good (keep) + what to improve, in the answer's language
 }
 
 export interface ResultQuestion {
@@ -119,6 +120,24 @@ export interface AnswerResult {
   quality: QualityResult | null;
   questions: ResultQuestion[];
   checked_pdf_url: string | null;
+}
+
+// ── Answer-sheet feedback chatbot ─────────────────────────────────────────────
+
+export interface FeedbackChatMessage {
+  role: string; // student | assistant
+  content: string;
+}
+
+export interface FeedbackChat {
+  chat_id: string | null;
+  messages: FeedbackChatMessage[];
+}
+
+export interface FeedbackChatReply {
+  chat_id: string;
+  messages: FeedbackChatMessage[];
+  follow_up_suggestions: string[];
 }
 
 export const subjectiveTestsService = {
@@ -159,4 +178,14 @@ export const subjectiveTestsService = {
       .then((r) => r.data),
   getResult: (testId: string): Promise<AnswerResult> =>
     api.get(`/api/student/subjective/tests/${testId}/result`).then((r) => r.data),
+
+  // Feedback chatbot (explains an already-checked sheet; never re-grades)
+  getFeedbackChat: (sheetId: string): Promise<FeedbackChat> =>
+    api.get(`/api/student/subjective/sheets/${sheetId}/feedback-chat`).then((r) => r.data),
+  startFeedbackChat: (sheetId: string): Promise<FeedbackChat> =>
+    api.post(`/api/student/subjective/sheets/${sheetId}/feedback-chat/start`).then((r) => r.data),
+  sendFeedbackMessage: (sheetId: string, chatId: string, message: string): Promise<FeedbackChatReply> =>
+    api
+      .post(`/api/student/subjective/sheets/${sheetId}/feedback-chat/${chatId}/message`, { message }, { timeout: 120_000 })
+      .then((r) => r.data),
 };

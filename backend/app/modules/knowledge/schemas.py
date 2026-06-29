@@ -1,13 +1,13 @@
 import uuid
 from datetime import datetime
-from typing import Literal
 from pydantic import BaseModel
 
 
 class KnowledgeDocumentCreate(BaseModel):
     display_name: str
     document_type: str
-    content_usage_type: Literal["objective", "subjective"]
+    exam_id: uuid.UUID
+    chapter: str | None = None
     topic: str | None = None
     subtopic: str | None = None
     custom_instruction: str | None = None
@@ -33,7 +33,8 @@ class KnowledgeDocumentOut(BaseModel):
     id: uuid.UUID
     display_name: str
     document_type: str
-    content_usage_type: str
+    exam_id: uuid.UUID
+    chapter: str | None
     topic: str | None
     subtopic: str | None
     processing_status: str

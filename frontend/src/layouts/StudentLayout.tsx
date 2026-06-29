@@ -1,11 +1,12 @@
 import { NavLink, Outlet } from "react-router-dom";
 import { motion } from "framer-motion";
-import { Home, HelpCircle, Video, FileCheck2, BarChart3, User } from "lucide-react";
+import { Home, HelpCircle, Video, Sparkles, FileCheck2, BarChart3, User } from "lucide-react";
 
 const NAV_ITEMS = [
   { to: "/student/dashboard", label: "Home", icon: Home },
   { to: "/student/mcq-tests", label: "MCQ", icon: HelpCircle },
   { to: "/student/video-tutor", label: "Videos", icon: Video },
+  { to: "/student/tutor", label: "AI Tutor", icon: Sparkles },
   { to: "/student/subjective-tests", label: "Subjective", icon: FileCheck2 },
   { to: "/student/results", label: "Results", icon: BarChart3 },
   { to: "/student/profile", label: "Profile", icon: User },

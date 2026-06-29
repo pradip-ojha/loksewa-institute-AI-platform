@@ -55,6 +55,48 @@ async def list_students(
     )
 
 
+# ── Admin: exam enrollment ─────────────────────────────────────────────────────
+
+class EnrollRequest(BaseModel):
+    exam_id: uuid.UUID
+
+
+@router.get("/admin/students/{student_id}/exams")
+async def list_student_exams(
+    student_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    from app.modules.exams import service as exam_svc
+    return await exam_svc.list_student_enrollments(db, student_id)
+
+
+@router.post("/admin/students/{student_id}/exams", status_code=201)
+async def enroll_student_in_exam(
+    student_id: uuid.UUID,
+    payload: EnrollRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    result = await db.execute(select(User).where(User.id == student_id, User.role == UserRole.student))
+    if not result.scalar_one_or_none():
+        raise AppException(404, "not_found", "Student not found.")
+    from app.modules.exams import service as exam_svc
+    await exam_svc.enroll_student(db, student_id=student_id, exam_id=payload.exam_id)
+    return {"enrolled": True}
+
+
+@router.delete("/admin/students/{student_id}/exams/{exam_id}", status_code=204)
+async def unenroll_student_from_exam(
+    student_id: uuid.UUID,
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    from app.modules.exams import service as exam_svc
+    await exam_svc.unenroll_student(db, student_id=student_id, exam_id=exam_id)
+
+
 @router.post("/admin/students", response_model=UserOut, status_code=201)
 async def create_student(
     payload: UserCreate,

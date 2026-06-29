@@ -17,6 +17,7 @@ class SubjectiveTest(Base):
     __tablename__ = "subjective_tests"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    exam_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("exams.id"), nullable=False)
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     total_time_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     num_questions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -24,6 +25,9 @@ class SubjectiveTest(Base):
 
     question_paper_file_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("files.id", ondelete="SET NULL"), nullable=True)
     model_answer_file_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("files.id", ondelete="SET NULL"), nullable=True)
+    # When the model answer is an image/scan: handwritten → Gemini vision; else → Azure gpt-5
+    # typed vision (CLAUDE.md §4 governing principle). Default typed.
+    model_answer_is_handwritten: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     sample_marked_file_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("files.id", ondelete="SET NULL"), nullable=True)
     # Optional per-test rubric file. When null, the checker uses the default rubric.
     rubric_file_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("files.id", ondelete="SET NULL"), nullable=True)
@@ -52,6 +56,8 @@ class SubjectiveQuestion(Base):
     question_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Detected per question against the subjective syllabus tree (best-effort; used to
     # fetch supporting knowledge during skill generation). Null when not matched.
+    # Chapter is the PRIMARY retrieval dimension (CLAUDE.md §8) — resolved from the topic.
+    chapter: Mapped[str | None] = mapped_column(String(120), nullable=True)
     topic: Mapped[str | None] = mapped_column(String(120), nullable=True)
     subtopic: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
@@ -149,4 +155,28 @@ class PDFAnnotation(Base):
     locator_plan: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     checked_file_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("files.id", ondelete="SET NULL"), nullable=True)
     annotation_status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")  # pending | completed | failed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SubjectiveFeedbackChat(Base):
+    """A follow-up chat anchored to one checked answer sheet. The chatbot explains the
+    already-stored evaluation in a teacher-like way — it never re-checks the sheet."""
+
+    __tablename__ = "subjective_feedback_chats"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    sheet_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("student_answer_sheets.id", ondelete="CASCADE"), nullable=False)
+    student_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")  # open | closed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class SubjectiveFeedbackMessage(Base):
+    __tablename__ = "subjective_feedback_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    chat_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("subjective_feedback_chats.id", ondelete="CASCADE"), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)  # student | assistant
+    content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

@@ -45,6 +45,7 @@ const STATUS_MAP: Record<string, { tone: Tone; label?: string }> = {
   generated: { tone: "success" },
   approved: { tone: "success" },
   checked: { tone: "success" },
+  feedback_ready: { tone: "success", label: "result ready" },
   ready: { tone: "success" },
   passed: { tone: "success" },
   draft: { tone: "neutral" },

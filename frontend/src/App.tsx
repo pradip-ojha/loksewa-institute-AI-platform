@@ -1,8 +1,10 @@
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { AuthProvider } from "./context/AuthContext";
+import { ExamProvider } from "./context/ExamContext";
 import { ProtectedRoute } from "./routes/ProtectedRoute";
 import { Login } from "./pages/Login";
 import { AdminLayout } from "./layouts/AdminLayout";
+import { AdminExams } from "./pages/admin/Exams";
 import { StudentLayout } from "./layouts/StudentLayout";
 import { AdminDashboard } from "./pages/admin/Dashboard";
 import { AdminStudents } from "./pages/admin/Students";
@@ -20,6 +22,7 @@ import { StudentDashboard } from "./pages/student/Dashboard";
 import { StudentMCQTests } from "./pages/student/StudentMCQTests";
 import { StudentSubjectiveTests } from "./pages/student/StudentSubjectiveTests";
 import { StudentVideoTutor } from "./pages/student/StudentVideoTutor";
+import { StudentTutor } from "./pages/student/StudentTutor";
 import { StudentProfile } from "./pages/student/Profile";
 import { StudentPlaceholder } from "./pages/student/Placeholder";
 
@@ -27,6 +30,7 @@ function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
+        <ExamProvider>
         <Routes>
           {/* Public */}
           <Route path="/login" element={<Login />} />
@@ -37,6 +41,7 @@ function App() {
             <Route path="/admin" element={<AdminLayout />}>
               <Route index element={<Navigate to="dashboard" replace />} />
               <Route path="dashboard" element={<AdminDashboard />} />
+              <Route path="exams" element={<AdminExams />} />
               <Route path="syllabus" element={<AdminSyllabus />} />
               <Route path="students" element={<AdminStudents />} />
               <Route path="knowledge" element={<AdminKnowledge />} />
@@ -58,6 +63,7 @@ function App() {
               <Route path="dashboard" element={<StudentDashboard />} />
               <Route path="mcq-tests" element={<StudentMCQTests />} />
               <Route path="video-tutor" element={<StudentVideoTutor />} />
+              <Route path="tutor" element={<StudentTutor />} />
               <Route path="subjective-tests" element={<StudentSubjectiveTests />} />
               <Route path="results" element={<StudentPlaceholder title="Results" />} />
               <Route path="profile" element={<StudentProfile />} />
@@ -66,6 +72,7 @@ function App() {
 
           <Route path="*" element={<Navigate to="/login" replace />} />
         </Routes>
+        </ExamProvider>
       </AuthProvider>
     </BrowserRouter>
   );

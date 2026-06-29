@@ -38,7 +38,7 @@ Return ONLY valid JSON in exactly this structure:
 class VideoSegmentRouterAgent:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.provider = get_provider("reasoning")
+        self.provider = get_provider("thinking")
 
     async def route(self, *, question: str, current_time: str | None, segments_block: str, video_id: uuid.UUID) -> dict:
         prompt = ROUTER_PROMPT.format(

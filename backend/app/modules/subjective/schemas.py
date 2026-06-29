@@ -101,6 +101,7 @@ class SectionMarkOut(BaseModel):
     awarded: float
     max: float
     status: str  # correct | partial | wrong
+    note: str = ""  # student-facing: what was good (keep) + what to improve, in the answer's language
 
 
 class ResultQuestionOut(BaseModel):
@@ -125,3 +126,25 @@ class AnswerResultOut(BaseModel):
     quality: QualityResultOut | None = None
     questions: list[ResultQuestionOut] = []
     checked_pdf_url: str | None = None
+
+
+# ── Answer-sheet feedback chatbot ────────────────────────────────────────────────
+
+class FeedbackChatMessageOut(BaseModel):
+    role: str  # student | assistant
+    content: str
+
+
+class FeedbackChatOut(BaseModel):
+    chat_id: uuid.UUID | None = None
+    messages: list[FeedbackChatMessageOut] = []
+
+
+class FeedbackChatMessageIn(BaseModel):
+    message: str
+
+
+class FeedbackChatReplyOut(BaseModel):
+    chat_id: uuid.UUID
+    messages: list[FeedbackChatMessageOut] = []
+    follow_up_suggestions: list[str] = []

@@ -16,6 +16,7 @@ class MCQTestBlueprint(Base):
     __tablename__ = "mcq_test_blueprints"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    exam_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("exams.id"), nullable=False)
     test_name: Mapped[str] = mapped_column(String(255), nullable=False)
     total_time_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     num_sets: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -37,6 +38,7 @@ class MCQTestSet(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     blueprint_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("mcq_test_blueprints.id", ondelete="CASCADE"), nullable=False)
+    exam_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("exams.id"), nullable=False)
     set_name: Mapped[str] = mapped_column(String(255), nullable=False)
     num_questions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     difficulty_mix: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

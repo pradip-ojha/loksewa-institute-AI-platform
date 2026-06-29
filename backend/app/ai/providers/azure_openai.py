@@ -19,38 +19,28 @@ from app.ai.providers.base import AIModelProvider
 
 logger = logging.getLogger(__name__)
 
-_reasoning_client: AsyncAzureOpenAI | None = None
-_embedding_client: AsyncAzureOpenAI | None = None
+# One AsyncAzureOpenAI client per api-version (the SDK pins api_version at client
+# construction, and the tiered deployments may use different api-versions). Clients
+# are cheap to hold open and safe to share across the worker's single event loop.
+_clients: dict[str, AsyncAzureOpenAI] = {}
 
 # Errors worth retrying: the call did not complete but may succeed if repeated.
 # A malformed JSON body is NOT here — that call completed, the content is just unusable.
 _TRANSIENT_ERRORS = (APITimeoutError, APIConnectionError, RateLimitError, InternalServerError)
 
 
-def _get_reasoning_client() -> AsyncAzureOpenAI:
-    global _reasoning_client
-    if _reasoning_client is None:
+def _get_client(api_version: str) -> AsyncAzureOpenAI:
+    client = _clients.get(api_version)
+    if client is None:
         if not settings.AZURE_OPENAI_ENDPOINT or not settings.AZURE_OPENAI_API_KEY:
             raise RuntimeError("AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY must be configured.")
-        _reasoning_client = AsyncAzureOpenAI(
+        client = AsyncAzureOpenAI(
             azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
             api_key=settings.AZURE_OPENAI_API_KEY,
-            api_version=settings.AZURE_OPENAI_API_VERSION_REASONING,
+            api_version=api_version,
         )
-    return _reasoning_client
-
-
-def _get_embedding_client() -> AsyncAzureOpenAI:
-    global _embedding_client
-    if _embedding_client is None:
-        if not settings.AZURE_OPENAI_ENDPOINT or not settings.AZURE_OPENAI_API_KEY:
-            raise RuntimeError("AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY must be configured.")
-        _embedding_client = AsyncAzureOpenAI(
-            azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
-            api_key=settings.AZURE_OPENAI_API_KEY,
-            api_version=settings.AZURE_OPENAI_API_VERSION_EMBEDDING,
-        )
-    return _embedding_client
+        _clients[api_version] = client
+    return client
 
 
 def _strip_code_fences(text: str) -> str:
@@ -152,8 +142,23 @@ async def _audit(audit_ctx: dict | None, *, model: str, api_version: str, input_
 
 
 class AzureOpenAIProvider(AIModelProvider):
+    """Azure OpenAI chat/vision provider for a single deployment tier.
+
+    The chat deployment (``model``) and its ``api_version`` are fixed per instance,
+    selected by ``model_router.get_provider(task_type)``:
+      - reasoning (gpt-5.5)        — default
+      - thinking  (gpt-5)          — typed text/vision extraction
+      - fast      (gpt-5-mini)     — semantic chunking
+    ``embed()`` and ``transcribe()`` ignore the tier and use their dedicated
+    embedding/transcription deployments + api-versions.
+    """
+
+    def __init__(self, model: str | None = None, api_version: str | None = None):
+        self.model = model or settings.MODEL_REASONING
+        self.api_version = api_version or settings.AZURE_OPENAI_API_VERSION_REASONING
+
     async def generate_text(self, prompt: str, schema: dict | None = None, audit_ctx: dict | None = None) -> dict:
-        client = _get_reasoning_client()
+        client = _get_client(self.api_version)
         kwargs: dict = {}
         if schema is not None:
             kwargs["response_format"] = {"type": "json_object"}
@@ -162,16 +167,16 @@ class AzureOpenAIProvider(AIModelProvider):
         try:
             response = await _create_with_retry(
                 client,
-                model=settings.MODEL_REASONING,
+                model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 **kwargs,
             )
             latency = int((time.monotonic() - t0) * 1000)
             usage = response.usage
-            await _audit(audit_ctx, model=settings.MODEL_REASONING, api_version=settings.AZURE_OPENAI_API_VERSION_REASONING, input_tokens=usage.prompt_tokens if usage else None, output_tokens=usage.completion_tokens if usage else None, latency_ms=latency)
+            await _audit(audit_ctx, model=self.model, api_version=self.api_version, input_tokens=usage.prompt_tokens if usage else None, output_tokens=usage.completion_tokens if usage else None, latency_ms=latency)
         except Exception as exc:
             latency = int((time.monotonic() - t0) * 1000)
-            await _audit(audit_ctx, model=settings.MODEL_REASONING, api_version=settings.AZURE_OPENAI_API_VERSION_REASONING, input_tokens=None, output_tokens=None, latency_ms=latency, status="error", error_message=str(exc))
+            await _audit(audit_ctx, model=self.model, api_version=self.api_version, input_tokens=None, output_tokens=None, latency_ms=latency, status="error", error_message=str(exc))
             raise
 
         text = _response_text(response)
@@ -180,7 +185,7 @@ class AzureOpenAIProvider(AIModelProvider):
         return {"text": text}
 
     async def generate_with_file(self, prompt: str, file_bytes: bytes, mime_type: str, schema: dict | None = None, audit_ctx: dict | None = None) -> dict:
-        client = _get_reasoning_client()
+        client = _get_client(self.api_version)
         kwargs: dict = {}
         if schema is not None:
             kwargs["response_format"] = {"type": "json_object"}
@@ -198,16 +203,16 @@ class AzureOpenAIProvider(AIModelProvider):
         try:
             response = await _create_with_retry(
                 client,
-                model=settings.MODEL_REASONING,
+                model=self.model,
                 messages=[{"role": "user", "content": content}],
                 **kwargs,
             )
             latency = int((time.monotonic() - t0) * 1000)
             usage = response.usage
-            await _audit(audit_ctx, model=settings.MODEL_REASONING, api_version=settings.AZURE_OPENAI_API_VERSION_REASONING, input_tokens=usage.prompt_tokens if usage else None, output_tokens=usage.completion_tokens if usage else None, latency_ms=latency)
+            await _audit(audit_ctx, model=self.model, api_version=self.api_version, input_tokens=usage.prompt_tokens if usage else None, output_tokens=usage.completion_tokens if usage else None, latency_ms=latency)
         except Exception as exc:
             latency = int((time.monotonic() - t0) * 1000)
-            await _audit(audit_ctx, model=settings.MODEL_REASONING, api_version=settings.AZURE_OPENAI_API_VERSION_REASONING, input_tokens=None, output_tokens=None, latency_ms=latency, status="error", error_message=str(exc))
+            await _audit(audit_ctx, model=self.model, api_version=self.api_version, input_tokens=None, output_tokens=None, latency_ms=latency, status="error", error_message=str(exc))
             raise
 
         text = _response_text(response)
@@ -216,7 +221,7 @@ class AzureOpenAIProvider(AIModelProvider):
         return {"text": text}
 
     async def generate_with_image(self, prompt: str, image_bytes: bytes, schema: dict | None = None, audit_ctx: dict | None = None) -> dict:
-        client = _get_reasoning_client()
+        client = _get_client(self.api_version)
         b64 = base64.b64encode(image_bytes).decode()
         kwargs: dict = {}
         if schema is not None:
@@ -231,16 +236,16 @@ class AzureOpenAIProvider(AIModelProvider):
         try:
             response = await _create_with_retry(
                 client,
-                model=settings.MODEL_REASONING,
+                model=self.model,
                 messages=[{"role": "user", "content": content}],
                 **kwargs,
             )
             latency = int((time.monotonic() - t0) * 1000)
             usage = response.usage
-            await _audit(audit_ctx, model=settings.MODEL_REASONING, api_version=settings.AZURE_OPENAI_API_VERSION_REASONING, input_tokens=usage.prompt_tokens if usage else None, output_tokens=usage.completion_tokens if usage else None, latency_ms=latency)
+            await _audit(audit_ctx, model=self.model, api_version=self.api_version, input_tokens=usage.prompt_tokens if usage else None, output_tokens=usage.completion_tokens if usage else None, latency_ms=latency)
         except Exception as exc:
             latency = int((time.monotonic() - t0) * 1000)
-            await _audit(audit_ctx, model=settings.MODEL_REASONING, api_version=settings.AZURE_OPENAI_API_VERSION_REASONING, input_tokens=None, output_tokens=None, latency_ms=latency, status="error", error_message=str(exc))
+            await _audit(audit_ctx, model=self.model, api_version=self.api_version, input_tokens=None, output_tokens=None, latency_ms=latency, status="error", error_message=str(exc))
             raise
 
         text = _response_text(response)
@@ -249,7 +254,7 @@ class AzureOpenAIProvider(AIModelProvider):
         return {"text": text}
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        client = _get_embedding_client()
+        client = _get_client(settings.AZURE_OPENAI_API_VERSION_EMBEDDING)
         embeddings: list[list[float]] = []
 
         batch_size = 100
@@ -272,7 +277,7 @@ class AzureOpenAIProvider(AIModelProvider):
     async def transcribe(self, audio_bytes: bytes, mime_type: str, audit_ctx: dict | None = None) -> dict:
         if not settings.MODEL_TRANSCRIPTION:
             raise RuntimeError("MODEL_TRANSCRIPTION is not configured.")
-        client = _get_reasoning_client()
+        client = _get_client(settings.AZURE_OPENAI_API_VERSION_TRANSCRIPTION)
         # The transcription API infers the codec from the filename extension, so
         # the extension MUST name a real audio format. Our pipeline produces MP3
         # with mime "audio/mpeg" — sending it as "audio.mpeg" makes the API treat
@@ -293,9 +298,10 @@ class AzureOpenAIProvider(AIModelProvider):
             return f
 
         # gpt-4o-transcribe / gpt-4o-mini-transcribe only support "json" or "text"
-        # (verbose_json — and thus segment-level timestamps — is whisper-1 only).
-        # Our timeline is built by VideoTimelineAgent from the cleaned transcript,
-        # so we don't depend on transcription segments; request plain "json".
+        # (Azure rejects "verbose_json" — and thus segment-level timestamps — for them).
+        # The timeline is built by VideoTimelineAgent, which anchors each segment to the
+        # GLOBAL time window of the audio chunk it came from; chunk size (audio_tools.
+        # DEFAULT_CHUNK_MINUTES) is therefore the timeline's time granularity. Request "json".
         t0 = time.monotonic()
         try:
             response = await _call_with_retry(

@@ -18,7 +18,8 @@ from app.modules.files.models import File
 from app.modules.jobs.service import update_job
 from app.modules.jobs.models import JobStatus
 from app.modules.knowledge.models import KnowledgeChunk, KnowledgeDocument
-from app.modules.syllabus.models import SyllabusItem, SyllabusType
+from app.modules.syllabus.models import SyllabusItem
+from app.modules.exams.models import Exam
 
 logger = logging.getLogger(__name__)
 
@@ -124,16 +125,22 @@ HARD RULES (never violate):
 
 Context:
 - Document type: {document_type}
-- Content usage: {content_usage_type}
+- Exam type: {exam_type}
+- CHAPTER (the primary scope — this whole document belongs to it): {chapter}
 - Custom instruction: {custom_instruction}
 
-VALID SYLLABUS TOPICS AND SUBTOPICS — use ONLY these exact strings:
+CHAPTER IS THE PRIMARY RETRIEVAL KEY. This document was uploaded under the chapter above, so every
+chunk belongs to that chapter. Topic/subtopic are a SECONDARY, finer label *within* that chapter —
+they only narrow within it, they never override it.
+
+VALID SYLLABUS TOPICS AND SUBTOPICS for THIS CHAPTER — use ONLY these exact strings:
 {syllabus_topics}
 
 Topic assignment rules:
+- The chunk's chapter is already fixed ({chapter}); you only choose its topic/subtopic within it.
 - Set "topic" to the exact string from the list above that best matches the chunk content.
 - Set "subtopic" to the exact string from the list above, or null if no subtopic applies.
-- If the chunk content does not match any listed topic, set both to null.
+- If the chunk content does not match any listed topic, set both to null (it still belongs to the chapter).
 - Never invent topic or subtopic strings not in the list above.
 
 Return a JSON object with a single key "chunks" whose value is an array. Each item must have:
@@ -149,13 +156,6 @@ Example format:
 TEXT TO CHUNK:
 {text}
 """
-
-# Hardcoded chapter names for this deployment's single-chapter vertical slice.
-_CHAPTER_BY_USAGE_TYPE: dict[str, str] = {
-    "objective":  "भूगोल, वातावरण र जनसंख्या",
-    "subjective": "बैंकिङ्ग",
-}
-
 
 # ── PDF text classification ────────────────────────────────────────────────────
 
@@ -332,7 +332,7 @@ class KnowledgeProcessingAgent:
                 # Mark document as processing
                 doc.processing_status = "processing"
 
-                usage_type = doc.content_usage_type
+                exam_id = doc.exam_id
                 document_type = doc.document_type
                 custom_instruction = doc.custom_instruction
                 doc_topic = doc.topic
@@ -340,16 +340,26 @@ class KnowledgeProcessingAgent:
                 display_name = doc.display_name
                 file_id = doc.file_id
 
-                # Derive hardcoded chapter for this deployment's vertical slice
-                hardcoded_chapter = _CHAPTER_BY_USAGE_TYPE.get(usage_type, "")
+                # exam_type drives the chunk metadata; chapter is the admin-entered
+                # real value (no more hardcoded chapter-by-usage-type).
+                exam = (await load_db.execute(select(Exam).where(Exam.id == exam_id))).scalar_one_or_none()
+                exam_type = exam.exam_type if exam else ""
+                doc_chapter = doc.chapter or ""
 
-                # Load syllabus topics/subtopics for metadata validation and prompt injection
+                # Load syllabus topics/subtopics for metadata validation and prompt injection.
+                # CHAPTER IS PRIMARY: when the document is uploaded under a chapter, scope the
+                # valid topics to THAT chapter so chunks can't be mis-tagged with a topic from a
+                # different chapter of the same exam (cross-chapter leakage). With no chapter we
+                # fall back to the whole exam tree.
+                _syl_where = [
+                    SyllabusItem.exam_id == exam_id,
+                    SyllabusItem.is_active == True,
+                ]
+                if doc_chapter:
+                    _syl_where.append(SyllabusItem.chapter == doc_chapter)
                 syl_result = await load_db.execute(
                     select(SyllabusItem)
-                    .where(
-                        SyllabusItem.syllabus_type == SyllabusType(usage_type),
-                        SyllabusItem.is_active == True,
-                    )
+                    .where(*_syl_where)
                     .order_by(SyllabusItem.sort_order)
                 )
                 syllabus_items = syl_result.scalars().all()
@@ -398,7 +408,9 @@ class KnowledgeProcessingAgent:
                     _extract_pdf_pages_text, file_bytes
                 )
                 total_pages = len(page_texts_raw)
-                provider = get_provider("reasoning")
+                # Scanned/legacy-font knowledge PDFs are TYPED text → Azure gpt-5 typed
+                # vision OCR (not Gemini, which is reserved for handwriting; not gpt-5.5).
+                provider = get_provider("vision_typed")
 
                 # First pass: classify each page
                 classifications: list[str] = [
@@ -502,7 +514,9 @@ class KnowledgeProcessingAgent:
                 )
 
             sections = _split_into_sections(raw_text, max_chars=8000)
-            provider = get_provider("text")
+            # Semantic chunking is lower-intelligence work → gpt-5-mini (fast tier).
+            # (provider.embed below ignores the chat tier and uses the embedding deployment.)
+            provider = get_provider("chunking")
 
             # Parallel chunking: max 5 concurrent text-model calls
             chunk_sem = asyncio.Semaphore(5)
@@ -511,7 +525,8 @@ class KnowledgeProcessingAgent:
                 async with chunk_sem:
                     prompt = CHUNK_PROMPT.format(
                         document_type=document_type,
-                        content_usage_type=usage_type,
+                        exam_type=exam_type,
+                        chapter=doc_chapter or "(unspecified)",
                         custom_instruction=custom_instruction or "None",
                         syllabus_topics=syllabus_topics_block,
                         text=section,
@@ -569,8 +584,9 @@ class KnowledgeProcessingAgent:
                     "document_id": str(doc_uuid),
                     "document_name": display_name,
                     "document_type": document_type,
-                    "content_usage_type": usage_type,
-                    "chapter": hardcoded_chapter,
+                    "exam_id": str(exam_id),
+                    "exam_type": exam_type,
+                    "chapter": doc_chapter,
                     "topic": chunk.get("topic") or doc_topic or "",
                     "subtopic": chunk.get("subtopic") or doc_subtopic or "",
                     "language": chunk.get("language", "nepali_english_mixed"),
@@ -665,10 +681,11 @@ class KnowledgeProcessingAgent:
                             save_db.add_all([
                                 KnowledgeChunk(
                                     document_id=doc_uuid,
+                                    exam_id=exam_id,
                                     chunk_index=p["chunk_index"],
                                     content=p["content"],
                                     content_type=p["content_type"],
-                                    chapter=hardcoded_chapter,
+                                    chapter=doc_chapter or None,
                                     topic=p["topic"],
                                     subtopic=p["subtopic"],
                                     language=p["language"],

@@ -60,7 +60,7 @@ def process_video(self, job_id: str, video_id: str) -> None:
         await update_job(db, jid, status=JobStatus.processing, progress=8, step="Extracting audio")
         await db.commit()
 
-        media_bytes = get_r2().download_fileobj(media.r2_key)
+        media_bytes = await _to_thread(get_r2().download_fileobj, media.r2_key)
         audio_bytes, audio_mime, duration = await _to_thread(
             audio_tools.extract_audio, media_bytes, media.original_filename or "input"
         )
@@ -165,7 +165,7 @@ def process_video(self, job_id: str, video_id: str) -> None:
         cleaned = "\n\n".join(c["text"] for c in timed_clean).strip()
         transcript.cleaned_transcript = cleaned
         transcript.language = _pick_language(languages)
-        transcript.model_used_for_cleaning = "gpt-5.5"
+        transcript.model_used_for_cleaning = "gpt-5"
         await db.commit()
 
         # 6) Generate timeline ----------------------------------------------------
@@ -199,7 +199,11 @@ def process_video(self, job_id: str, video_id: str) -> None:
         # 7) Map segments to syllabus topic/subtopic ------------------------------
         video.processing_status = "mapping_topics"
         await update_job(db, jid, progress=80, step="Mapping topics")
-        tree_text, valid_topics, valid_subtopics = await svc.get_chapter_tree(db, video.content_usage_type)
+        tree_text, valid_topics, valid_subtopics, _valid_chapters, _topic_to_chapter = await svc.get_chapter_tree(db, video.exam_id)
+        # Every segment inherits the video's chapter (the PRIMARY retrieval dimension),
+        # set unconditionally so it survives even if topic mapping fails.
+        for row in seg_rows:
+            row.chapter = video.chapter
         if valid_topics:
             from app.ai.agents.video_segment_topic_mapper_agent import VideoSegmentTopicMapperAgent
             try:
@@ -317,7 +321,7 @@ async def _process_slides(db, video, seg_rows) -> int:
     slides_file = f_r.scalar_one_or_none()
     if not slides_file:
         return 0
-    data = get_r2().download_fileobj(slides_file.r2_key)
+    data = await _to_thread(get_r2().download_fileobj, slides_file.r2_key)
 
     # Per-page text.
     pages_text: list[str] = []

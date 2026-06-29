@@ -41,8 +41,11 @@ async def create_blueprint(
             422, "difficulty_exceeds_total",
             "Difficulty distribution total cannot exceed the total questions per set.",
         )
+    from app.modules.exams.service import get_exam_or_404
+    await get_exam_or_404(db, payload.exam_id)
 
     blueprint = MCQTestBlueprint(
+        exam_id=payload.exam_id,
         test_name=payload.test_name,
         total_time_minutes=payload.total_time_minutes,
         num_sets=payload.num_sets,

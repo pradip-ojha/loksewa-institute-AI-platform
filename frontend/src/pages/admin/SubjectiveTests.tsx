@@ -7,6 +7,7 @@ import type {
 } from "../../services/subjectiveTests";
 import { getErrorMessage } from "../../utils/error";
 import { SubjectiveAnalyticsView } from "./Analytics";
+import { useExam } from "../../context/ExamContext";
 
 type Tab = "create" | "tests" | "submissions" | "analytics";
 
@@ -76,10 +77,12 @@ export function AdminSubjectiveTests() {
 // ── Create Test ─────────────────────────────────────────────────────────────────
 
 function CreateTestTab({ onCreated }: { onCreated: () => void }) {
+  const { selectedExamId } = useExam();
   const [displayName, setDisplayName] = useState("");
   const [totalTime, setTotalTime] = useState("60");
   const [totalMarks, setTotalMarks] = useState("");
   const [instruction, setInstruction] = useState("");
+  const [modelHandwritten, setModelHandwritten] = useState(false);
 
   const paperRef = useRef<HTMLInputElement>(null);
   const modelRef = useRef<HTMLInputElement>(null);
@@ -94,11 +97,13 @@ function CreateTestTab({ onCreated }: { onCreated: () => void }) {
     e.preventDefault();
     setError("");
     if (!displayName.trim()) return setError("Display name is required.");
+    if (!selectedExamId) return setError("Select an exam in the top bar first.");
     const paper = paperRef.current?.files?.[0];
     if (!paper) return setError("Question paper file is required.");
 
     const fd = new FormData();
     fd.append("display_name", displayName);
+    fd.append("exam_id", selectedExamId);
     fd.append("total_time_minutes", totalTime || "60");
     fd.append("total_marks", totalMarks || "0");
     if (instruction.trim()) fd.append("custom_instruction", instruction);
@@ -107,6 +112,7 @@ function CreateTestTab({ onCreated }: { onCreated: () => void }) {
     const sample = sampleRef.current?.files?.[0];
     const rubric = rubricRef.current?.files?.[0];
     if (model) fd.append("model_answer", model);
+    if (model && modelHandwritten) fd.append("model_answer_is_handwritten", "true");
     if (sample) fd.append("sample_marked", sample);
     if (rubric) fd.append("rubric", rubric);
 
@@ -150,6 +156,14 @@ function CreateTestTab({ onCreated }: { onCreated: () => void }) {
         <div>
           <Label>Model / Ideal Answer (optional)</Label>
           <input ref={modelRef} type="file" accept=".pdf,.docx,.doc" className="text-sm" />
+          <label className="mt-2 flex items-center gap-2 text-xs text-gray-600">
+            <input
+              type="checkbox"
+              checked={modelHandwritten}
+              onChange={(e) => setModelHandwritten(e.target.checked)}
+            />
+            Model answer is handwritten (scanned) — use Gemini to read it; otherwise typed text is read by GPT-5.
+          </label>
         </div>
         <div>
           <Label>Sample Marked Answer (optional)</Label>

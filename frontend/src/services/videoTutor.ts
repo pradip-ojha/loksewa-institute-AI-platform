@@ -17,7 +17,7 @@ export interface PagedResult<T> {
 export interface VideoItem {
   id: string;
   display_name: string;
-  content_usage_type: string;
+  chapter: string | null;
   topic: string | null;
   subtopic: string | null;
   processing_status: string;

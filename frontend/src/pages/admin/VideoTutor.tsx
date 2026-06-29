@@ -5,6 +5,7 @@ import type { VideoDetail, VideoItem } from "../../services/videoTutor";
 import { syllabusService, type SyllabusTree } from "../../services/syllabus";
 import { getErrorMessage } from "../../utils/error";
 import { RichText } from "../../components/content/RichText";
+import { useExam } from "../../context/ExamContext";
 
 type Tab = "upload" | "library";
 
@@ -58,8 +59,9 @@ export function AdminVideoTutor() {
 // ── Upload ──────────────────────────────────────────────────────────────────────
 
 function UploadTab({ onUploaded }: { onUploaded: () => void }) {
+  const { selectedExamId, selectedExam } = useExam();
   const [title, setTitle] = useState("");
-  const [usageType, setUsageType] = useState("objective");
+  const [chapter, setChapter] = useState("");
   const [topic, setTopic] = useState("");
   const [subtopic, setSubtopic] = useState("");
   const [instruction, setInstruction] = useState("");
@@ -69,27 +71,31 @@ function UploadTab({ onUploaded }: { onUploaded: () => void }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
-  const [syllabusObj, setSyllabusObj] = useState<SyllabusTree | null>(null);
-  const [syllabusSubj, setSyllabusSubj] = useState<SyllabusTree | null>(null);
+  const [tree, setTree] = useState<SyllabusTree | null>(null);
 
   useEffect(() => {
-    syllabusService.getObjective().then(setSyllabusObj).catch(() => {});
-    syllabusService.getSubjective().then(setSyllabusSubj).catch(() => {});
-  }, []);
+    if (!selectedExamId) { setTree(null); return; }
+    syllabusService.get(selectedExamId).then(setTree).catch(() => setTree(null));
+  }, [selectedExamId]);
 
-  const availableTopics = useMemo(() => {
-    if (usageType === "objective")
-      return syllabusObj?.chapters.flatMap((c) => c.topics) ?? [];
-    return syllabusSubj?.chapters.flatMap((c) => c.topics) ?? [];
-  }, [usageType, syllabusObj, syllabusSubj]);
+  const availableChapters = useMemo(() => tree?.chapters ?? [], [tree]);
+
+  // Chapter is the PRIMARY dimension: once a chapter is chosen, topics narrow to it.
+  const availableTopics = useMemo(
+    () =>
+      chapter
+        ? availableChapters.find((c) => c.chapter === chapter)?.topics ?? []
+        : availableChapters.flatMap((c) => c.topics),
+    [chapter, availableChapters]
+  );
 
   const availableSubtopics = useMemo(
     () => availableTopics.find((t) => t.topic === topic)?.subtopics ?? [],
     [topic, availableTopics]
   );
 
-  const handleUsageChange = (value: string) => {
-    setUsageType(value);
+  const handleChapterChange = (value: string) => {
+    setChapter(value);
     setTopic("");
     setSubtopic("");
   };
@@ -103,12 +109,14 @@ function UploadTab({ onUploaded }: { onUploaded: () => void }) {
     e.preventDefault();
     setError("");
     if (!title.trim()) return setError("Title is required.");
+    if (!selectedExamId) return setError("Select an exam in the top bar first.");
     const media = mediaRef.current?.files?.[0];
     if (!media) return setError("Select a video or audio file.");
 
     const fd = new FormData();
     fd.append("title", title);
-    fd.append("content_usage_type", usageType);
+    fd.append("exam_id", selectedExamId);
+    if (chapter.trim()) fd.append("chapter", chapter.trim());
     if (topic.trim()) fd.append("topic", topic.trim());
     if (subtopic.trim()) fd.append("subtopic", subtopic.trim());
     if (instruction.trim()) fd.append("custom_instruction", instruction.trim());
@@ -154,17 +162,29 @@ function UploadTab({ onUploaded }: { onUploaded: () => void }) {
       </div>
 
       <div>
-        <label className="mb-1 block text-sm font-medium text-gray-700">Syllabus</label>
-        <select
-          value={usageType}
-          onChange={(e) => handleUsageChange(e.target.value)}
-          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
-        >
-          <option value="objective">Objective</option>
-          <option value="subjective">Subjective</option>
-        </select>
+        <label className="mb-1 block text-sm font-medium text-gray-700">Exam</label>
+        <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700">
+          {selectedExam ? `${selectedExam.name} (${selectedExam.exam_type})` : "Select an exam in the top bar"}
+        </div>
         <p className="mt-1 text-xs text-gray-400">
           Decides which syllabus topics and knowledge notes the tutor uses.
+        </p>
+      </div>
+
+      <div>
+        <label className="mb-1 block text-sm font-medium text-gray-700">Chapter (optional)</label>
+        <select
+          value={chapter}
+          onChange={(e) => handleChapterChange(e.target.value)}
+          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+        >
+          <option value="">— Leave blank for auto-detection —</option>
+          {availableChapters.map((c) => (
+            <option key={c.chapter} value={c.chapter}>{c.chapter}</option>
+          ))}
+        </select>
+        <p className="mt-1 text-xs text-gray-400">
+          The primary dimension for fetching notes — topics narrow within it.
         </p>
       </div>
 
@@ -297,7 +317,7 @@ function LibraryTab({ onOpen }: { onOpen: (id: string) => void }) {
             <div className="min-w-0">
               <h3 className="truncate font-semibold text-gray-800">{v.display_name}</h3>
               <p className="text-xs text-gray-400">
-                {v.content_usage_type}
+                {v.chapter || "Unscoped"}
                 {v.topic ? ` · ${v.topic}` : ""}
                 {v.is_audio_only ? " · audio" : " · video"}
                 {v.has_slides ? " · slides" : ""}
@@ -357,7 +377,7 @@ function DetailView({ videoId, onBack }: { videoId: string; onBack: () => void }
       <button onClick={onBack} className="mb-3 text-sm text-brand-700">← Back to library</button>
       <h1 className="text-2xl font-bold text-gray-900">{v.display_name}</h1>
       <p className="mb-4 text-sm text-gray-500">
-        {v.content_usage_type}{v.topic ? ` · ${v.topic}` : ""} · {v.status}
+        {v.chapter || "Unscoped"}{v.topic ? ` · ${v.topic}` : ""} · {v.status}
       </p>
 
       {v.media_url && (

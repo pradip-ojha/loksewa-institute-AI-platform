@@ -53,7 +53,8 @@ async def _dispatch_processing(db: AsyncSession, video: Video, created_by: uuid.
 @router.post("/admin/videos", response_model=JobOut, status_code=201)
 async def create_video(
     title: str = Form(...),
-    content_usage_type: str = Form("objective"),
+    exam_id: uuid.UUID = Form(...),
+    chapter: str | None = Form(None),
     topic: str | None = Form(None),
     subtopic: str | None = Form(None),
     custom_instruction: str | None = Form(None),
@@ -64,8 +65,8 @@ async def create_video(
 ):
     """Upload a lecture (video or audio) + optional support-slides PDF, then run the
     processing pipeline (audio → transcript → timeline → summary → slides)."""
-    if content_usage_type not in ("objective", "subjective"):
-        raise AppException(422, "invalid_type", "content_usage_type must be 'objective' or 'subjective'.")
+    from app.modules.exams.service import get_exam_or_404
+    await get_exam_or_404(db, exam_id)
 
     media_file = await store_upload(
         media, context="videos",
@@ -81,7 +82,8 @@ async def create_video(
 
     video = Video(
         display_name=title,
-        content_usage_type=content_usage_type,
+        exam_id=exam_id,
+        chapter=chapter or None,
         topic=topic or None,
         subtopic=subtopic or None,
         custom_instruction=custom_instruction or None,
@@ -198,9 +200,9 @@ async def delete_video(
 @router.get("/student/videos", response_model=list[StudentVideoListItem])
 async def student_list_videos(
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_student),
+    current_user: User = Depends(require_student),
 ):
-    videos = await svc.list_student_videos(db)
+    videos = await svc.list_student_videos(db, current_user.id)
     return [
         StudentVideoListItem(
             id=v.id, display_name=v.display_name, topic=v.topic, subtopic=v.subtopic,

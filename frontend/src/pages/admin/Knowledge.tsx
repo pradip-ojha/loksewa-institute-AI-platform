@@ -2,17 +2,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { knowledgeService, type KnowledgeChunk, type KnowledgeDocument } from "../../services/knowledge";
 import { syllabusService, type SyllabusTree } from "../../services/syllabus";
 import { JobStatusPoller, type JobState } from "../../components/JobStatusPoller";
+import { useExam } from "../../context/ExamContext";
 
 const DOC_TYPES = [
   { value: "notes", label: "Notes" },
   { value: "book_content", label: "Book Content" },
   { value: "handout", label: "Handout" },
   { value: "reference_material", label: "Reference Material" },
-];
-
-const USAGE_TYPES = [
-  { value: "objective", label: "Objective (MCQ generation)" },
-  { value: "subjective", label: "Subjective (checking support)" },
 ];
 
 const STATUS_COLORS: Record<string, string> = {
@@ -58,11 +54,12 @@ export function AdminKnowledge() {
 // ── Upload Tab ───────────────────────────────────────────────────────────────
 
 function UploadTab() {
+  const { selectedExamId, selectedExam } = useExam();
   const fileRef = useRef<HTMLInputElement>(null);
   const [form, setForm] = useState({
     display_name: "",
     document_type: "notes",
-    content_usage_type: "objective",
+    chapter: "",
     topic: "",
     subtopic: "",
     custom_instruction: "",
@@ -72,19 +69,19 @@ function UploadTab() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [docId, setDocId] = useState<string | null>(null);
 
-  const [syllabusObj, setSyllabusObj] = useState<SyllabusTree | null>(null);
-  const [syllabusSubj, setSyllabusSubj] = useState<SyllabusTree | null>(null);
+  const [tree, setTree] = useState<SyllabusTree | null>(null);
 
   useEffect(() => {
-    syllabusService.getObjective().then(setSyllabusObj).catch(() => {});
-    syllabusService.getSubjective().then(setSyllabusSubj).catch(() => {});
-  }, []);
+    if (!selectedExamId) { setTree(null); return; }
+    syllabusService.get(selectedExamId).then(setTree).catch(() => setTree(null));
+  }, [selectedExamId]);
+
+  const availableChapters = useMemo(() => tree?.chapters ?? [], [tree]);
 
   const availableTopics = useMemo(() => {
-    if (form.content_usage_type === "objective")
-      return syllabusObj?.chapters.flatMap((c) => c.topics) ?? [];
-    return syllabusSubj?.chapters.flatMap((c) => c.topics) ?? [];
-  }, [form.content_usage_type, syllabusObj, syllabusSubj]);
+    if (form.chapter) return availableChapters.find((c) => c.chapter === form.chapter)?.topics ?? [];
+    return availableChapters.flatMap((c) => c.topics);
+  }, [form.chapter, availableChapters]);
 
   const availableSubtopics = useMemo(
     () => availableTopics.find((t) => t.topic === form.topic)?.subtopics ?? [],
@@ -94,8 +91,8 @@ function UploadTab() {
   const set = (field: string, value: string) =>
     setForm((f) => ({ ...f, [field]: value }));
 
-  const handleUsageChange = (value: string) => {
-    setForm((f) => ({ ...f, content_usage_type: value, topic: "", subtopic: "" }));
+  const handleChapterChange = (value: string) => {
+    setForm((f) => ({ ...f, chapter: value, topic: "", subtopic: "" }));
   };
 
   const handleTopicChange = (value: string) => {
@@ -104,6 +101,7 @@ function UploadTab() {
 
   const handleSubmit = async () => {
     const file = fileRef.current?.files?.[0];
+    if (!selectedExamId) { setError("Select an exam in the top bar first."); return; }
     if (!file) { setError("Select a file to upload."); return; }
     if (!form.display_name.trim()) { setError("Display name is required."); return; }
 
@@ -116,7 +114,8 @@ function UploadTab() {
     fd.append("file", file);
     fd.append("display_name", form.display_name);
     fd.append("document_type", form.document_type);
-    fd.append("content_usage_type", form.content_usage_type);
+    fd.append("exam_id", selectedExamId);
+    if (form.chapter) fd.append("chapter", form.chapter);
     if (form.topic) fd.append("topic", form.topic);
     if (form.subtopic) fd.append("subtopic", form.subtopic);
     if (form.custom_instruction) fd.append("custom_instruction", form.custom_instruction);
@@ -157,10 +156,16 @@ function UploadTab() {
         </div>
 
         <div>
-          <Label>Content Usage Type *</Label>
-          <Select value={form.content_usage_type} onChange={(e) => handleUsageChange(e.target.value)}>
-            {USAGE_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+          <Label>Chapter <span className="font-normal text-gray-400">(optional)</span></Label>
+          <Select value={form.chapter} onChange={(e) => handleChapterChange(e.target.value)}>
+            <option value="">— All / unspecified —</option>
+            {availableChapters.map((c) => (
+              <option key={c.chapter} value={c.chapter}>{c.chapter}</option>
+            ))}
           </Select>
+          <p className="mt-1 text-xs text-gray-400">
+            Exam: <span className="font-medium text-gray-600">{selectedExam?.name ?? "none selected"}</span>
+          </p>
         </div>
 
         <div>
@@ -301,7 +306,7 @@ function ProcessedTab() {
             <tr>
               <th className="px-4 py-3 text-left">Name</th>
               <th className="px-4 py-3 text-left">Type</th>
-              <th className="px-4 py-3 text-left">Usage</th>
+              <th className="px-4 py-3 text-left">Chapter</th>
               <th className="px-4 py-3 text-left">Chunks</th>
               <th className="px-4 py-3 text-left">Status</th>
               <th className="px-4 py-3 text-left">Actions</th>
@@ -312,7 +317,7 @@ function ProcessedTab() {
               <tr key={doc.id} className="hover:bg-gray-50">
                 <td className="px-4 py-3 font-medium text-gray-900 max-w-xs truncate">{doc.display_name}</td>
                 <td className="px-4 py-3 text-gray-500 capitalize">{doc.document_type.replace("_", " ")}</td>
-                <td className="px-4 py-3 text-gray-500 capitalize">{doc.content_usage_type}</td>
+                <td className="px-4 py-3 text-gray-500">{doc.chapter ?? "—"}</td>
                 <td className="px-4 py-3 text-gray-700">{doc.chunk_count}</td>
                 <td className="px-4 py-3">
                   <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_COLORS[doc.processing_status] ?? STATUS_COLORS.pending}`}>

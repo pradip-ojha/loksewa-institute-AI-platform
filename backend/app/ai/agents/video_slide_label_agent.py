@@ -52,7 +52,7 @@ Return ONLY valid JSON in exactly this structure:
 class VideoSlideLabelAgent:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.provider = get_provider("reasoning")
+        self.provider = get_provider("thinking")
 
     async def generate(self, *, slides_block: str, timeline_block: str, video_id: uuid.UUID) -> list[dict]:
         prompt = SLIDE_PROMPT.format(timeline=timeline_block[:12000], slides=slides_block[:40000])

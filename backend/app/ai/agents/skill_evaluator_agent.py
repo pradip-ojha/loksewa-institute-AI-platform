@@ -73,7 +73,11 @@ Return ONLY valid JSON in exactly this structure (one entry per question):
 class SkillEvaluatorAgent:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.provider = get_provider("reasoning")
+        # Evaluation only flags serious STRUCTURAL issues (wrong-question mapping,
+        # qnum/max-marks mismatch, breakdown ≠ full marks, major gaps) — a consistency
+        # check, not deep authoring — so it runs on the cheaper gpt-5 (thinking) tier.
+        # Skill GENERATION + weak-skill regeneration stay on gpt-5.5 (reasoning).
+        self.provider = get_provider("consistency_check")
 
     async def evaluate(
         self, *, skills: list[dict], custom_instruction: str | None, test_id: uuid.UUID,

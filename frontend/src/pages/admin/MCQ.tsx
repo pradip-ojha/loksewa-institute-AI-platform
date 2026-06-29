@@ -6,6 +6,7 @@ import type { MCQQuestion, MCQReviewBatch, MCQBatchWithQuestions, MCQOption } fr
 import { syllabusService } from "../../services/syllabus";
 import type { ChapterNode } from "../../services/syllabus";
 import { getErrorMessage } from "../../utils/error";
+import { useExam } from "../../context/ExamContext";
 
 type Tab = "upload" | "generate" | "batches" | "review" | "bank" | "manual";
 
@@ -24,17 +25,25 @@ const STATUS_BADGE: Record<string, string> = {
 // ── Upload Existing MCQ Tab ───────────────────────────────────────────────────
 
 function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batchMode: "extract") => void; chapters: ChapterNode[] }) {
-  const [form, setForm] = useState({ display_name: "", topic: "", subtopic: "", custom_instruction: "" });
+  const { selectedExamId } = useExam();
+  const [form, setForm] = useState({ display_name: "", chapter: "", topic: "", subtopic: "", custom_instruction: "" });
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const allTopics = useMemo(() => chapters.flatMap(c => c.topics), [chapters]);
+  // Chapter is the primary scope: topics are shown only for the chosen chapter.
+  const chapterTopics = useMemo(
+    () => chapters.find(c => c.chapter === form.chapter)?.topics ?? [],
+    [form.chapter, chapters]
+  );
   const availableSubtopics = useMemo(
-    () => allTopics.find(t => t.topic === form.topic)?.subtopics ?? [],
-    [form.topic, allTopics]
+    () => chapterTopics.find(t => t.topic === form.topic)?.subtopics ?? [],
+    [form.topic, chapterTopics]
   );
 
+  function handleChapterChange(value: string) {
+    setForm(p => ({ ...p, chapter: value, topic: "", subtopic: "" }));
+  }
   function handleTopicChange(value: string) {
     setForm(p => ({ ...p, topic: value, subtopic: "" }));
   }
@@ -42,12 +51,16 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!file) { setError("Please select a file."); return; }
+    if (!selectedExamId) { setError("Select an exam in the top bar first."); return; }
     if (!form.display_name.trim()) { setError("Document name is required."); return; }
+    if (!form.chapter) { setError("Chapter is required."); return; }
     setLoading(true); setError("");
     try {
       const fd = new FormData();
       fd.append("file", file);
       fd.append("display_name", form.display_name);
+      fd.append("exam_id", selectedExamId);
+      fd.append("chapter", form.chapter);
       fd.append("topic", form.topic);
       fd.append("subtopic", form.subtopic);
       fd.append("custom_instruction", form.custom_instruction);
@@ -70,20 +83,40 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
         <label className="block text-sm font-medium text-gray-700 mb-1">PDF or Word File *</label>
         <input aria-label="PDF or Word File" type="file" accept=".pdf,.doc,.docx" className="w-full text-sm" onChange={e => setFile(e.target.files?.[0] || null)} />
       </div>
+      <div>
+        <label className="block text-sm font-medium text-gray-700 mb-1">Chapter *</label>
+        <select
+          aria-label="Chapter"
+          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
+          value={form.chapter}
+          onChange={e => handleChapterChange(e.target.value)}
+        >
+          <option value="">— Select chapter —</option>
+          {chapters.map(c => (
+            <option key={c.chapter} value={c.chapter}>{c.chapter}</option>
+          ))}
+        </select>
+      </div>
       <div className="grid grid-cols-2 gap-3">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Topic (optional)</label>
-          <select
-            aria-label="Topic"
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
-            value={form.topic}
-            onChange={e => handleTopicChange(e.target.value)}
-          >
-            <option value="">— Auto-detect —</option>
-            {allTopics.map(t => (
-              <option key={t.topic} value={t.topic}>{t.topic}</option>
-            ))}
-          </select>
+          {chapterTopics.length > 0 ? (
+            <select
+              aria-label="Topic"
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
+              value={form.topic}
+              onChange={e => handleTopicChange(e.target.value)}
+            >
+              <option value="">— Auto-detect —</option>
+              {chapterTopics.map(t => (
+                <option key={t.topic} value={t.topic}>{t.topic}</option>
+              ))}
+            </select>
+          ) : (
+            <select aria-label="Topic" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white" disabled>
+              <option value="">{form.chapter ? "No topics" : "Select chapter first"}</option>
+            </select>
+          )}
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Subtopic (optional)</label>
@@ -121,17 +154,25 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
 // ── Generate from Content Tab ─────────────────────────────────────────────────
 
 function GenerateTab({ onJobStart, chapters }: { onJobStart: (jobId: string, mode: "generate") => void; chapters: ChapterNode[] }) {
-  const [form, setForm] = useState({ display_name: "", topic: "", subtopic: "", custom_instruction: "", count: "10" });
+  const { selectedExamId } = useExam();
+  const [form, setForm] = useState({ display_name: "", chapter: "", topic: "", subtopic: "", custom_instruction: "", count: "10" });
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const allTopics = useMemo(() => chapters.flatMap(c => c.topics), [chapters]);
+  // Chapter is the primary scope: topics are shown only for the chosen chapter.
+  const chapterTopics = useMemo(
+    () => chapters.find(c => c.chapter === form.chapter)?.topics ?? [],
+    [form.chapter, chapters]
+  );
   const availableSubtopics = useMemo(
-    () => allTopics.find(t => t.topic === form.topic)?.subtopics ?? [],
-    [form.topic, allTopics]
+    () => chapterTopics.find(t => t.topic === form.topic)?.subtopics ?? [],
+    [form.topic, chapterTopics]
   );
 
+  function handleChapterChange(value: string) {
+    setForm(p => ({ ...p, chapter: value, topic: "", subtopic: "" }));
+  }
   function handleTopicChange(value: string) {
     setForm(p => ({ ...p, topic: value, subtopic: "" }));
   }
@@ -139,12 +180,16 @@ function GenerateTab({ onJobStart, chapters }: { onJobStart: (jobId: string, mod
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!file) { setError("Please select a file."); return; }
+    if (!selectedExamId) { setError("Select an exam in the top bar first."); return; }
     if (!form.display_name.trim()) { setError("Document name is required."); return; }
+    if (!form.chapter) { setError("Chapter is required."); return; }
     setLoading(true); setError("");
     try {
       const fd = new FormData();
       fd.append("file", file);
       fd.append("display_name", form.display_name);
+      fd.append("exam_id", selectedExamId);
+      fd.append("chapter", form.chapter);
       fd.append("count", form.count);
       fd.append("topic", form.topic);
       fd.append("subtopic", form.subtopic);
@@ -172,20 +217,40 @@ function GenerateTab({ onJobStart, chapters }: { onJobStart: (jobId: string, mod
         <label className="block text-sm font-medium text-gray-700 mb-1">Number of MCQs to Generate</label>
         <input aria-label="Number of MCQs to Generate" type="number" min={1} max={100} className="w-32 rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.count} onChange={e => setForm(p => ({ ...p, count: e.target.value }))} />
       </div>
+      <div>
+        <label className="block text-sm font-medium text-gray-700 mb-1">Chapter *</label>
+        <select
+          aria-label="Chapter"
+          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
+          value={form.chapter}
+          onChange={e => handleChapterChange(e.target.value)}
+        >
+          <option value="">— Select chapter —</option>
+          {chapters.map(c => (
+            <option key={c.chapter} value={c.chapter}>{c.chapter}</option>
+          ))}
+        </select>
+      </div>
       <div className="grid grid-cols-2 gap-3">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Topic (optional)</label>
-          <select
-            aria-label="Topic"
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
-            value={form.topic}
-            onChange={e => handleTopicChange(e.target.value)}
-          >
-            <option value="">— Auto-detect —</option>
-            {allTopics.map(t => (
-              <option key={t.topic} value={t.topic}>{t.topic}</option>
-            ))}
-          </select>
+          {chapterTopics.length > 0 ? (
+            <select
+              aria-label="Topic"
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
+              value={form.topic}
+              onChange={e => handleTopicChange(e.target.value)}
+            >
+              <option value="">— Auto-detect —</option>
+              {chapterTopics.map(t => (
+                <option key={t.topic} value={t.topic}>{t.topic}</option>
+              ))}
+            </select>
+          ) : (
+            <select aria-label="Topic" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white" disabled>
+              <option value="">{form.chapter ? "No topics" : "Select chapter first"}</option>
+            </select>
+          )}
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Subtopic (optional)</label>
@@ -569,6 +634,7 @@ const EMPTY_OPTIONS: MCQOption[] = [
 ];
 
 function ManualAddTab({ onCreated, chapters }: { onCreated: () => void; chapters: ChapterNode[] }) {
+  const { selectedExamId } = useExam();
   const [form, setForm] = useState({
     question_text: "",
     explanation: "",
@@ -602,15 +668,18 @@ function ManualAddTab({ onCreated, chapters }: { onCreated: () => void; chapters
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!form.question_text.trim()) { setError("Question text is required."); return; }
+    if (!selectedExamId) { setError("Select an exam in the top bar first."); return; }
+    if (!form.chapter) { setError("Chapter is required."); return; }
     if (options.some(o => !o.text.trim())) { setError("All 4 options must have text."); return; }
     setLoading(true); setError(""); setSuccess(false);
     try {
       await mcqService.createQuestion({
+        exam_id: selectedExamId,
         question_text: form.question_text,
         options,
         correct_option_ids: [form.correct_option_id],
         explanation: form.explanation || undefined,
-        chapter: form.chapter || undefined,
+        chapter: form.chapter,
         topic: form.topic || undefined,
         subtopic: form.subtopic || undefined,
         complexity: form.complexity,
@@ -659,7 +728,7 @@ function ManualAddTab({ onCreated, chapters }: { onCreated: () => void; chapters
           </select>
         </div>
         <div>
-          <label className="block text-xs font-medium text-gray-600 mb-1">Chapter</label>
+          <label className="block text-xs font-medium text-gray-600 mb-1">Chapter *</label>
           <select aria-label="Chapter" className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.chapter} onChange={e => handleChapterChange(e.target.value)}>
             <option value="">— None —</option>
             {chapters.map(c => (
@@ -713,11 +782,13 @@ export function AdminMCQ() {
   const [tab, setTab] = useState<Tab>("upload");
   const [activeJobId, setActiveJobId] = useState("");
   const [reviewBatchId, setReviewBatchId] = useState("");
+  const { selectedExamId } = useExam();
   const [syllabusChapters, setSyllabusChapters] = useState<ChapterNode[]>([]);
 
   useEffect(() => {
-    syllabusService.getObjective().then(tree => setSyllabusChapters(tree.chapters)).catch(() => {});
-  }, []);
+    if (!selectedExamId) { setSyllabusChapters([]); return; }
+    syllabusService.get(selectedExamId).then(tree => setSyllabusChapters(tree.chapters)).catch(() => {});
+  }, [selectedExamId]);
 
   const TABS: { key: Tab; label: string }[] = [
     { key: "upload", label: "Upload Existing MCQs" },

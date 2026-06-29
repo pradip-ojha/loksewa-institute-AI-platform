@@ -9,19 +9,22 @@ the task rely on.
 Source-of-truth rule: per-question `marks` on SubjectiveQuestion is the hard cap
 for awardable marks — enforced in `clamp_marks` regardless of what the AI returns.
 """
+import asyncio
 import logging
 import uuid
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.exceptions import AppException
 from app.integrations.r2_client import get_r2
 from app.modules.ai_audit.models import AIOutput, AIRequest
 from app.modules.files.models import File
 from app.modules.jobs.models import ProcessingJob
 from app.modules.subjective.models import (
     AnswerEvaluation, AnswerExtraction, AnswerQualityCheck, PDFAnnotation,
-    QuestionSpecificCheckingSkill, StudentAnswerSheet, SubjectiveQuestion, SubjectiveTest,
+    QuestionSpecificCheckingSkill, StudentAnswerSheet, SubjectiveFeedbackChat,
+    SubjectiveFeedbackMessage, SubjectiveQuestion, SubjectiveTest,
 )
 from app.modules.users.models import User
 
@@ -138,10 +141,12 @@ async def list_submissions(db: AsyncSession, test_id: uuid.UUID) -> list[dict]:
 async def list_student_tests(db: AsyncSession, student_id: uuid.UUID) -> list[dict]:
     """Active tests + any test this student already submitted to, each with the
     student's own latest submission status."""
+    from app.modules.exams.service import get_enrolled_exam_ids
+    enrolled = await get_enrolled_exam_ids(db, student_id)
     sheets = await _student_sheets_by_test(db, student_id)
     test_ids = set(sheets.keys())
 
-    cond = SubjectiveTest.status == "active"
+    cond = (SubjectiveTest.status == "active") & SubjectiveTest.exam_id.in_(enrolled or [uuid.uuid4()])
     if test_ids:
         cond = cond | SubjectiveTest.id.in_(test_ids)
     r = await db.execute(select(SubjectiveTest).where(cond).order_by(SubjectiveTest.created_at.desc()))
@@ -214,7 +219,10 @@ async def build_student_result(db: AsyncSession, sheet: StudentAnswerSheet) -> d
     }
 
     evaluation = await _latest_evaluation(db, sheet.id)
-    if evaluation and sheet.current_status == "checked":
+    # Show marks + feedback as soon as they're ready (feedback_ready), even while the
+    # checked PDF is still being annotated. The checked-PDF URL stays None until the
+    # annotation row exists (status `checked`).
+    if evaluation and sheet.current_status in ("feedback_ready", "checked"):
         questions = await get_test_questions(db, sheet.test_id)
         by_number = {q.question_number: q for q in questions}
         rows = []
@@ -230,6 +238,7 @@ async def build_student_result(db: AsyncSession, sheet: StudentAnswerSheet) -> d
                     "awarded": float(s.get("awarded_marks", 0) or 0),
                     "max": float(s.get("max_marks", 0) or 0),
                     "status": s.get("status") or "partial",
+                    "note": str(s.get("note") or ""),
                 })
             rows.append({
                 "question_number": qnum or (q.question_number if q else "?"),
@@ -251,30 +260,331 @@ async def build_student_result(db: AsyncSession, sheet: StudentAnswerSheet) -> d
     return result
 
 
+# ── Answer-sheet feedback chatbot (synchronous, explains the stored result) ──────
+
+MAX_FEEDBACK_HISTORY = 10
+_FEEDBACK_GREETING = (
+    "नमस्ते! तपाईंको जाँचिएको उत्तरपुस्तिकाबारे जे पनि सोध्नुहोस् — किन यति अंक आयो, "
+    "कसरी सुधार्ने, के बुँदा छुट्यो, वा कुनै बुँदा थपेको भए के हुन्थ्यो। म तपाईंको "
+    "शिक्षकजस्तै बुझाउँछु।"
+)
+
+
+async def _load_feedback_chat(db: AsyncSession, chat_id: uuid.UUID) -> SubjectiveFeedbackChat | None:
+    r = await db.execute(select(SubjectiveFeedbackChat).where(SubjectiveFeedbackChat.id == chat_id))
+    return r.scalar_one_or_none()
+
+
+async def _feedback_messages(db: AsyncSession, chat_id: uuid.UUID) -> list[SubjectiveFeedbackMessage]:
+    r = await db.execute(
+        select(SubjectiveFeedbackMessage)
+        .where(SubjectiveFeedbackMessage.chat_id == chat_id)
+        .order_by(SubjectiveFeedbackMessage.created_at.asc())
+    )
+    return list(r.scalars().all())
+
+
+def _ensure_checked(sheet: StudentAnswerSheet) -> None:
+    """Feedback chat unlocks as soon as the result + feedback are ready (after the
+    reviewer pass), even while the checked PDF is still being annotated — its context
+    (questions, extracted answer, skills, evaluation) is all available pre-annotation."""
+    if sheet.current_status not in ("feedback_ready", "checked"):
+        raise AppException(
+            409, "not_checked",
+            "You can ask follow-up questions only after your answer sheet has been checked.",
+        )
+
+
+async def build_feedback_context(
+    db: AsyncSession, sheet: StudentAnswerSheet, include_qnums: set[str] | None = None,
+) -> str:
+    """Assemble the grounding context for the feedback chatbot from stored data ONLY
+    (no re-extraction, no Pinecone): per question the configured marks + the reviewed
+    evaluation (awarded, feedback, missing points, section breakdown), the student's
+    extracted answer text, and the locked per-question checking guide. The chatbot
+    explains this — it never re-grades.
+
+    `include_qnums` (when given) restricts the heavy PER-QUESTION detail to just those
+    question numbers — the selector agent (§12.1) decides which the student's message
+    actually needs, so we don't ship every question's guide on every turn. The test
+    header, overall result, and personalization block are always included. None = all
+    questions (used for the greeting and broad questions)."""
+    import json
+
+    test = await get_test(db, sheet.test_id)
+    questions = await get_test_questions(db, sheet.test_id)
+    evaluation = await _latest_evaluation(db, sheet.id)
+    eval_by_num: dict[str, dict] = {}
+    if evaluation and isinstance(evaluation.evaluation_data, dict):
+        for item in evaluation.evaluation_data.get("question_results", []) or []:
+            eval_by_num[str(item.get("question_number") or "")] = item
+
+    # Student's extracted answer text, keyed by question id.
+    extraction = (
+        await db.execute(
+            select(AnswerExtraction).where(AnswerExtraction.sheet_id == sheet.id)
+            .order_by(AnswerExtraction.created_at.desc()).limit(1)
+        )
+    ).scalar_one_or_none()
+    answer_by_qid: dict[str, str] = {}
+    if extraction and isinstance(extraction.extracted_data, dict):
+        for a in extraction.extracted_data.get("questions", []) or []:
+            answer_by_qid[str(a.get("qid") or "")] = str(a.get("answer_text") or "")
+
+    # Locked per-question checking guide, keyed by question id.
+    sk_r = await db.execute(
+        select(QuestionSpecificCheckingSkill).where(
+            QuestionSpecificCheckingSkill.test_id == sheet.test_id,
+            QuestionSpecificCheckingSkill.is_active.is_(True),
+        )
+    )
+    skill_by_qid = {sk.question_id: sk.skill_json for sk in sk_r.scalars().all()}
+
+    # 5th input (spec §5.2): personalization — who this student is + their subjective-mock
+    # mistake history. Best-effort; the chatbot still only EXPLAINS the stored result.
+    person = ""
+    try:
+        from app.modules.personalization import service as pers
+        person = await pers.build_subjective_feedback_context(db, sheet.student_id)
+    except Exception:
+        person = ""
+
+    lines: list[str] = []
+    if person:
+        lines.append("STUDENT CONTEXT (personalization — for tone/emphasis only; never changes the marks):")
+        lines.append(person)
+        lines.append("")
+    if test:
+        lines.append(f"TEST: {test.display_name}")
+        if test.custom_instruction:
+            lines.append(f"ADMIN CHECKING INSTRUCTION: {test.custom_instruction}")
+    if evaluation:
+        lines.append(
+            f"OVERALL: {evaluation.total_marks_awarded} / {evaluation.total_marks_possible}"
+        )
+        summary = (evaluation.evaluation_data or {}).get("overall_summary")
+        if summary:
+            lines.append(f"OVERALL SUMMARY: {summary}")
+
+    for q in questions:
+        # When the selector narrowed to specific questions, only emit those questions'
+        # heavy detail (digit-tolerant match). The header/overall/personalization above stay.
+        if include_qnums is not None and not _match_question_number(q.question_number, list(include_qnums)):
+            continue
+        item = eval_by_num.get(q.question_number) or _match_eval_item(q.question_number, eval_by_num)
+        lines.append("\n" + "─" * 8)
+        lines.append(f"QUESTION {q.question_number} (max {q.marks} marks): {q.question_text}")
+        ans = answer_by_qid.get(q.question_number) or _match_answer(q.question_number, answer_by_qid)
+        lines.append(f"STUDENT'S WRITTEN ANSWER (transcribed): {ans or '(not captured)'}")
+        if item:
+            lines.append(f"AWARDED: {item.get('awarded_marks')} / {item.get('max_marks', q.marks)}")
+            if item.get("feedback"):
+                lines.append(f"EXAMINER FEEDBACK: {item['feedback']}")
+            missing = item.get("missing_points") or []
+            if missing:
+                lines.append("MISSING POINTS: " + "; ".join(str(m) for m in missing))
+            sections = item.get("sections") or []
+            if sections:
+                lines.append("SECTION BREAKDOWN:")
+                for s in sections:
+                    if not isinstance(s, dict):
+                        continue
+                    lines.append(
+                        f"  - {s.get('section')}: {s.get('awarded_marks')}/{s.get('max_marks')} "
+                        f"[{s.get('status')}] — {s.get('note') or ''}"
+                    )
+        guide = skill_by_qid.get(q.id)
+        if guide:
+            lines.append("CHECKING GUIDE (how this question is marked): " + json.dumps(guide, ensure_ascii=False)[:4000])
+
+    return "\n".join(lines)
+
+
+async def _build_question_index(db: AsyncSession, sheet: StudentAnswerSheet) -> str:
+    """A compact one-line-per-question listing (number — short text — awarded/max) for the
+    feedback selector to route on. Cheap: no guides, no full answers."""
+    questions = await get_test_questions(db, sheet.test_id)
+    evaluation = await _latest_evaluation(db, sheet.id)
+    eval_by_num: dict[str, dict] = {}
+    if evaluation and isinstance(evaluation.evaluation_data, dict):
+        for item in evaluation.evaluation_data.get("question_results", []) or []:
+            eval_by_num[str(item.get("question_number") or "")] = item
+    lines: list[str] = []
+    for q in questions:
+        item = eval_by_num.get(q.question_number) or _match_eval_item(q.question_number, eval_by_num)
+        awarded = item.get("awarded_marks") if item else "?"
+        text = (q.question_text or "").strip().replace("\n", " ")[:90]
+        lines.append(f"{q.question_number} — {text} — {awarded}/{q.marks}")
+    return "\n".join(lines)
+
+
+def _match_eval_item(qnum: str, eval_by_num: dict[str, dict]) -> dict | None:
+    matched = _match_question_number(qnum, list(eval_by_num.keys()))
+    return eval_by_num.get(matched) if matched else None
+
+
+def _match_answer(qnum: str, answer_by_qid: dict[str, str]) -> str:
+    matched = _match_question_number(qnum, list(answer_by_qid.keys()))
+    return answer_by_qid.get(matched, "") if matched else ""
+
+
+async def start_feedback_chat(db: AsyncSession, sheet_id: uuid.UUID, student_id: uuid.UUID) -> dict:
+    """Open (or resume) the feedback chat for a checked sheet the student owns, seeded
+    with a greeting. Resumes the latest open chat so history isn't lost on reload."""
+    sheet = await get_sheet(db, sheet_id)
+    if not sheet or sheet.student_id != student_id:
+        raise AppException(404, "not_found", "Answer sheet not found.")
+    _ensure_checked(sheet)
+
+    existing = (
+        await db.execute(
+            select(SubjectiveFeedbackChat)
+            .where(
+                SubjectiveFeedbackChat.sheet_id == sheet_id,
+                SubjectiveFeedbackChat.student_id == student_id,
+                SubjectiveFeedbackChat.status == "open",
+            )
+            .order_by(SubjectiveFeedbackChat.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing:
+        msgs = await _feedback_messages(db, existing.id)
+        return {
+            "chat_id": existing.id,
+            "messages": [{"role": m.role, "content": m.content} for m in msgs],
+        }
+
+    chat = SubjectiveFeedbackChat(sheet_id=sheet_id, student_id=student_id, status="open")
+    db.add(chat)
+    await db.flush()
+    db.add(SubjectiveFeedbackMessage(chat_id=chat.id, role="assistant", content=_FEEDBACK_GREETING))
+    await db.commit()
+    return {"chat_id": chat.id, "messages": [{"role": "assistant", "content": _FEEDBACK_GREETING}]}
+
+
+async def post_feedback_question(
+    db: AsyncSession, sheet_id: uuid.UUID, chat_id: uuid.UUID, question: str, student_id: uuid.UUID,
+) -> dict:
+    """Persist the student turn, run the feedback agent against the stored evaluation
+    context, persist the reply, and return the full transcript + follow-up suggestions."""
+    from app.ai.agents.answer_feedback_chat_agent import AnswerFeedbackChatAgent
+
+    sheet = await get_sheet(db, sheet_id)
+    if not sheet or sheet.student_id != student_id:
+        raise AppException(404, "not_found", "Answer sheet not found.")
+    _ensure_checked(sheet)
+
+    chat = await _load_feedback_chat(db, chat_id)
+    if not chat or chat.sheet_id != sheet_id or chat.student_id != student_id:
+        raise AppException(404, "chat_not_found", "Feedback chat not found.")
+
+    prior = await _feedback_messages(db, chat_id)
+    history = "\n".join(
+        f"{'STUDENT' if m.role == 'student' else 'TUTOR'}: {m.content}"
+        for m in prior[-MAX_FEEDBACK_HISTORY:]
+    )
+
+    db.add(SubjectiveFeedbackMessage(chat_id=chat_id, role="student", content=question))
+    await db.flush()
+
+    # A cheap selector (§12.1) first picks which question(s) the student's message is
+    # about, so build_feedback_context only ships those questions' heavy grading detail
+    # instead of every question's on every turn. Fail-open: broad/unsure → full context.
+    from app.ai.agents.answer_feedback_selector_agent import AnswerFeedbackSelectorAgent
+    q_index = await _build_question_index(db, sheet)
+    selection = await AnswerFeedbackSelectorAgent(db).select(
+        question=question, question_index=q_index, history=history, sheet_id=sheet.id,
+    )
+    include = None if selection["needs_all"] else set(selection["question_numbers"])
+    context = await build_feedback_context(db, sheet, include_qnums=include)
+    agent = AnswerFeedbackChatAgent(db)
+    result = await agent.answer(
+        question=question, evaluation_context=context, history=history, sheet_id=sheet.id,
+    )
+
+    db.add(SubjectiveFeedbackMessage(chat_id=chat_id, role="assistant", content=result["reply"]))
+    await db.commit()
+
+    # Personalization: roll this turn into the chat-session summary (best-effort).
+    try:
+        from app.core.celery_client import get_celery
+        turns = f"{history}\nSTUDENT: {question}\nTUTOR: {result['reply']}"[:8000]
+        get_celery().send_task(
+            "workers.tasks.personalization_tasks.pers_update_chat",
+            args=[str(student_id), "subjective_feedback", str(chat_id), turns], queue="kvi_ai_default",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    messages = [{"role": m.role, "content": m.content} for m in prior]
+    messages.append({"role": "student", "content": question})
+    messages.append({"role": "assistant", "content": result["reply"]})
+    return {
+        "chat_id": chat_id,
+        "messages": messages,
+        "follow_up_suggestions": result["follow_up_suggestions"],
+    }
+
+
+async def get_feedback_chat(db: AsyncSession, sheet_id: uuid.UUID, student_id: uuid.UUID) -> dict:
+    """Latest open feedback chat for a sheet the student owns (for UI reload). Returns
+    an empty transcript when no chat has been started yet."""
+    sheet = await get_sheet(db, sheet_id)
+    if not sheet or sheet.student_id != student_id:
+        raise AppException(404, "not_found", "Answer sheet not found.")
+    chat = (
+        await db.execute(
+            select(SubjectiveFeedbackChat)
+            .where(
+                SubjectiveFeedbackChat.sheet_id == sheet_id,
+                SubjectiveFeedbackChat.student_id == student_id,
+                SubjectiveFeedbackChat.status == "open",
+            )
+            .order_by(SubjectiveFeedbackChat.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if not chat:
+        return {"chat_id": None, "messages": []}
+    msgs = await _feedback_messages(db, chat.id)
+    return {"chat_id": chat.id, "messages": [{"role": m.role, "content": m.content} for m in msgs]}
+
+
 # ── Knowledge fetch (skill-generation only, best-effort) ─────────────────────────
 
 async def fetch_question_resources(
-    db: AsyncSession, *, topic: str | None, subtopic: str | None, query: str, top_k: int = 6,
+    db: AsyncSession, *, exam_id, topic: str | None, subtopic: str | None, query: str,
+    chapter: str | None = None, top_k: int = 6,
 ) -> str:
-    """Vector-search the SUBJECTIVE knowledge set for a question's topic/subtopic and
-    return distilled excerpt text. Best-effort: returns "" on any failure or when no
-    knowledge is uploaded, so skill generation never blocks (CLAUDE.md §11 — knowledge
-    is used ONLY here at skill-generation time, never during per-sheet checking)."""
+    """Vector-search the exam's knowledge set for a question's chapter/topic/subtopic and
+    return distilled excerpt text. Always filtered by `exam_id` so retrieval never crosses
+    exams, and by `chapter` (the PRIMARY retrieval dimension, CLAUDE.md §8) when known so it
+    never crosses chapters within an exam; topic/subtopic narrow within the chapter.
+    Best-effort: returns "" on any failure or when no knowledge is uploaded, so skill
+    generation never blocks (CLAUDE.md §11 — knowledge is used ONLY here at skill-generation
+    time, never during per-sheet checking)."""
     from app.modules.knowledge.models import KnowledgeChunk
     try:
+        import asyncio
         from app.ai.model_router import get_provider
         from app.integrations.pinecone_client import get_pinecone
 
         embeddings = await get_provider("reasoning").embed([query[:6000]])
         if not embeddings:
             return ""
-        filter_dict: dict = {"content_usage_type": "subjective"}
+        filter_dict: dict = {"exam_id": str(exam_id)}
+        if chapter:
+            filter_dict["chapter"] = chapter
         if topic:
             filter_dict["topic"] = topic
         if subtopic:
             filter_dict["subtopic"] = {"$in": [subtopic]}
 
-        matches = get_pinecone().query(embeddings[0], top_k=top_k, filter_dict=filter_dict)
+        # Offload the blocking (sync) Pinecone SDK call so it can't stall the event loop.
+        matches = await asyncio.to_thread(
+            get_pinecone().query, embeddings[0], top_k, filter_dict,
+        )
         vector_ids = [m["id"] for m in matches if m.get("id")]
         if not vector_ids:
             return ""
@@ -404,6 +714,7 @@ def _clamp_sections(item: dict, question_cap: float) -> None:
         clean.append({
             "section": "अन्य", "max_marks": _half(question_cap - sum_max),
             "awarded_marks": 0.0, "status": "wrong", "evidence_text": "",
+            "note": "यो भागको लागि अपेक्षित उत्तर लेखिएको छैन — यो थप्नुपर्छ।",
         })
 
     # 2) Force the awarded section sum to equal the question's awarded marks.
@@ -713,7 +1024,7 @@ async def build_debug_pdf(db: AsyncSession, sheet_id: uuid.UUID) -> dict | None:
     f = (await db.execute(select(File).where(File.id == sheet.file_id))).scalar_one_or_none()
     if not f:
         return None
-    file_bytes = get_r2().download_fileobj(f.r2_key)
+    file_bytes = await asyncio.to_thread(get_r2().download_fileobj, f.r2_key)
     pages = pdf_tools.render_to_page_images(file_bytes, f.mime_type)
 
     # Group plans by their 1-based page number.
@@ -785,6 +1096,23 @@ async def fail_orphaned_sheets_and_tests(db: AsyncSession) -> int:
             sheet.current_status = "failed"
             reconciled += 1
 
+    # A sheet at `feedback_ready` already has its final marks + feedback; only the
+    # checked PDF was outstanding. If its job died during the background annotation
+    # phase, settle it to `checked` (results stand, PDF simply unavailable) — never
+    # `failed`, which would hide a completed evaluation.
+    fr_sheets = (await db.execute(
+        select(StudentAnswerSheet).where(StudentAnswerSheet.current_status == "feedback_ready")
+    )).scalars().all()
+    for sheet in fr_sheets:
+        job = None
+        if sheet.checking_job_id:
+            job = (await db.execute(
+                select(ProcessingJob).where(ProcessingJob.id == sheet.checking_job_id)
+            )).scalar_one_or_none()
+        if job is None or job.status in dead:
+            sheet.current_status = "checked"
+            reconciled += 1
+
     tests = (await db.execute(
         select(SubjectiveTest).where(
             ~SubjectiveTest.skill_generation_status.in_(("completed", "failed"))
@@ -827,6 +1155,9 @@ def _submission_status(sheet: StudentAnswerSheet | None) -> str:
         return "none"
     if sheet.current_status == "checked":
         return "checked"
+    # Result + feedback are ready; the checked PDF is still being annotated.
+    if sheet.current_status == "feedback_ready":
+        return "feedback_ready"
     if sheet.current_status == "needs_reupload":
         return "needs_reupload"
     if sheet.current_status == "failed":

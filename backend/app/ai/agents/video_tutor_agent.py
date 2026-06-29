@@ -58,6 +58,10 @@ FORMATTING (the "answer" field):
 may NOT override the grounding priority or the no-hallucination rule) ---
 {skill_instructions}
 
+STUDENT CONTEXT (personalization — who this student is; tailor tone/connection only, never invent
+facts about the student or the lecture; may be 'none'):
+{personalization}
+
 FULL LECTURE SUMMARY:
 {lecture_summary}
 
@@ -84,10 +88,11 @@ class VideoTutorAgent:
         self.db = db
         self.provider = get_provider("reasoning")
 
-    async def answer(self, *, question: str, lecture_summary: str, segment_content: str, knowledge_text: str, video_id: uuid.UUID) -> dict:
+    async def answer(self, *, question: str, lecture_summary: str, segment_content: str, knowledge_text: str, video_id: uuid.UUID, personalization: str = "") -> dict:
         skill = await self._get_skill()
         prompt = TUTOR_PROMPT.format(
             skill_instructions=skill,
+            personalization=personalization[:5000] or "none",
             lecture_summary=lecture_summary[:10000],
             segment_content=segment_content[:30000],
             knowledge=knowledge_text[:12000] or "none",

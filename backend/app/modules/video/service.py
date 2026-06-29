@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.r2_client import get_r2
 from app.modules.files.models import File
-from app.modules.syllabus.models import SyllabusItem, SyllabusType
+from app.modules.syllabus.models import SyllabusItem
 from app.modules.video.models import (
     Video, VideoChatMessage, VideoChatSession, VideoSlideLabel,
     VideoSummary, VideoTimelineSegment, VideoView,
@@ -111,7 +111,7 @@ def video_out_fields(v: Video) -> dict:
     return {
         "id": v.id,
         "display_name": v.display_name,
-        "content_usage_type": v.content_usage_type,
+        "exam_id": v.exam_id,
         "topic": v.topic,
         "subtopic": v.subtopic,
         "processing_status": v.processing_status,
@@ -194,9 +194,16 @@ def slide_out(s: VideoSlideLabel) -> dict:
 
 # ── Student ──────────────────────────────────────────────────────────────────────
 
-async def list_student_videos(db: AsyncSession) -> list[Video]:
+async def list_student_videos(db: AsyncSession, student_id: uuid.UUID) -> list[Video]:
+    from app.modules.exams.service import get_enrolled_exam_ids
+    enrolled = await get_enrolled_exam_ids(db, student_id)
+    if not enrolled:
+        return []
     r = await db.execute(
-        select(Video).where(Video.status == "active", Video.processing_status == "completed")
+        select(Video).where(
+            Video.status == "active", Video.processing_status == "completed",
+            Video.exam_id.in_(enrolled),
+        )
         .order_by(Video.created_at.desc())
     )
     return list(r.scalars().all())
@@ -236,44 +243,55 @@ async def get_chat_history(db: AsyncSession, video_id: uuid.UUID, student_id: uu
     return list(r.scalars().all())
 
 
-# ── Syllabus tree (fixed chapter, by content_usage_type) ─────────────────────────
+# ── Syllabus tree (per exam) ──────────────────────────────────────────────────
 
-async def get_chapter_tree(db: AsyncSession, content_usage_type: str) -> tuple[str, set[str], set[str]]:
-    """Return (tree_text, valid_topics, valid_subtopics) for the lecture's syllabus.
+async def get_chapter_tree(
+    db: AsyncSession, exam_id: uuid.UUID
+) -> tuple[str, set[str], set[str], set[str], dict[str, str]]:
+    """Return (tree_text, valid_topics, valid_subtopics, valid_chapters, topic_to_chapter).
 
-    content_usage_type ('objective'|'subjective') maps to the syllabus_type. The tree
-    text is what the routing/mapping agents are constrained to choose from.
+    Scoped by `exam_id` (replacing the old objective/subjective `content_usage_type`).
+    The tree text is what the routing/mapping agents are constrained to choose from, and
+    now leads with CHAPTER — the PRIMARY retrieval dimension (CLAUDE.md §8) — so agents can
+    return the chapter a topic belongs to. `topic_to_chapter` is the deterministic
+    topic→chapter lookup (each topic belongs to one chapter; on the rare collision the
+    agent's explicit chapter disambiguates). Shared by the video Q&A chain, the main AI
+    tutor, and subjective skill generation.
     """
-    try:
-        stype = SyllabusType(content_usage_type)
-    except ValueError:
-        stype = SyllabusType.objective
-
     r = await db.execute(
         select(SyllabusItem)
-        .where(SyllabusItem.syllabus_type == stype, SyllabusItem.is_active.is_(True))
+        .where(SyllabusItem.exam_id == exam_id, SyllabusItem.is_active.is_(True))
         .order_by(SyllabusItem.sort_order)
     )
     items = list(r.scalars().all())
 
     valid_topics: set[str] = set()
     valid_subtopics: set[str] = set()
-    by_topic: dict[str, list[str]] = {}
+    valid_chapters: set[str] = set()
+    topic_to_chapter: dict[str, str] = {}
+    # chapter -> {topic -> [subtopics]}
+    by_chapter: dict[str, dict[str, list[str]]] = {}
     for it in items:
+        chapter = it.chapter or "(unspecified)"
+        valid_chapters.add(chapter)
+        by_chapter.setdefault(chapter, {})
         if it.topic:
             valid_topics.add(it.topic)
-            by_topic.setdefault(it.topic, [])
-        if it.subtopic:
-            valid_subtopics.add(it.subtopic)
-            by_topic.setdefault(it.topic, []).append(it.subtopic)
+            topic_to_chapter.setdefault(it.topic, chapter)
+            by_chapter[chapter].setdefault(it.topic, [])
+            if it.subtopic:
+                valid_subtopics.add(it.subtopic)
+                by_chapter[chapter][it.topic].append(it.subtopic)
 
     lines: list[str] = []
-    for topic, subs in by_topic.items():
-        lines.append(f"- TOPIC: {topic}")
-        for sub in subs:
-            lines.append(f"    - SUBTOPIC: {sub}")
+    for chapter, topics in by_chapter.items():
+        lines.append(f"- CHAPTER: {chapter}")
+        for topic, subs in topics.items():
+            lines.append(f"    - TOPIC: {topic}")
+            for sub in subs:
+                lines.append(f"        - SUBTOPIC: {sub}")
     tree_text = "\n".join(lines) or "(no syllabus topics configured)"
-    return tree_text, valid_topics, valid_subtopics
+    return tree_text, valid_topics, valid_subtopics, valid_chapters, topic_to_chapter
 
 
 # ── Q&A chain (timeline-first) ───────────────────────────────────────────────────
@@ -321,10 +339,11 @@ async def run_qa_chain(
     segment_context = _format_segment_context(selected, include_transcript=False)
     segment_content = _format_segment_context(selected, include_transcript=True)
 
-    # ── Step 3: Topic/Subtopic Router ────────────────────────────────────────────
-    tree_text, valid_topics, valid_subtopics = await get_chapter_tree(db, video.content_usage_type)
+    # ── Step 3: Topic/Subtopic Router (also flags whether the knowledge layer is needed) ─
+    tree_text, valid_topics, valid_subtopics, _valid_chapters, _topic_to_chapter = await get_chapter_tree(db, video.exam_id)
     detected_topic: str | None = None
     detected_subtopics: list[str] = []
+    needs_knowledge = False
     if valid_topics:
         try:
             topic_route = await VideoTopicRouterAgent(db).route(
@@ -335,6 +354,7 @@ async def run_qa_chain(
             if cand_topic in valid_topics:
                 detected_topic = cand_topic
             detected_subtopics = [s for s in topic_route.get("subtopic_ids", []) if s in valid_subtopics]
+            needs_knowledge = bool(topic_route.get("needs_knowledge"))
         except Exception as exc:
             logger.warning("topic routing failed: %s", exc)
     # Fall back to the segments' own mapped topic when the router is unsure.
@@ -344,17 +364,23 @@ async def run_qa_chain(
                 detected_topic = s.topic
                 break
 
-    # ── Step 4: Fetch supporting knowledge (filtered) ────────────────────────────
-    knowledge_text, supporting = await fetch_supporting_knowledge(
-        db, content_usage_type=video.content_usage_type,
-        topic=detected_topic, subtopic_ids=detected_subtopics, question=question,
-    )
+    # ── Step 4: Fetch supporting knowledge ONLY when the question is deep enough ──
+    # (spec §5.3 — the lecture transcript/summary answers most questions; reach for the
+    # book/notes layer only when the topic router flags it).
+    knowledge_text, supporting = "", []
+    if needs_knowledge:
+        knowledge_text, supporting = await fetch_supporting_knowledge(
+            db, exam_id=video.exam_id, chapter=video.chapter,
+            topic=detected_topic, subtopic_ids=detected_subtopics, question=question,
+        )
 
-    # ── Step 5: Main Tutor ───────────────────────────────────────────────────────
+    # ── Step 5: Main Tutor (with personalization) ────────────────────────────────
+    from app.modules.personalization import service as pers
+    personalization = await pers.build_video_tutor_context(db, session.student_id)
     answer = await VideoTutorAgent(db).answer(
         question=question, lecture_summary=lecture_summary_text,
         segment_content=segment_content or "(no specific lecture segment matched this question)",
-        knowledge_text=knowledge_text, video_id=video.id,
+        knowledge_text=knowledge_text, video_id=video.id, personalization=personalization,
     )
 
     selected_out = [{
@@ -383,6 +409,18 @@ async def run_qa_chain(
     )
     db.add(msg)
     await db.commit()
+
+    # Personalization: roll this turn into the video chat-session summary (best-effort).
+    try:
+        from app.core.celery_client import get_celery
+        get_celery().send_task(
+            "workers.tasks.personalization_tasks.pers_update_chat",
+            args=[str(session.student_id), "video", str(session.id),
+                  f"STUDENT: {question}\nTUTOR: {answer['answer']}"[:8000]],
+            queue="kvi_ai_default",
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
     return {
         "answer": answer["answer"],
@@ -427,28 +465,37 @@ def _format_segment_context(segments: list[VideoTimelineSegment], *, include_tra
 
 
 async def fetch_supporting_knowledge(
-    db: AsyncSession, *, content_usage_type: str, topic: str | None,
-    subtopic_ids: list[str], question: str, top_k: int = 5,
+    db: AsyncSession, *, exam_id: uuid.UUID, topic: str | None,
+    subtopic_ids: list[str], question: str, chapter: str | None = None, top_k: int = 5,
 ) -> tuple[str, list[dict]]:
-    """Vector search ONLY inside the routed topic/subtopic knowledge set (never global).
+    """Vector search ONLY inside the routed knowledge set (never global), ALWAYS filtered
+    by `exam_id` so retrieval never crosses exams, and by `chapter` (the PRIMARY retrieval
+    dimension, CLAUDE.md §8) when known so it never crosses chapters within an exam;
+    topic/subtopic narrow within the chapter.
     Returns (knowledge_text, supporting_list). Best-effort: returns empty on any failure
     so Q&A still works grounded in the lecture alone."""
     from app.modules.knowledge.models import KnowledgeChunk
 
     try:
+        import asyncio
         from app.ai.model_router import get_provider
         from app.integrations.pinecone_client import get_pinecone
 
         embeddings = await get_provider("reasoning").embed([question])
         if not embeddings:
             return "", []
-        filter_dict: dict = {"content_usage_type": content_usage_type}
+        filter_dict: dict = {"exam_id": str(exam_id)}
+        if chapter:
+            filter_dict["chapter"] = chapter
         if topic:
             filter_dict["topic"] = topic
         if subtopic_ids:
             filter_dict["subtopic"] = {"$in": subtopic_ids}
 
-        matches = get_pinecone().query(embeddings[0], top_k=top_k, filter_dict=filter_dict)
+        # Offload the blocking (sync) Pinecone SDK call so it can't stall the event loop.
+        matches = await asyncio.to_thread(
+            get_pinecone().query, embeddings[0], top_k, filter_dict,
+        )
         vector_ids = [m["id"] for m in matches if m.get("id")]
         if not vector_ids:
             return "", []

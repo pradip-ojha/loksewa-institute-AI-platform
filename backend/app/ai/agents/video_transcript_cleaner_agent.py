@@ -47,7 +47,7 @@ Return ONLY valid JSON in exactly this structure:
 class VideoTranscriptCleanerAgent:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.provider = get_provider("reasoning")
+        self.provider = get_provider("thinking")
 
     async def clean(self, *, raw_transcript: str, custom_instruction: str | None, video_id: uuid.UUID) -> dict:
         skill = await self._get_skill()

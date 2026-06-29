@@ -27,8 +27,11 @@ _TARGET_SAMPLE_RATE = 16000
 _TARGET_CHANNELS = 1
 EXTRACTED_MIME = "audio/mpeg"
 
-# Chunking defaults (CLAUDE.md §13: 5–10 min chunks, 10–15 s overlap).
-DEFAULT_CHUNK_MINUTES = 8
+# Chunking defaults. Smaller chunks tighten the per-chunk global time window that
+# the timeline agent anchors segment timestamps to, so the lecture timeline lands
+# closer to real time (gpt-4o-transcribe gives no per-segment timestamps of its own —
+# Azure rejects verbose_json for it — so chunk size IS the timeline granularity).
+DEFAULT_CHUNK_MINUTES = 3
 DEFAULT_OVERLAP_SECONDS = 12
 
 

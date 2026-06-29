@@ -1,15 +1,38 @@
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote_plus
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ENV_FILE = Path(__file__).parent.parent.parent / ".env"  # backend/.env
+
+_DEFAULT_DATABASE_URL = "postgresql+asyncpg://neurafix:neurafix_dev_pass@localhost:5432/neurafix"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE), env_file_encoding="utf-8", extra="ignore")
 
     # Database
-    DATABASE_URL: str = "postgresql+asyncpg://neurafix:neurafix_dev_pass@localhost:5432/neurafix"
+    # Either set DATABASE_URL directly (asyncpg driver), or provide the discrete
+    # PG* components below (e.g. Azure Postgres connection info) and DATABASE_URL
+    # is assembled from them at startup (see _assemble_database_url).
+    DATABASE_URL: str = _DEFAULT_DATABASE_URL
+
+    # Discrete Postgres connection parts (Azure flexible server style). When PGHOST
+    # is set and DATABASE_URL is left at its default, these are used to build the
+    # asyncpg URL with SSL required (Azure mandates TLS).
+    PGHOST: str = ""
+    PGUSER: str = ""
+    PGPORT: int = 5432
+    PGDATABASE: str = ""
+    PGPASSWORD: str = ""
+
+    # DB connection pool (per process: FastAPI + each Celery worker keep their own).
+    # Sized so (API + worker×concurrency + beat) stays comfortably under Azure PG
+    # max_connections. Raise on a larger PG tier / higher worker concurrency.
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 10
 
     # Auth
     JWT_SECRET: str = "change-this-secret"
@@ -38,7 +61,17 @@ class Settings(BaseSettings):
     AZURE_OPENAI_API_VERSION_REASONING: str = "2026-04-24"
     AZURE_OPENAI_API_VERSION_EMBEDDING: str = "2025-01-01-preview"
     AZURE_OPENAI_API_VERSION_TRANSCRIPTION: str = "2025-03-01-preview"
+    # API versions for the tiered chat deployments (gpt-5 "thinking", gpt-5-mini "fast").
+    AZURE_OPENAI_API_VERSION_THINKING: str = "2025-01-01-preview"
+    AZURE_OPENAI_API_VERSION_FAST: str = "2025-01-01-preview"
+    # Model tiers (see ai/model_router.py):
+    #   MODEL_REASONING (gpt-5.5)  → high-intelligence reasoning (generation, evaluation, tutors)
+    #   MODEL_CHAT_THINKING (gpt-5) → typed text/vision extraction (printed/scanned docs, question papers)
+    #   MODEL_CHAT_FAST (gpt-5-mini) → lower-intelligence work (semantic chunking)
+    # Gemini (MODEL_VISION) is handwriting-only.
     MODEL_REASONING: str = "gpt-5.5"
+    MODEL_CHAT_THINKING: str = "gpt-5"
+    MODEL_CHAT_FAST: str = "gpt-5-mini"
     MODEL_EMBEDDING: str = "text-embedding-3-large"
     MODEL_TRANSCRIPTION: str = "gpt-4o-transcribe"
     EMBEDDING_DIMENSIONS: int = 3072
@@ -66,6 +99,23 @@ class Settings(BaseSettings):
     DEFAULT_ADMIN_EMAIL: str = "admin@neurafix.ai"
     DEFAULT_ADMIN_PASSWORD: str = "Admin@123"
     DEFAULT_ADMIN_NAME: str = "Institute Admin"
+
+    @model_validator(mode="after")
+    def _assemble_database_url(self) -> "Settings":
+        """Build an asyncpg DATABASE_URL from discrete PG* parts when an explicit
+        DATABASE_URL was not supplied. The password is percent-encoded so special
+        characters (@, #, etc.) don't corrupt the URL, and SSL is required because
+        Azure Postgres rejects non-TLS connections."""
+        explicit = bool(self.DATABASE_URL) and self.DATABASE_URL != _DEFAULT_DATABASE_URL
+        if not explicit and self.PGHOST:
+            user = quote_plus(self.PGUSER.strip())
+            password = quote_plus(self.PGPASSWORD.strip())
+            host = self.PGHOST.strip()
+            database = self.PGDATABASE.strip()
+            self.DATABASE_URL = (
+                f"postgresql+asyncpg://{user}:{password}@{host}:{self.PGPORT}/{database}?ssl=require"
+            )
+        return self
 
     def missing_required(self) -> list[str]:
         """Return names of critical settings still left at an empty/placeholder

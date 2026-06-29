@@ -40,7 +40,7 @@ Return ONLY valid JSON in exactly this structure:
 class VideoSegmentTopicMapperAgent:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.provider = get_provider("reasoning")
+        self.provider = get_provider("thinking")
 
     async def map_segments(self, *, segments: list[dict], tree_text: str, video_id: uuid.UUID) -> dict[int, dict]:
         skill = await self._get_skill()

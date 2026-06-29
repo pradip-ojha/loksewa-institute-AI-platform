@@ -21,8 +21,10 @@ right supporting notes can be fetched for it.
 TASK: Pick the single best topic (and subtopic when clear) for the question below.
 
 HARD RULES (never violate):
-- Choose topic and subtopic ONLY from the syllabus tree below — copy the exact strings. NEVER
-  invent, paraphrase, translate, or merge names.
+- Choose chapter, topic and subtopic ONLY from the syllabus tree below — copy the exact strings.
+  NEVER invent, paraphrase, translate, or merge names.
+- `chapter` is the PRIMARY dimension: return the exact CHAPTER the chosen topic is nested under.
+  If no topic fits but a chapter clearly does, return that chapter with topic null.
 - Judge purely from the question's subject matter, not its wording style or marks.
 - If unsure of the subtopic, leave it null. If unsure of the topic, pick the broader best-fit
   topic and lower the confidence — never force a precise match you are not sure of.
@@ -35,13 +37,13 @@ QUESTION TEXT:
 {question_text}
 
 Return ONLY valid JSON in exactly this structure:
-{{"topic": "exact topic string or null", "subtopic": "exact subtopic string or null", "confidence": 0.0}}"""
+{{"chapter": "exact chapter string or null", "topic": "exact topic string or null", "subtopic": "exact subtopic string or null", "confidence": 0.0}}"""
 
 
 class SubjectiveTopicRouterAgent:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.provider = get_provider("reasoning")
+        self.provider = get_provider("thinking")
 
     async def route(
         self, *, question_number: str, question_text: str, tree_text: str, test_id: uuid.UUID,
@@ -69,6 +71,7 @@ class SubjectiveTopicRouterAgent:
         if not isinstance(result, dict):
             raise AIResponseError("subjective topic routing did not return an object")
         return {
+            "chapter": (str(result["chapter"]).strip() if result.get("chapter") else None),
             "topic": (str(result["topic"]).strip() if result.get("topic") else None),
             "subtopic": (str(result["subtopic"]).strip() if result.get("subtopic") else None),
             "confidence": float(result.get("confidence", 0) or 0),
