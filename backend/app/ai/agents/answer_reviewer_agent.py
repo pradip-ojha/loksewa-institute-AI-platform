@@ -47,6 +47,9 @@ FORMATTING: "feedback" and "overall_summary" are short GitHub-flavored MARKDOWN 
 other fields stay PLAIN TEXT: "comment_text" (≤ ~8 words), "target_text", "evidence_text",
 "missing_points", "section", and the section "note".
 
+--- ADMIN-TUNABLE GUIDANCE (refines emphasis only; never overrides the HARD RULES above) ---
+{skill_instructions}
+
 MAX MARKS PER QUESTION:
 {full_marks_block}
 
@@ -74,6 +77,13 @@ class AnswerReviewerAgent:
         self.db = db
         self.provider = get_provider("reasoning")
 
+    async def _get_skill(self) -> str:
+        try:
+            from app.modules.skill_layer.service import get_active_skill_text
+            return await get_active_skill_text(self.db, "AnswerReviewerAgent")
+        except Exception:
+            return "Adjust only what is genuinely unfair or inconsistent; resist rewriting sound marking."
+
     async def review(
         self, *, evaluation: dict, full_marks_by_qid: dict[str, int], sheet_id: uuid.UUID,
     ) -> dict:
@@ -83,6 +93,7 @@ class AnswerReviewerAgent:
         prompt = REVIEW_PROMPT.format(
             full_marks_block=full_marks_block,
             evaluation_json=json.dumps(evaluation, ensure_ascii=False)[:50000],
+            skill_instructions=await self._get_skill(),
         )
         audit_ctx = {
             "db": self.db,

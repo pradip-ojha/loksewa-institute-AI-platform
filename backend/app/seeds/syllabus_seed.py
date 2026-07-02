@@ -15,11 +15,13 @@ logger = logging.getLogger("neurafix")
 
 SEEDS_DIR = Path(__file__).parent
 
-# Default exams created on first startup so the platform boots with a usable baseline
-# after the multi-exam clean-slate cut-over. Admins add more exams from the UI.
+# Default exams created on first startup so the platform boots with a usable baseline.
+# These are the real Banking 4th Level (unified examination system) exams — one objective
+# pre-test and the two subjective papers, each strictly ONE type. Admins add more from the UI.
 _DEFAULT_EXAMS = [
-    ("objective", "RBB Assistant (Objective)", "objective_syllabus.json"),
-    ("subjective", "RBB Assistant (Subjective)", "subjective_syllabus.json"),
+    ("subjective", "Banking 4th Level First Paper", "banking_first_paper_subjective.json"),
+    ("objective", "Banking 4th Level Pretest", "banking_pretest_objective.json"),
+    ("subjective", "Banking 4th Level Second Paper", "banking_second_paper_subjective.json"),
 ]
 
 

@@ -16,7 +16,7 @@ from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-TUTOR_PROMPT = EXAM_CONTEXT + """
+_TUTOR_BODY = EXAM_CONTEXT + """
 
 ROLE: You are a warm, encouraging Loksewa tutor for ONE selected exam. A student asks a question;
 you answer like their teacher using the retrieved notes/book content for the selected topic, and you
@@ -59,7 +59,9 @@ RECENT CONVERSATION (oldest first; may be 'none'):
 
 STUDENT QUESTION:
 {question}
+"""
 
+_JSON_TAIL = """
 Return ONLY valid JSON in exactly this structure:
 {{
   "answer": "the student-facing answer as markdown",
@@ -67,6 +69,17 @@ Return ONLY valid JSON in exactly this structure:
   "confidence": 0.0,
   "follow_up_suggestions": ["short follow-up question", "..."]
 }}"""
+
+# Streaming variant: answer text is streamed live, so it is emitted as plain markdown
+# first, then a marker + a tiny JSON tail carries the metadata (parsed server-side).
+_STREAM_TAIL = """
+First output the student-facing answer as clean GitHub-flavored markdown (follow the FORMATTING rules
+above). Then, on a NEW LINE, output the exact marker <<<META>>> followed by a single-line JSON object:
+{{"follow_up_suggestions": ["short follow-up question", "..."], "language": "nepali" | "roman_nepali" | "english", "confidence": 0.0}}
+Write NOTHING after that JSON object, and NEVER use the <<<META>>> marker anywhere inside the answer."""
+
+TUTOR_PROMPT = _TUTOR_BODY + _JSON_TAIL
+TUTOR_STREAM_PROMPT = _TUTOR_BODY + _STREAM_TAIL
 
 
 class TutorAgent:
@@ -107,6 +120,34 @@ class TutorAgent:
             "confidence": float(result.get("confidence", 0) or 0),
             "follow_up_suggestions": [str(s) for s in fu][:4] if isinstance(fu, list) else [],
         }
+
+    async def answer_stream(
+        self, *, question: str, scope: str, knowledge_text: str, history: str,
+        session_id: uuid.UUID, personalization: str = "", meta_sink: dict,
+    ):
+        """Stream the answer markdown as plain-text deltas; the parsed metadata
+        (follow_up_suggestions / language / confidence) lands in ``meta_sink`` once
+        the stream completes."""
+        from app.ai.agents.streaming import stream_answer_with_meta
+
+        skill = await self._get_skill()
+        prompt = TUTOR_STREAM_PROMPT.format(
+            skill_instructions=skill or "none",
+            scope=scope[:6000] or "(exam syllabus)",
+            personalization=personalization[:6000] or "none",
+            knowledge=knowledge_text[:14000] or "none",
+            history=history[:6000] or "none",
+            question=question[:2000],
+        )
+        audit_ctx = {
+            "db": self.db,
+            "agent_type": "TutorAgent",
+            "task_type": "tutor_answer",
+            "entity_type": "tutor_chat_session",
+            "entity_id": session_id,
+        }
+        async for delta in stream_answer_with_meta(self.provider, prompt, audit_ctx, meta_sink):
+            yield delta
 
     async def _get_skill(self) -> str:
         try:

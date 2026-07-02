@@ -23,7 +23,7 @@ from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-TUTOR_PROMPT = EXAM_CONTEXT + """
+_TUTOR_BODY = EXAM_CONTEXT + """
 
 ROLE: You are a warm, encouraging Loksewa lecture tutor. A student watching a recorded lecture
 asks you a question; you answer as their teacher would — clear, friendly, and grounded in what was
@@ -73,7 +73,9 @@ APPROVED KNOWLEDGE CHUNKS (secondary support; may be 'none'):
 
 STUDENT QUESTION:
 {question}
+"""
 
+_JSON_TAIL = """
 Return ONLY valid JSON in exactly this structure:
 {{
   "answer": "the student-facing answer as markdown (bold key point, bullet supporting points)",
@@ -81,6 +83,17 @@ Return ONLY valid JSON in exactly this structure:
   "confidence": 0.0,
   "follow_up_suggestions": ["short follow-up question", "..."]
 }}"""
+
+# Streaming variant: stream the answer markdown live, then a marker + tiny JSON tail.
+_STREAM_TAIL = """
+First output the student-facing answer as clean GitHub-flavored markdown (follow the FORMATTING and
+attribution rules above). Then, on a NEW LINE, output the exact marker <<<META>>> followed by a
+single-line JSON object:
+{{"follow_up_suggestions": ["short follow-up question", "..."], "language": "nepali" | "roman_nepali" | "english", "confidence": 0.0}}
+Write NOTHING after that JSON object, and NEVER use the <<<META>>> marker anywhere inside the answer."""
+
+TUTOR_PROMPT = _TUTOR_BODY + _JSON_TAIL
+TUTOR_STREAM_PROMPT = _TUTOR_BODY + _STREAM_TAIL
 
 
 class VideoTutorAgent:
@@ -118,6 +131,30 @@ class VideoTutorAgent:
             "confidence": float(result.get("confidence", 0) or 0),
             "follow_up_suggestions": [str(s) for s in fu][:4] if isinstance(fu, list) else [],
         }
+
+    async def answer_stream(self, *, question: str, lecture_summary: str, segment_content: str, knowledge_text: str, video_id: uuid.UUID, personalization: str = "", meta_sink: dict):
+        """Stream the answer markdown as plain-text deltas; parsed metadata
+        (follow_up_suggestions / language / confidence) lands in ``meta_sink``."""
+        from app.ai.agents.streaming import stream_answer_with_meta
+
+        skill = await self._get_skill()
+        prompt = TUTOR_STREAM_PROMPT.format(
+            skill_instructions=skill,
+            personalization=personalization[:5000] or "none",
+            lecture_summary=lecture_summary[:10000],
+            segment_content=segment_content[:30000],
+            knowledge=knowledge_text[:12000] or "none",
+            question=question[:2000],
+        )
+        audit_ctx = {
+            "db": self.db,
+            "agent_type": "VideoTutorAgent",
+            "task_type": "video_tutor_answer",
+            "entity_type": "video",
+            "entity_id": video_id,
+        }
+        async for delta in stream_answer_with_meta(self.provider, prompt, audit_ctx, meta_sink):
+            yield delta
 
     async def _get_skill(self) -> str:
         try:

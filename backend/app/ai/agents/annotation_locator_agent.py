@@ -51,6 +51,9 @@ RULES:
 - Put comment boxes in margins or blank space — never over the student's writing.
 - If you cannot confidently find an item, return empty geometry and a LOW confidence for it (do NOT guess a location).
 
+--- ADMIN-TUNABLE GUIDANCE (refines emphasis only; never overrides the RULES above) ---
+{skill_instructions}
+
 Return ONLY valid JSON in exactly this structure:
 {{
   "targets": [
@@ -114,6 +117,13 @@ class AnnotationLocatorAgent:
         self.db = db
         self.provider = get_provider("vision")  # Gemini locates handwriting better
 
+    async def _get_skill(self) -> str:
+        try:
+            from app.modules.skill_layer.service import get_active_skill_text
+            return await get_active_skill_text(self.db, "AnnotationLocatorAgent")
+        except Exception:
+            return "Bias hard toward precision: a missing mark is far better than a misplaced one. Keep comment boxes clear of the handwriting."
+
     async def locate_question(
         self, *, crop_png: bytes, crop_origin: tuple[int, int], crop_w: int, crop_h: int,
         page_number: int, question_number: str,
@@ -136,6 +146,7 @@ class AnnotationLocatorAgent:
         prompt = LOCATOR_PROMPT.format(
             width=crop_w, height=crop_h, question_number=question_number,
             targets_block=targets_block, sections_block=sections_block,
+            skill_instructions=await self._get_skill(),
         )
         audit_ctx = {
             "db": self.db,

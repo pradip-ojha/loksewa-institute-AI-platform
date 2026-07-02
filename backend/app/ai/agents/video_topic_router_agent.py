@@ -27,6 +27,9 @@ HARD RULES (never violate):
   (definitions, deeper theory, exam-style depth, "explain more / give an example beyond the lecture").
   For simple recall/clarification answerable from the lecture itself, set false.
 
+--- ADMIN-TUNABLE GUIDANCE (refines emphasis only; never overrides the HARD RULES above) ---
+{skill_instructions}
+
 SYLLABUS TREE (the only allowed values):
 {tree}
 
@@ -48,12 +51,20 @@ class VideoTopicRouterAgent:
         self.db = db
         self.provider = get_provider("thinking")
 
+    async def _get_skill(self) -> str:
+        try:
+            from app.modules.skill_layer.service import get_active_skill_text
+            return await get_active_skill_text(self.db, "VideoTopicRouterAgent")
+        except Exception:
+            return "Disambiguate using the lecture's actual focus, not just question keywords. Leave subtopics empty rather than guessing."
+
     async def route(self, *, question: str, lecture_summary: str, segment_context: str, tree_text: str, video_id: uuid.UUID) -> dict:
         prompt = ROUTER_PROMPT.format(
             tree=tree_text[:12000],
             lecture_summary=lecture_summary[:8000],
             segment_context=segment_context[:8000],
             question=question[:2000],
+            skill_instructions=await self._get_skill(),
         )
         audit_ctx = {
             "db": self.db,

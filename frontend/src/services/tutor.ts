@@ -1,4 +1,5 @@
 import api from "./api";
+import { streamNdjson, type StreamHandlers } from "./stream";
 
 export interface SupportingKnowledge {
   chunk_id: string;
@@ -39,6 +40,8 @@ export interface TutorHistoryItem {
 export const tutorService = {
   ask: (body: TutorAskBody): Promise<TutorAskResponse> =>
     api.post("/api/student/tutor/ask", body, { timeout: 120_000 }).then((r) => r.data),
+  askStream: (body: TutorAskBody, handlers: StreamHandlers, signal?: AbortSignal): Promise<void> =>
+    streamNdjson("/api/student/tutor/ask/stream", body, handlers, signal),
   getHistory: (sessionId: string): Promise<TutorHistoryItem[]> =>
     api.get("/api/student/tutor/history", { params: { session_id: sessionId } }).then((r) => r.data),
 };

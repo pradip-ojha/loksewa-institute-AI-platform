@@ -45,7 +45,7 @@ Return ONLY valid JSON: {{"question_numbers": ["1", ...], "needs_all": false}}""
 class AnswerFeedbackSelectorAgent:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.provider = get_provider("routing")  # gpt-5-mini (fast) — cheap routing
+        self.provider = get_provider("thinking")  # gpt-5 (thinking) — accurate routing
 
     async def select(
         self, *, question: str, question_index: str, history: str, sheet_id: uuid.UUID,

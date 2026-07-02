@@ -1,13 +1,15 @@
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import require_admin, require_student
 from app.core.database import get_db
 from app.core.exceptions import AppException
+from app.core.ratelimit import AI_CHAT_LIMIT, limiter
 from app.modules.files.service import store_upload
 from app.modules.jobs.models import JobStatus, ProcessingJob
 from app.modules.jobs.schemas import JobOut
@@ -352,7 +354,14 @@ async def upload_answer(
         current_status="uploaded",
     )
     db.add(sheet)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # A concurrent upload for the same (test, student) already claimed this attempt
+        # number (uq_answer_sheet_test_student_attempt). Treat as a duplicate submission
+        # rather than inserting a second sheet + a second checking job.
+        await db.rollback()
+        raise AppException(409, "in_progress", "Your submission is already being processed.")
 
     job = await create_job(
         db, job_type="answer_sheet_checking",
@@ -406,7 +415,9 @@ async def feedback_chat_start(
 
 
 @router.post("/student/subjective/sheets/{sheet_id}/feedback-chat/{chat_id}/message", response_model=FeedbackChatReplyOut)
+@limiter.limit(AI_CHAT_LIMIT)
 async def feedback_chat_message(
+    request: Request,
     sheet_id: uuid.UUID,
     chat_id: uuid.UUID,
     body: FeedbackChatMessageIn,

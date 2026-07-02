@@ -16,6 +16,24 @@ logger = logging.getLogger(__name__)
 
 _VALID_COMPLEXITY = {"easy", "medium", "hard"}
 
+
+async def _clear_prior_batches(db: AsyncSession, job_id: uuid.UUID) -> None:
+    """Idempotency for retries: a Celery retry re-runs the task from the top, and the
+    SAVE step is insert-only (new batch + questions keyed by this job_id). Without this,
+    a transient AI failure on attempt 1 would leave a half-built batch that attempt 2
+    then duplicates. Delete any batch (and its questions) previously created by THIS job
+    before inserting the fresh one, so a retry replaces rather than piles up."""
+    from sqlalchemy import delete, select
+
+    prior = (await db.execute(
+        select(MCQReviewBatch.id).where(MCQReviewBatch.job_id == job_id)
+    )).scalars().all()
+    if not prior:
+        return
+    await db.execute(delete(MCQQuestion).where(MCQQuestion.review_batch_id.in_(prior)))
+    await db.execute(delete(MCQReviewBatch).where(MCQReviewBatch.id.in_(prior)))
+    await db.flush()
+
 EXTRACTION_PROMPT = EXAM_CONTEXT + """
 
 ROLE: You are a meticulous question-bank digitiser. Admins upload real exam/practice MCQ
@@ -499,8 +517,13 @@ Return ONLY valid JSON in exactly this structure — options MUST be a list, nev
 
 
 class MCQExtractionAgent:
-    def __init__(self, db: AsyncSession, job_id: uuid.UUID, document: MCQDocument):
-        self.db = db
+    """Borrow-per-use sessions (CLAUDE.md §18): the multi-minute AI extraction must not
+    hold one pooled connection idle across the whole job. `self.document` is a detached
+    snapshot (scalar reads safe — `expire_on_commit=False`); every DB touch opens its own
+    short-lived session (LOAD → AI → SAVE) so no connection is ever held across the AI call
+    and the final commit runs on a freshly-validated connection."""
+
+    def __init__(self, job_id: uuid.UUID, document: MCQDocument):
         self.job_id = job_id
         self.document = document
         # Existing MCQ documents are TYPED (printed) → Azure gpt-5 typed text/vision
@@ -508,30 +531,37 @@ class MCQExtractionAgent:
         self.provider = get_provider("text_extraction")
 
     async def process(self) -> MCQReviewBatch:
-        await update_job(self.db, self.job_id, progress=5, step="Downloading source document")
-
-        # Download file from R2
+        from app.core.database import AsyncSessionLocal
         from app.integrations.r2_client import get_r2
         from app.modules.files.models import File
+        from app.processing.document_text import extract_text_from_bytes
         from sqlalchemy import select
 
-        file_r = await self.db.execute(select(File).where(File.id == self.document.file_id))
-        file_record = file_r.scalar_one_or_none()
-        if not file_record:
-            raise ValueError("Source file not found")
+        async def _job(**kw) -> None:
+            async with AsyncSessionLocal() as db:
+                await update_job(db, self.job_id, **kw)
 
-        file_bytes = await asyncio.to_thread(get_r2().download_fileobj, file_record.r2_key)
+        await _job(progress=5, step="Downloading source document")
 
-        await update_job(self.db, self.job_id, progress=20, step="Extracting text from document")
+        # LOAD: file record (short session) → snapshot the scalars we need.
+        async with AsyncSessionLocal() as db:
+            file_record = (await db.execute(
+                select(File).where(File.id == self.document.file_id)
+            )).scalar_one_or_none()
+            if not file_record:
+                raise ValueError("Source file not found")
+            r2_key, mime_type = file_record.r2_key, file_record.mime_type
 
-        from app.processing.document_text import extract_text_from_bytes
-        document_text = extract_text_from_bytes(file_bytes, file_record.mime_type)
+        file_bytes = await asyncio.to_thread(get_r2().download_fileobj, r2_key)
 
-        await update_job(self.db, self.job_id, progress=35, step="Retrieving active skill")
-        skill_instructions = await self._get_skill()
+        await _job(progress=20, step="Extracting text from document")
+        document_text = extract_text_from_bytes(file_bytes, mime_type)
 
-        await update_job(self.db, self.job_id, progress=50, step="Extracting MCQs with AI")
+        await _job(progress=35, step="Retrieving active skill")
+        async with AsyncSessionLocal() as db:
+            skill_instructions = await self._get_skill(db)
 
+        await _job(progress=50, step="Extracting MCQs with AI")
         prompt = EXTRACTION_PROMPT.format(
             skill_instructions=skill_instructions,
             topic_hint=self.document.topic or "auto-detect",
@@ -540,113 +570,114 @@ class MCQExtractionAgent:
             document_text=document_text[:40000],
         )
 
-        audit_ctx = {
-            "db": self.db,
-            "agent_type": "MCQExtractionAgent",
-            "task_type": "mcq_extraction",
-            "entity_type": "mcq_document",
-            "entity_id": self.document.id,
-        }
+        # AI call on its OWN short session (held only for this one call + its audit write).
+        async with AsyncSessionLocal() as db:
+            audit_ctx = {
+                "db": db, "agent_type": "MCQExtractionAgent", "task_type": "mcq_extraction",
+                "entity_type": "mcq_document", "entity_id": self.document.id,
+            }
+            try:
+                result = await self.provider.generate_text(prompt, schema={}, audit_ctx=audit_ctx)
+            except Exception as exc:
+                raise RuntimeError(f"AI extraction failed: {exc}") from exc
 
-        try:
-            result = await self.provider.generate_text(prompt, schema={}, audit_ctx=audit_ctx)
-        except Exception as exc:
-            raise RuntimeError(f"AI extraction failed: {exc}") from exc
-
-        await update_job(self.db, self.job_id, progress=75, step="Saving extracted questions")
-
+        await _job(progress=75, step="Saving extracted questions")
         questions_data = _require_questions_list(result)
         normalized, skipped = _normalize_batch(questions_data)
 
-        # batch + questions + document update commit together as one transaction.
-        batch = MCQReviewBatch(
-            document_id=self.document.id,
-            batch_type="extraction",
-            status="in_review",
-            total_questions=len(normalized),
-            job_id=self.job_id,
-            created_by=self.document.created_by,
-        )
-        self.db.add(batch)
-        await self.db.flush()
+        # SAVE: re-load the document in a fresh session; batch + questions + doc update commit
+        # together as one transaction on a freshly-validated connection.
+        async with AsyncSessionLocal() as db:
+            doc = (await db.execute(
+                select(MCQDocument).where(MCQDocument.id == self.document.id)
+            )).scalar_one()
+            await _clear_prior_batches(db, self.job_id)
+            batch = MCQReviewBatch(
+                document_id=doc.id, batch_type="extraction", status="in_review",
+                total_questions=len(normalized), job_id=self.job_id, created_by=doc.created_by,
+            )
+            db.add(batch)
+            await db.flush()
+            for f in normalized:
+                db.add(MCQQuestion(
+                    source_document_id=doc.id, review_batch_id=batch.id, exam_id=doc.exam_id,
+                    origin_type="uploaded_extracted", question_text=f["question_text"],
+                    options=f["options"], correct_option_ids=f["correct_option_ids"],
+                    explanation=f["explanation"], chapter=doc.chapter,
+                    topic=f["topic"] or doc.topic, subtopic=f["subtopic"] or doc.subtopic,
+                    complexity=f["complexity"], status="draft",
+                ))
+            doc.processing_status = "completed"
+            doc.question_count = len(normalized)
+            await db.commit()
 
-        for f in normalized:
-            self.db.add(MCQQuestion(
-                source_document_id=self.document.id,
-                review_batch_id=batch.id,
-                exam_id=self.document.exam_id,
-                origin_type="uploaded_extracted",
-                question_text=f["question_text"],
-                options=f["options"],
-                correct_option_ids=f["correct_option_ids"],
-                explanation=f["explanation"],
-                chapter=self.document.chapter,
-                topic=f["topic"] or self.document.topic,
-                subtopic=f["subtopic"] or self.document.subtopic,
-                complexity=f["complexity"],
-                status="draft",
-            ))
-
-        self.document.processing_status = "completed"
-        self.document.question_count = len(normalized)
-
-        await self.db.commit()
-        await self.db.refresh(batch)
-
-        await update_job(
-            self.db, self.job_id, progress=100, step="Extraction complete",
-            output=_extraction_output(len(normalized), skipped, len(questions_data), batch.id),
-        )
+        await _job(progress=100, step="Extraction complete",
+                   output=_extraction_output(len(normalized), skipped, len(questions_data), batch.id))
         return batch
 
-    async def _get_skill(self) -> str:
+    async def _get_skill(self, db: AsyncSession) -> str:
         try:
             from app.modules.skill_layer.service import get_active_skill_text
-            return await get_active_skill_text(self.db, "MCQExtractionAgent")
+            return await get_active_skill_text(db, "MCQExtractionAgent")
         except Exception:
             return "Favour exact fidelity over tidiness; when the answer key is ambiguous, mark needs_explanation_review rather than guessing."
 
 
 class MCQGenerationAgent:
-    def __init__(self, db: AsyncSession, job_id: uuid.UUID, document: MCQDocument, count: int):
-        self.db = db
+    """Borrow-per-use sessions (CLAUDE.md §18) — same rationale as MCQExtractionAgent:
+    topic detection, knowledge fetch, and the multi-minute generation AI call each run on
+    their own short-lived session so no pooled connection is held idle across the job."""
+
+    def __init__(self, job_id: uuid.UUID, document: MCQDocument, count: int):
         self.job_id = job_id
         self.document = document
         self.count = count
         self.provider = get_provider("reasoning")
 
     async def process(self) -> MCQReviewBatch:
-        await update_job(self.db, self.job_id, progress=5, step="Downloading source content")
-
+        from app.core.database import AsyncSessionLocal
         from app.integrations.r2_client import get_r2
         from app.modules.files.models import File
+        from app.processing.document_text import extract_text_from_bytes
         from sqlalchemy import select
 
-        file_r = await self.db.execute(select(File).where(File.id == self.document.file_id))
-        file_record = file_r.scalar_one_or_none()
-        if not file_record:
-            raise ValueError("Source file not found")
+        async def _job(**kw) -> None:
+            async with AsyncSessionLocal() as db:
+                await update_job(db, self.job_id, **kw)
 
-        file_bytes = await asyncio.to_thread(get_r2().download_fileobj, file_record.r2_key)
+        await _job(progress=5, step="Downloading source content")
 
-        await update_job(self.db, self.job_id, progress=20, step="Extracting text from content")
-        from app.processing.document_text import extract_text_from_bytes
-        document_text = extract_text_from_bytes(file_bytes, file_record.mime_type)
+        # LOAD: file record (short session) → snapshot the scalars we need.
+        async with AsyncSessionLocal() as db:
+            file_record = (await db.execute(
+                select(File).where(File.id == self.document.file_id)
+            )).scalar_one_or_none()
+            if not file_record:
+                raise ValueError("Source file not found")
+            r2_key, mime_type = file_record.r2_key, file_record.mime_type
 
-        await update_job(self.db, self.job_id, progress=30, step="Detecting covered topics")
-        covered_topics, covered_subtopics = await self._detect_covered_topics(document_text)
+        file_bytes = await asyncio.to_thread(get_r2().download_fileobj, r2_key)
 
-        await update_job(self.db, self.job_id, progress=42, step="Fetching knowledge layer enrichment")
-        knowledge_context = await self._fetch_knowledge_context(covered_topics, covered_subtopics)
+        await _job(progress=20, step="Extracting text from content")
+        document_text = extract_text_from_bytes(file_bytes, mime_type)
 
-        await update_job(self.db, self.job_id, progress=52, step="Retrieving style examples")
-        style_examples = await self._get_style_examples()
+        await _job(progress=30, step="Detecting covered topics")
+        async with AsyncSessionLocal() as db:
+            covered_topics, covered_subtopics = await self._detect_covered_topics(db, document_text)
 
-        await update_job(self.db, self.job_id, progress=60, step="Retrieving active skill")
-        skill_instructions = await self._get_skill()
+        await _job(progress=42, step="Fetching knowledge layer enrichment")
+        async with AsyncSessionLocal() as db:
+            knowledge_context = await self._fetch_knowledge_context(db, covered_topics, covered_subtopics)
 
-        await update_job(self.db, self.job_id, progress=68, step="Generating MCQs with AI")
+        await _job(progress=52, step="Retrieving style examples")
+        async with AsyncSessionLocal() as db:
+            style_examples = await self._get_style_examples(db)
 
+        await _job(progress=60, step="Retrieving active skill")
+        async with AsyncSessionLocal() as db:
+            skill_instructions = await self._get_skill(db)
+
+        await _job(progress=68, step="Generating MCQs with AI")
         prompt = GENERATION_PROMPT.format(
             count=self.count,
             skill_instructions=skill_instructions,
@@ -658,21 +689,18 @@ class MCQGenerationAgent:
             document_text=document_text[:30000],
         )
 
-        audit_ctx = {
-            "db": self.db,
-            "agent_type": "MCQGenerationAgent",
-            "task_type": "mcq_generation",
-            "entity_type": "mcq_document",
-            "entity_id": self.document.id,
-        }
+        # AI call on its OWN short session (held only for this one call + its audit write).
+        async with AsyncSessionLocal() as db:
+            audit_ctx = {
+                "db": db, "agent_type": "MCQGenerationAgent", "task_type": "mcq_generation",
+                "entity_type": "mcq_document", "entity_id": self.document.id,
+            }
+            try:
+                result = await self.provider.generate_text(prompt, schema={}, audit_ctx=audit_ctx)
+            except Exception as exc:
+                raise RuntimeError(f"AI generation failed: {exc}") from exc
 
-        try:
-            result = await self.provider.generate_text(prompt, schema={}, audit_ctx=audit_ctx)
-        except Exception as exc:
-            raise RuntimeError(f"AI generation failed: {exc}") from exc
-
-        await update_job(self.db, self.job_id, progress=88, step="Saving generated questions")
-
+        await _job(progress=88, step="Saving generated questions")
         questions_data = _require_questions_list(result)
         normalized, skipped = _normalize_batch(questions_data)
 
@@ -686,46 +714,36 @@ class MCQGenerationAgent:
         # Spread the correct option evenly across A/B/C/D (LLMs cluster it on A).
         balance_answer_positions(normalized)
 
-        batch = MCQReviewBatch(
-            document_id=self.document.id,
-            batch_type="generation",
-            status="in_review",
-            total_questions=len(normalized),
-            job_id=self.job_id,
-            created_by=self.document.created_by,
-        )
-        self.db.add(batch)
-        await self.db.flush()
+        # SAVE: re-load the document in a fresh session; commit batch + questions + doc update.
+        async with AsyncSessionLocal() as db:
+            doc = (await db.execute(
+                select(MCQDocument).where(MCQDocument.id == self.document.id)
+            )).scalar_one()
+            await _clear_prior_batches(db, self.job_id)
+            batch = MCQReviewBatch(
+                document_id=doc.id, batch_type="generation", status="in_review",
+                total_questions=len(normalized), job_id=self.job_id, created_by=doc.created_by,
+            )
+            db.add(batch)
+            await db.flush()
+            for f in normalized:
+                db.add(MCQQuestion(
+                    source_document_id=doc.id, review_batch_id=batch.id, exam_id=doc.exam_id,
+                    origin_type="ai_generated", question_text=f["question_text"],
+                    options=f["options"], correct_option_ids=f["correct_option_ids"],
+                    explanation=f["explanation"], chapter=doc.chapter,
+                    topic=f["topic"] or doc.topic, subtopic=f["subtopic"] or doc.subtopic,
+                    complexity=f["complexity"], status="draft",
+                ))
+            doc.processing_status = "completed"
+            doc.question_count = len(normalized)
+            await db.commit()
 
-        for f in normalized:
-            self.db.add(MCQQuestion(
-                source_document_id=self.document.id,
-                review_batch_id=batch.id,
-                exam_id=self.document.exam_id,
-                origin_type="ai_generated",
-                question_text=f["question_text"],
-                options=f["options"],
-                correct_option_ids=f["correct_option_ids"],
-                explanation=f["explanation"],
-                chapter=self.document.chapter,
-                topic=f["topic"] or self.document.topic,
-                subtopic=f["subtopic"] or self.document.subtopic,
-                complexity=f["complexity"],
-                status="draft",
-            ))
-
-        self.document.processing_status = "completed"
-        self.document.question_count = len(normalized)
-
-        await self.db.commit()
-        await self.db.refresh(batch)
-        await update_job(
-            self.db, self.job_id, progress=100, step="Generation complete",
-            output=_extraction_output(len(normalized), skipped, len(questions_data), batch.id),
-        )
+        await _job(progress=100, step="Generation complete",
+                   output=_extraction_output(len(normalized), skipped, len(questions_data), batch.id))
         return batch
 
-    async def _detect_covered_topics(self, document_text: str) -> tuple[list[str], list[str]]:
+    async def _detect_covered_topics(self, db: AsyncSession, document_text: str) -> tuple[list[str], list[str]]:
         """Identify which of the exam's syllabus topics this document covers."""
         from sqlalchemy import select
         from app.modules.syllabus.models import SyllabusItem
@@ -738,7 +756,7 @@ class MCQGenerationAgent:
         ]
         if self.document.chapter:
             _where.append(SyllabusItem.chapter == self.document.chapter)
-        rows = await self.db.execute(select(SyllabusItem).where(*_where))
+        rows = await db.execute(select(SyllabusItem).where(*_where))
         items = rows.scalars().all()
 
         if not items:
@@ -762,7 +780,7 @@ class MCQGenerationAgent:
         )
 
         audit_ctx = {
-            "db": self.db,
+            "db": db,
             "agent_type": "MCQGenerationAgent",
             "task_type": "topic_detection",
             "entity_type": "mcq_document",
@@ -785,22 +803,23 @@ class MCQGenerationAgent:
 
     async def _fetch_knowledge_context(
         self,
+        db: AsyncSession,
         covered_topics: list[str],
         covered_subtopics: list[str],
     ) -> str:
         """Fetch 25 chunks per document type for the document's chapter, narrowed to the
         detected topics. Chapter is the primary scope."""
         return await _fetch_knowledge_by_type(
-            self.db,
+            db,
             topics=set(covered_topics),
             subtopics=set(covered_subtopics),
             exam_id=self.document.exam_id,
             chapter=self.document.chapter,
         )
 
-    async def _get_style_examples(self) -> str:
+    async def _get_style_examples(self, db: AsyncSession) -> str:
         from sqlalchemy import select
-        result = await self.db.execute(
+        result = await db.execute(
             select(MCQQuestion)
             .where(
                 MCQQuestion.exam_id == self.document.exam_id,
@@ -811,7 +830,7 @@ class MCQGenerationAgent:
         )
         examples = result.scalars().all()
         if not examples:
-            result = await self.db.execute(
+            result = await db.execute(
                 select(MCQQuestion)
                 .where(MCQQuestion.exam_id == self.document.exam_id, MCQQuestion.status == "approved")
                 .limit(8)
@@ -831,110 +850,111 @@ class MCQGenerationAgent:
             lines.append("")
         return "\n".join(lines)
 
-    async def _get_skill(self) -> str:
+    async def _get_skill(self, db: AsyncSession) -> str:
         try:
             from app.modules.skill_layer.service import get_active_skill_text
-            return await get_active_skill_text(self.db, "MCQGenerationAgent")
+            return await get_active_skill_text(db, "MCQGenerationAgent")
         except Exception:
             return "Favour application over rote recall; make every distractor a plausible Loksewa-style trap, not filler."
 
 
 class MCQRegenerationAgent:
-    def __init__(self, db: AsyncSession, job_id: uuid.UUID, batch: MCQReviewBatch, feedback: str):
-        self.db = db
+    """Borrow-per-use sessions (CLAUDE.md §18). Rejected questions are snapshotted to plain
+    data in a LOAD session, the AI runs holding no long-lived connection, and the rows are
+    re-loaded and mutated in a fresh SAVE session — so no connection is held across the
+    multi-minute regeneration call."""
+
+    def __init__(self, job_id: uuid.UUID, batch: MCQReviewBatch, feedback: str):
         self.job_id = job_id
-        self.batch = batch
-        # Capture the batch UUID as a plain Python value NOW, before any DB
-        # commit can expire the ORM object and make self.batch.id a lazy-load.
+        # Capture the batch UUID as a plain Python value (the ORM object is detached).
         self._batch_id: uuid.UUID = batch.id
         self.feedback = feedback
         self.provider = get_provider("reasoning")
 
-    async def process(self) -> MCQReviewBatch:
+    async def process(self) -> None:
+        from app.core.database import AsyncSessionLocal
+        from app.integrations.r2_client import get_r2
+        from app.modules.files.models import File
         from app.modules.jobs.models import JobStatus
-
-        await update_job(self.db, self.job_id, progress=10, step="Collecting rejected questions")
-
+        from app.processing.document_text import extract_text_from_bytes
         from sqlalchemy import select
-        rejected_r = await self.db.execute(
-            select(MCQQuestion).where(
-                MCQQuestion.review_batch_id == self._batch_id,
-                MCQQuestion.status == "rejected",
-            )
-        )
-        rejected = rejected_r.scalars().all()
 
-        logger.info(
-            "Regeneration: batch_id=%s — found %d rejected question(s)",
-            self._batch_id, len(rejected),
-        )
+        async def _job(**kw) -> None:
+            async with AsyncSessionLocal() as db:
+                await update_job(db, self.job_id, **kw)
+
+        await _job(progress=10, step="Collecting rejected questions")
+
+        # LOAD: snapshot rejected questions + the source doc's file/topic to plain data.
+        # Deterministic order so the prompt order matches the SAVE re-load order.
+        async with AsyncSessionLocal() as db:
+            rejected_rows = (await db.execute(
+                select(MCQQuestion)
+                .where(MCQQuestion.review_batch_id == self._batch_id, MCQQuestion.status == "rejected")
+                .order_by(MCQQuestion.created_at.asc(), MCQQuestion.id.asc())
+            )).scalars().all()
+            rejected = [{
+                "id": q.id, "question_text": q.question_text, "topic": q.topic,
+                "subtopic": q.subtopic, "review_feedback": q.review_feedback,
+                "exam_id": q.exam_id, "chapter": q.chapter,
+            } for q in rejected_rows]
+
+            doc_topic: str | None = None
+            doc_subtopic: str | None = None
+            file_meta: tuple[str, str] | None = None
+            batch = (await db.execute(
+                select(MCQReviewBatch).where(MCQReviewBatch.id == self._batch_id)
+            )).scalar_one_or_none()
+            if batch and batch.document_id:
+                doc = (await db.execute(
+                    select(MCQDocument).where(MCQDocument.id == batch.document_id)
+                )).scalar_one_or_none()
+                if doc:
+                    doc_topic, doc_subtopic = doc.topic, doc.subtopic
+                    if doc.file_id:
+                        fr = (await db.execute(select(File).where(File.id == doc.file_id))).scalar_one_or_none()
+                        if fr:
+                            file_meta = (fr.r2_key, fr.mime_type)
+
+        logger.info("Regeneration: batch_id=%s — found %d rejected question(s)", self._batch_id, len(rejected))
 
         if not rejected:
             logger.warning(
                 "Regeneration: batch_id=%s has 0 rejected questions; "
-                "they may have already been regenerated in a previous run.",
-                self._batch_id,
+                "they may have already been regenerated in a previous run.", self._batch_id,
             )
-            await update_job(
-                self.db, self.job_id,
-                status=JobStatus.completed,
-                progress=100,
-                step="No rejected questions found — they may already have been regenerated",
-            )
-            return self.batch
+            await _job(status=JobStatus.completed, progress=100,
+                       step="No rejected questions found — they may already have been regenerated")
+            return
 
-        await update_job(self.db, self.job_id, progress=20, step="Loading source document")
-
+        await _job(progress=20, step="Loading source document")
         document_text = ""
-        doc_topic: str | None = None
-        doc_subtopic: str | None = None
+        if file_meta:
+            file_bytes = await asyncio.to_thread(get_r2().download_fileobj, file_meta[0])
+            document_text = extract_text_from_bytes(file_bytes, file_meta[1])[:20000]
 
-        # Re-load the batch to get a fresh, non-expired reference after the commits above
-        fresh_batch_r = await self.db.execute(select(MCQReviewBatch).where(MCQReviewBatch.id == self._batch_id))
-        self.batch = fresh_batch_r.scalar_one_or_none() or self.batch
+        await _job(progress=35, step="Fetching knowledge enrichment")
+        async with AsyncSessionLocal() as db:
+            knowledge_context = await self._fetch_knowledge_context(db, rejected, doc_topic, doc_subtopic)
 
-        if self.batch.document_id:
-            from app.modules.mcq.models import MCQDocument as MCQDoc
-            from app.modules.files.models import File
-            from app.integrations.r2_client import get_r2
-            from app.processing.document_text import extract_text_from_bytes
-
-            doc_r = await self.db.execute(select(MCQDoc).where(MCQDoc.id == self.batch.document_id))
-            doc = doc_r.scalar_one_or_none()
-            if doc:
-                doc_topic = doc.topic
-                doc_subtopic = doc.subtopic
-                if doc.file_id:
-                    file_r = await self.db.execute(select(File).where(File.id == doc.file_id))
-                    file_record = file_r.scalar_one_or_none()
-                    if file_record:
-                        file_bytes = await asyncio.to_thread(get_r2().download_fileobj, file_record.r2_key)
-                        document_text = extract_text_from_bytes(file_bytes, file_record.mime_type)[:20000]
-
-        await update_job(self.db, self.job_id, progress=35, step="Fetching knowledge enrichment")
-        knowledge_context = await self._fetch_knowledge_context(rejected, doc_topic, doc_subtopic)
-
-        await update_job(self.db, self.job_id, progress=45, step="Loading style examples")
-
-        style_r = await self.db.execute(
-            select(MCQQuestion).where(MCQQuestion.status == "approved").limit(6)
-        )
-        style_qs = style_r.scalars().all()
-        style_text = ""
-        for ex in style_qs:
-            style_text += f"Q: {ex.question_text}\n"
-            for opt in ex.options:
-                style_text += f"  {opt['id']}. {opt['text']}\n"
-            style_text += f"  Answer: {ex.correct_option_ids}\n\n"
+        await _job(progress=45, step="Loading style examples")
+        async with AsyncSessionLocal() as db:
+            style_qs = (await db.execute(
+                select(MCQQuestion).where(MCQQuestion.status == "approved").limit(6)
+            )).scalars().all()
+            style_text = ""
+            for ex in style_qs:
+                style_text += f"Q: {ex.question_text}\n"
+                for opt in ex.options:
+                    style_text += f"  {opt['id']}. {opt['text']}\n"
+                style_text += f"  Answer: {ex.correct_option_ids}\n\n"
+            skill_instructions = await self._get_skill(db)
 
         rejected_text = ""
         for q in rejected:
-            rejected_text += f"Question: {q.question_text}\nTopic: {q.topic}\nFeedback: {q.review_feedback}\n\n"
+            rejected_text += f"Question: {q['question_text']}\nTopic: {q['topic']}\nFeedback: {q['review_feedback']}\n\n"
 
-        skill_instructions = await self._get_skill()
-
-        await update_job(self.db, self.job_id, progress=55, step="Regenerating with AI")
-
+        await _job(progress=55, step="Regenerating with AI")
         prompt = REGENERATION_PROMPT.format(
             feedback=self.feedback,
             skill_instructions=skill_instructions,
@@ -944,59 +964,65 @@ class MCQRegenerationAgent:
             document_text=document_text,
         )
 
-        audit_ctx = {
-            "db": self.db,
-            "agent_type": "MCQRegenerationAgent",
-            "task_type": "mcq_regeneration",
-            "entity_type": "mcq_review_batch",
-            "entity_id": self._batch_id,
-        }
+        # AI call on its OWN short session (held only for this one call + its audit write).
+        async with AsyncSessionLocal() as db:
+            audit_ctx = {
+                "db": db, "agent_type": "MCQRegenerationAgent", "task_type": "mcq_regeneration",
+                "entity_type": "mcq_review_batch", "entity_id": self._batch_id,
+            }
+            try:
+                result = await self.provider.generate_text(prompt, schema={}, audit_ctx=audit_ctx)
+            except Exception as exc:
+                raise RuntimeError(f"AI regeneration failed: {exc}") from exc
 
-        try:
-            result = await self.provider.generate_text(prompt, schema={}, audit_ctx=audit_ctx)
-        except Exception as exc:
-            raise RuntimeError(f"AI regeneration failed: {exc}") from exc
-
-        await update_job(self.db, self.job_id, progress=85, step="Replacing rejected questions")
-
+        await _job(progress=85, step="Replacing rejected questions")
         questions_data = _require_questions_list(result)
 
-        replaced = 0
-        skipped: list[str] = []
-        replaced_questions: list = []
-        for old_q, new_q_data in zip(rejected, questions_data):
-            fields, reason = _normalize_question(new_q_data)
-            if fields is None:
-                skipped.append(reason or "invalid")
-                continue
-            old_q.question_text = fields["question_text"]
-            old_q.options = fields["options"]
-            old_q.correct_option_ids = fields["correct_option_ids"]
-            old_q.explanation = fields["explanation"]
-            old_q.complexity = fields["complexity"]
-            old_q.status = "draft"
-            old_q.review_feedback = None
-            replaced += 1
-            replaced_questions.append(old_q)
+        # SAVE: re-load the rejected rows (same order) and apply replacements in a fresh session.
+        async with AsyncSessionLocal() as db:
+            rejected_ids = [r["id"] for r in rejected]
+            rows_by_id = {q.id: q for q in (await db.execute(
+                select(MCQQuestion).where(MCQQuestion.id.in_(rejected_ids))
+            )).scalars().all()}
 
-        if replaced == 0:
-            raise AIResponseError(
-                f"regeneration produced no usable replacements out of {len(questions_data)} returned"
-            )
+            replaced = 0
+            skipped: list[str] = []
+            replaced_questions: list = []
+            for qid, new_q_data in zip(rejected_ids, questions_data):
+                old_q = rows_by_id.get(qid)
+                if old_q is None:
+                    continue
+                fields, reason = _normalize_question(new_q_data)
+                if fields is None:
+                    skipped.append(reason or "invalid")
+                    continue
+                old_q.question_text = fields["question_text"]
+                old_q.options = fields["options"]
+                old_q.correct_option_ids = fields["correct_option_ids"]
+                old_q.explanation = fields["explanation"]
+                old_q.complexity = fields["complexity"]
+                old_q.status = "draft"
+                old_q.review_feedback = None
+                replaced += 1
+                replaced_questions.append(old_q)
 
-        # Spread the correct option evenly across A/B/C/D (LLMs cluster it on A).
-        balance_answer_positions(replaced_questions)
+            if replaced == 0:
+                raise AIResponseError(
+                    f"regeneration produced no usable replacements out of {len(questions_data)} returned"
+                )
 
-        self.batch.status = "in_review"
-        self.batch.rejection_feedback = self.feedback
-        await self.db.commit()
-        await self.db.refresh(self.batch)
+            # Spread the correct option evenly across A/B/C/D (LLMs cluster it on A).
+            balance_answer_positions(replaced_questions)
 
-        await update_job(
-            self.db, self.job_id,
-            status=JobStatus.completed,
-            progress=100,
-            step="Regeneration complete",
+            batch = (await db.execute(
+                select(MCQReviewBatch).where(MCQReviewBatch.id == self._batch_id)
+            )).scalar_one()
+            batch.status = "in_review"
+            batch.rejection_feedback = self.feedback
+            await db.commit()
+
+        await _job(
+            status=JobStatus.completed, progress=100, step="Regeneration complete",
             output={
                 "batch_id": str(self._batch_id),
                 "rejected": len(rejected),
@@ -1005,32 +1031,32 @@ class MCQRegenerationAgent:
                 **({"skip_reasons": skipped[:20]} if skipped else {}),
             },
         )
-        return self.batch
 
     async def _fetch_knowledge_context(
         self,
-        rejected_questions: list,
+        db: AsyncSession,
+        rejected_questions: list[dict],
         doc_topic: str | None,
         doc_subtopic: str | None,
     ) -> str:
         """Fetch 25 chunks per document type for topics present in the rejected questions."""
-        topics = {q.topic for q in rejected_questions if q.topic}
-        subtopics = {q.subtopic for q in rejected_questions if q.subtopic}
+        topics = {q["topic"] for q in rejected_questions if q.get("topic")}
+        subtopics = {q["subtopic"] for q in rejected_questions if q.get("subtopic")}
         if doc_topic:
             topics.add(doc_topic)
         if doc_subtopic:
             subtopics.add(doc_subtopic)
-        exam_id = next((q.exam_id for q in rejected_questions if getattr(q, "exam_id", None)), None)
+        exam_id = next((q["exam_id"] for q in rejected_questions if q.get("exam_id")), None)
         # Chapter is primary: all rejected questions in a batch share the source document's
         # chapter, so scope enrichment to it.
-        chapter = next((q.chapter for q in rejected_questions if getattr(q, "chapter", None)), None)
+        chapter = next((q["chapter"] for q in rejected_questions if q.get("chapter")), None)
         return await _fetch_knowledge_by_type(
-            self.db, topics=topics, subtopics=subtopics, exam_id=exam_id, chapter=chapter,
+            db, topics=topics, subtopics=subtopics, exam_id=exam_id, chapter=chapter,
         )
 
-    async def _get_skill(self) -> str:
+    async def _get_skill(self, db: AsyncSession) -> str:
         try:
             from app.modules.skill_layer.service import get_active_skill_text
-            return await get_active_skill_text(self.db, "MCQRegenerationAgent")
+            return await get_active_skill_text(db, "MCQRegenerationAgent")
         except Exception:
             return "Treat the rejection feedback as the brief; fix the exact weakness it names rather than making cosmetic edits."

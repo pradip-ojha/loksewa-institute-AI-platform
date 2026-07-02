@@ -52,7 +52,8 @@ PostgreSQL (Azure) · Redis (Upstash) · Pinecone · Cloudflare R2 · Azure Open
 
 **Robustness (spec §7):** DB is **Azure Postgres** (`config.py` assembles the asyncpg URL from the
 `PG*` parts, SSL required). DB pool is right-sized per process via `DB_POOL_SIZE`/`DB_MAX_OVERFLOW`
-(default 5+10) so API + worker×concurrency + beat stay under Azure PG `max_connections`. **R2** uses
+(default 8+12 = 20/process — sized so the per-phase concurrency of 6 + the job-mark session stay in
+the core pool) so API + worker×concurrency + beat stay under Azure PG `max_connections`. **R2** uses
 bounded boto3 timeouts (`connect_timeout=10`, `read_timeout=30`, 3 retries); **Pinecone** sync SDK
 calls are offloaded via `asyncio.to_thread` at the async call sites so they never stall the event
 loop. Mid-task DB drops are covered by the three-session pattern, the per-task fresh sessions used by
@@ -86,6 +87,8 @@ Do NOT share DB / Pinecone index / R2 bucket / queue names with NeuraFix Bridge.
 **DB:** PostgreSQL (Neon). **Vector DB:** Pinecone, 3072 dims, `text-embedding-3-large`.
 **Storage:** R2. **Queue:** Redis + Celery.
 **PDF/Image:** PyMuPDF, OpenCV, Pillow. **Audio:** FFmpeg (`ffmpeg-python`; `ffmpeg` binary on PATH).
+**DOCX→PDF:** headless LibreOffice (`soffice` binary on PATH) — required on the worker to OCR
+Preeti/scanned Word documents in the Knowledge Layer (§8); Unicode DOCX works without it.
 
 **AI providers + model tiering (exact ids/versions in §23; routing in `ai/model_router.py`):**
 Governing principle — *typed text (even scanned/printed images) → Azure OpenAI; handwritten
@@ -102,10 +105,14 @@ Nepali/Devanagari → Gemini.* `get_provider(task_type)` selects both provider A
   agents run here (gpt-5, not gpt-5.5 — their tasks don't need reasoning-tier):** `QuestionPaperAgent`,
   `SubjectiveTopicRouterAgent`, `TutorTopicSelectorAgent`, and the video `VideoTopicRouterAgent`,
   `VideoSegmentRouterAgent`, `VideoSlideLabelAgent`, `VideoSegmentTopicMapperAgent`,
-  `VideoTranscriptCleanerAgent` (these call `get_provider("thinking")`).
-- **Azure `gpt-5-mini` (fast)** — `get_provider("chunking")` (semantic chunking) and
-  `get_provider("routing")` (cheap routing/selection, e.g. the feedback-chat question selector
-  `AnswerFeedbackSelectorAgent` §12.1 — stays on gpt-5-mini, cheaper than gpt-5).
+  `VideoTranscriptCleanerAgent` (these call `get_provider("thinking")`) — PLUS the feedback-chat
+  question selector `AnswerFeedbackSelectorAgent` §12.1 (moved to gpt-5 for more accurate routing).
+- **Azure `gpt-5-mini` (fast)** — the `get_provider("routing")` tier (cheap routing/selection;
+  retained for future cheap-routing use). `get_provider("chunking")` (semantic chunking) is
+  **configurable** via `CHUNKING_MODEL_TIER` (.env): default `thinking` = **gpt-5** (chunking is a
+  one-time per-document cost whose segmentation + verbatim-Devanagari fidelity underpins all
+  downstream retrieval, so it defaults to the better tier), or `fast` = gpt-5-mini for the cheaper
+  option. Toggled from `.env` only (not the admin panel); only `"chunking"` is affected.
 - **Azure embeddings** (`text-embedding-3-large`) + **transcription** (`gpt-4o-transcribe`) use their
   own dedicated deployments/api-versions.
 - **Google Gemini = HANDWRITING-ONLY VISION** (`gemini-3.5-flash`, `google-genai` SDK,
@@ -166,7 +173,10 @@ refreshes the cached user after the change.
 ## 7. Syllabus
 
 **One syllabus tree per exam** (scoped by `exam_id`, replacing the old objective/subjective split).
-Two default exams + their trees are seeded on first startup from JSON; fully admin-editable from UI.
+Three real Banking 4th Level exams + their trees are seeded on first startup from JSON
+(`app/seeds/banking_*.json`, listed in `syllabus_seed._DEFAULT_EXAMS`): **Banking 4th Level First
+Paper** (subjective), **Banking 4th Level Pretest** (objective), **Banking 4th Level Second Paper**
+(subjective). Fully admin-editable from UI. Re-seed / wipe old exams via `python -m scripts.reset_exams`.
 Structure within an exam: chapter → topic → subtopic.
 
 Admin can: add chapters (≥1 topic required), rename a chapter (cascades), delete a chapter (cascades
@@ -205,13 +215,31 @@ already have explanations).
 **Upload fields:** Display Name, Document Type (notes/book_content/handout/reference_material),
 **Exam** (select), **Chapter** (opt), File, Topic (opt), Subtopic (opt), Custom Instruction.
 
-**Pipeline:** Upload → store R2 → extract text (parallel **Azure gpt-5 typed-vision OCR** if the page
-is scanned/legacy-font — NOT Gemini, which is handwriting-only) → semantic chunking (parallel,
-**gpt-5-mini** `get_provider("chunking")`) → embed (`text-embedding-3-large`, 3072d) → upsert Pinecone
+**Pipeline:** Upload → store R2 → extract text (**OCR-ONLY: every PDF page is re-OCR'd by parallel
+Azure gpt-5 typed-vision** — NOT Gemini, which is handwriting-only) → semantic chunking (parallel,
+`get_provider("chunking")`, tier set by `CHUNKING_MODEL_TIER` .env — **default gpt-5**, or gpt-5-mini
+when `fast`) → embed (`text-embedding-3-large`, 3072d) → upsert Pinecone
 → metadata to PG. Chunking = meaningful semantic units (concepts, definitions, exam points), not blind
 token splits.
-Vision OCR parallel across pages (`asyncio.Semaphore(3)`); chunking parallel across sections
-(`asyncio.Semaphore(5)`).
+Vision OCR parallel across pages (`asyncio.Semaphore(6)`); chunking parallel across sections
+(`asyncio.Semaphore(6)`). (All AI-fan-out semaphores across the platform are 6.)
+
+**OCR-only ingestion (the corpus is entirely scanned or legacy Preeti/Kantipur-font, whose PDF text
+layer is unusable ASCII garbage).** `FORCE_OCR_ALL_PAGES=True` in
+`ai/agents/knowledge_processing_agent.py` → `_needs_vision()` is true for EVERY page, so all pages are
+rendered to 250-DPI JPEG and read by the typed-vision model. Per-page classification
+(`_classify_page_text`) still runs but only annotates logs. **No garbage fallback:** a page that fails
+OCR is RETRIED (`VISION_OCR_ATTEMPTS=3`) and then SKIPPED (empty) — the pipeline NEVER backfills with
+the raw text layer or an LLM "Preeti decode" (both removed), because that would only poison the vector
+store. If every page fails (e.g. the deployment can't accept images → 404), the job fails honestly
+rather than ingesting nothing/garbage.
+**DOCX handling (both Unicode and Preeti):** the `.docx` text is extracted and classified the same way
+— `valid_unicode` → used directly; anything else (Preeti/legacy/empty/broken) → the DOCX is converted
+to PDF via **headless LibreOffice** (`_docx_to_pdf_bytes`, `soffice --headless --convert-to pdf`,
+isolated per-job LO profile) and run through the same OCR path. **LibreOffice (`soffice`) is therefore
+a worker dependency** for Preeti/scanned DOCX; missing it fails such a job with a clear "install
+LibreOffice or re-upload as PDF" message (Unicode DOCX still works without it). The shared OCR routine
+is `_ocr_pdf_bytes(file_bytes, step_cb)`, used by both the PDF path and the converted-DOCX path.
 
 **CHAPTER IS THE PRIMARY RETRIEVAL DIMENSION (topic/subtopic are secondary within it).** A document is
 uploaded under one chapter, so every chunk inherits it. The chunking prompt is told the chapter and is
@@ -540,7 +568,7 @@ guidance only** (never a committed new official mark). Synchronous in-request mu
 Celery job); history persisted.
 - **Two-agent flow (cost-optimized):** a cheap **selector** runs FIRST, then the main chat agent.
   - **Selector** `AnswerFeedbackSelectorAgent` (`answer_feedback_selector_agent.py`,
-    `get_provider("routing")` = gpt-5-mini, NOT skill-tunable). Given the student's message + recent
+    `get_provider("thinking")` = gpt-5, NOT skill-tunable). Given the student's message + recent
     history + a compact one-line-per-question index (number — short text — awarded/max), it returns
     `{question_numbers[], needs_all}`. So `build_feedback_context` ships ONLY the targeted question(s)'
     heavy detail (evaluation + checking guide) instead of every question's on every turn. Fail-open:
@@ -575,7 +603,7 @@ Celery job); history persisted.
 Intentionally **quality-first**: question-level extraction + reviewer pass + on-demand vision
 locator/validator for natural geometry on every sheet. Cost secondary to quality here.
 
-### Implementation (`backend/app/modules/subjective/`, Stage 3; checking v2 in migration `013_subjective_checking_v2`)
+### Implementation (`backend/app/modules/subjective/`; checking v2 in migration `013_subjective_checking_v2`)
 Mirrors `mcq_tests/`; base tables in migration `010_subjective`. `013` adds
 `subjective_questions.topic/subtopic`, `question_specific_checking_skills.evaluation_status/
 evaluation_notes/iterations`, `pdf_annotations.locator_plan`. Two orchestrated Celery jobs on
@@ -602,7 +630,7 @@ kvi_ai_subjective`):
   (`processing/image_quality`, OpenCV; **poor + attempt<2 ⇒ `needs_reupload`, no AI spent**) →
   **whole-sheet structure pass** (`AnswerStructureAgent`, Gemini vision over all pages, stored under
   `extracted_data["structure_map"]`) → **question-level** extraction, **all pages IN PARALLEL**
-  (`AnswerExtractionAgent.extract_page`, Gemini vision; `asyncio.gather` + `Semaphore(3)`, each page on
+  (`AnswerExtractionAgent.extract_page`, Gemini vision; `asyncio.gather` + `Semaphore(6)`, each page on
   its OWN short-lived session since audit logging makes one `AsyncSession` not concurrency-safe; the
   structure pass already mapped continuations so pages don't depend on each other; **partial success** —
   a failing page yields an empty page output, never fails the sheet) → assemble whole-question answers
@@ -690,7 +718,7 @@ question (+ current_video_time) → SegmentRouter (picks 1–3 timeline segments
   If neither covers it, say so honestly. Include timestamp/slide reference only when useful. Student
   can also watch the video.
 
-### Implementation (`backend/app/modules/video/`, Phase 9)
+### Implementation (`backend/app/modules/video/`)
 Mirrors `subjective/`; tables in migration `011_video` (§19). Segment/chunk times in **seconds**
 (float) for precise seeking.
 - **Video belongs to the selected `exam_id`** — drives both the syllabus tree (routing/mapping) and
@@ -703,11 +731,14 @@ Mirrors `subjective/`; tables in migration `011_video` (§19). Segment/chunk tim
   (`audio_tools.extract_audio`, FFmpeg, mono 16 kHz mp3 → R2 `audio/`) → chunk (**≈3 min**, 12 s overlap,
   global offsets preserved — `audio_tools.DEFAULT_CHUNK_MINUTES`; smaller chunks tighten the per-chunk
   time window the timeline anchors to, since gpt-4o-transcribe gives no per-segment timestamps and Azure
-  rejects `verbose_json` — so chunk size IS the timeline's time granularity) → transcribe per chunk
-  (`provider.transcribe`, gpt-4o-transcribe, `response_format="json"` — text only, no segment
-  timestamps) → merge →
-  clean **per chunk** (`VideoTranscriptCleanerAgent`, once per chunk so each cleaned section keeps its
-  global time window; languages aggregated via `_pick_language`) → timeline (`VideoTimelineAgent`, fed
+  rejects `verbose_json` — so chunk size IS the timeline's time granularity) → transcribe chunks **IN
+  PARALLEL** (`provider.transcribe`, gpt-4o-transcribe, `response_format="json"` — text only, no segment
+  timestamps; `asyncio.gather` + `Semaphore(6)`, each chunk on its OWN short-lived session for audit,
+  reassembled in chunk order — partial-success: one bad chunk is skipped, only all-failed fails the job)
+  → merge →
+  clean chunks **IN PARALLEL** (`VideoTranscriptCleanerAgent`, once per chunk so each cleaned section
+  keeps its global time window; same `Semaphore(6)` + per-chunk session pattern; a failed chunk falls
+  back to its raw text; languages aggregated via `_pick_language`) → timeline (`VideoTimelineAgent`, fed
   cleaned chunks as **time-anchored sections** so segment timestamps pin to real chunk windows —
   accurate on long multi-chunk lectures despite no per-segment times) → map to syllabus
   (`VideoSegmentTopicMapperAgent`, validated vs live tree; each segment also inherits `video.chapter`)
@@ -726,6 +757,14 @@ Mirrors `subjective/`; tables in migration `011_video` (§19). Segment/chunk tim
   Response: `{answer, language, chat_session_id,
   selected_segments, detected_topic, detected_subtopic_ids, supporting_knowledge_used, confidence,
   follow_up_suggestions}`.
+  **Streaming variant** (`POST /student/videos/{id}/ask/stream` → `service.run_qa_chain_stream`): same
+  pre-steps (segment/topic routing + retrieval run first, non-streamed), then NDJSON events — a `meta`
+  event (`chat_session_id` + `selected_segments` + detected topic), `delta` events as the answer streams
+  (`VideoTutorAgent.answer_stream` → `provider.stream_text`, plain markdown, NO json_object), then a
+  `done` event with `follow_up_suggestions`/`language`/`confidence`. The agent emits the answer, then a
+  `<<<META>>>` sentinel, then a one-line JSON tail parsed server-side (fail-open) — see
+  `app/ai/agents/streaming.py`. The turn is persisted only after the stream completes; the non-stream
+  endpoint stays as a fallback.
 - **Agents** (`backend/app/ai/agents/video_*`, `audit_ctx` `entity_type="video"`, `get_active_skill_text`):
   `video_timeline_agent`, `video_summary_agent`, `video_tutor_agent` on `get_provider("reasoning")`
   (gpt-5.5); the simpler `video_transcript_cleaner_agent`, `video_segment_topic_mapper_agent`,
@@ -763,6 +802,10 @@ still answers from scope).
 - **Endpoints** (`require_student`): `POST /api/student/tutor/ask` (`{question, exam_id?, chat_session_id?}`
   — `exam_id` required to START a new chat, omitted when resuming → answer +
   `detected_topic`/`detected_subtopic_ids`/`supporting_knowledge_used`/confidences/follow-ups),
+  `POST /api/student/tutor/ask/stream` (streaming NDJSON variant → `service.run_tutor_chain_stream`:
+  `meta` event with `chat_session_id`+detected topic, `delta` events as the answer streams via
+  `TutorAgent.answer_stream`, then a `done` event with follow-ups; sentinel-tail metadata parsing per
+  `app/ai/agents/streaming.py`; non-stream endpoint retained as fallback),
   `GET /api/student/tutor/history?session_id=`.
 - **Tables** (migration `014_chatbots`): `tutor_chat_sessions`, `tutor_chat_messages` (mirrors
   `video_chat_messages`).
@@ -818,7 +861,7 @@ status: draft|active|archived, created_by, approved_by, created_at, activated_at
 ```
 Internal question-specific checking skills: auto-generated, no approval, stored for audit.
 
-### Implementation (`backend/app/modules/skill_layer/`, Phase 10 / Stage 6)
+### Implementation (`backend/app/modules/skill_layer/`)
 `models/service/schemas/router`; chat tables in migration `012_skill_chat`.
 - **Foundation:** `agent_core_skills` + `agent_skill_versions` (migration `008`).
   `seed_default_skills()` (idempotent, run at startup in `main.py`) seeds one **global active** version
@@ -837,9 +880,13 @@ Internal question-specific checking skills: auto-generated, no approval, stored 
 - **Endpoints (`require_admin`):** `GET /api/admin/skills`, `GET /api/admin/skills/{agent_type}`
   (active + history), `POST .../chat/start`, `.../chat/{id}/message`, `.../chat/{id}/approve`,
   `.../chat/{id}/discard`.
-- **Agent integration:** 11 production agents inject active skill via `_get_skill()` +
-  `{skill_instructions}` placeholder, so an approved global update takes effect on next run with no
-  further wiring. The MCQ-rejection auto-refinement path (`update_skill_from_rejection` on
+- **Agent integration:** EVERY skill-tunable agent in `_DEFAULT_SKILLS` injects its active skill via
+  `_get_skill()` + an `{skill_instructions}` placeholder (framed under an `--- ADMIN-TUNABLE GUIDANCE ---`
+  section that may never override the hard rules), so an approved global update takes effect on next run
+  with no further wiring. (The 6 that previously had a seeded default but never read it —
+  `AnswerExtractionAgent`, `AnswerReviewerAgent`, `AnnotationLocatorAgent`, `VideoTopicRouterAgent`,
+  `VideoSegmentRouterAgent`, `VideoSlideLabelAgent` — are now wired too; admin edits to them are no longer
+  silent no-ops.) The MCQ-rejection auto-refinement path (`update_skill_from_rejection` on
   `kvi_ai_skill`) is unchanged.
 - **Frontend:** admin `pages/admin/SkillLayer.tsx` (three-pane: agent selector | chat | draft+approve/
   discard + active instruction + history), service `frontend/src/services/skillLayer.ts`.
@@ -903,7 +950,7 @@ marks, common mistakes, low-confidence count, checked-PDF access log.
 **Video:** total views, total questions, most asked, unclear concepts, student-wise questions,
 low-confidence answers.
 
-### Implementation (`backend/app/modules/analytics/` + `backend/app/modules/dashboard/`, Phase 11)
+### Implementation (`backend/app/modules/analytics/` + `backend/app/modules/dashboard/`)
 Both **read-only aggregation** (no new tables/migration) — query existing MCQ/subjective/video/jobs
 tables. All endpoints `require_admin`.
 - **Dashboard** (`dashboard/service.py` + `router.py`): `GET /api/admin/dashboard/stats` returns
@@ -1010,7 +1057,12 @@ Every task body delegates to `run_task(work, *, job_id, task=self, manage_sessio
   annotation locator calls open their own short session for audit logging), and writes each result in its
   own SAVE burst. `generate_test_skills` uses the SAME borrow-per-use model (snapshots the test config +
   question rows to plain dicts in LOAD sessions, runs topic routing / knowledge-fetch+skill-gen /
-  evaluation holding no session, persists routing + locked skills in SAVE bursts).
+  evaluation holding no session, persists routing + locked skills in SAVE bursts). The video pipeline
+  (`process_video`) ALSO uses `manage_session=False`: it snapshots the video/media scalars in a LOAD
+  session, runs every AI phase (parallel transcription + cleaning, then timeline / topic mapping /
+  summary / slide-label generation) holding no session — each AI call opens its own short session for
+  audit — and persists audio, chunk transcripts, transcript, segments, summary, and slide labels in
+  separate SAVE bursts (`_process_slides` is borrow-per-use too).
 - **Short-lived sessions either way.** The `processing` mark and the terminal `completed` mark always
   use a **separate** `AsyncSessionLocal()`. *Why:* a long task runs minutes; the DB drops the idle
   pooled asyncpg connection server-side, and reusing it for the final commit was the historic
@@ -1033,23 +1085,46 @@ Every task body delegates to `run_task(work, *, job_id, task=self, manage_sessio
   before acking, so `run_task` skips work if the job is already `completed`.
 - Hard per-task timeout (`TASK_TIMEOUT_SECONDS`) via `asyncio.wait_for`.
 
+### Job liveness heartbeat (multi-worker-safe recovery)
+Every running task is stamped with an `owner_token` and a `last_heartbeat_at` that a dedicated
+heartbeat loop (`runtime.py::_heartbeat_loop`) refreshes every `HEARTBEAT_INTERVAL_SECONDS` (30 s) on
+its OWN short session — so the heartbeat keeps advancing even through a multi-minute AI phase with no
+progress update. "Dead vs. alive" has ONE definition: a `processing` job is dead when its last sign of
+life (`coalesce(last_heartbeat_at, started_at, created_at)`) is older than `JOB_STALE_SECONDS` (180 s).
+Both the reaper and startup recovery use this rule, which is what makes running multiple worker
+processes (prefork `--concurrency≥2`, horizontal scaling) safe.
+
 ### Stuck-job reaper (`workers/tasks/maintenance.py`, beat every 2 min)
 Backstop so **no job is stuck forever**. `reap_stale_jobs` (`jobs/service.py`) fails: `queued` > 10 min
-(misrouted/orphaned), and `processing` past `TASK_TIMEOUT_SECONDS` + 5 min grace (worker died/wedged).
-*Why needed:* **Celery's hard `task_time_limit` does NOT fire under `--pool=solo` on Windows** (no
-signals), so on Windows the in-task `wait_for` + reaper are the real timeouts; on Linux/prefork the
-hard limit also applies. Each tick also calls `subjective.service.fail_orphaned_sheets_and_tests` to
-propagate dead/failed jobs to their sheets/tests (`current_status`/`skill_generation_status` →
-`failed`) so the student UI leaves the spinner and re-upload is enabled.
+(misrouted/orphaned), and `processing` whose **heartbeat is stale** (`JOB_STALE_SECONDS`, worker
+died/wedged) — heartbeat-based, not "started_at + task timeout", so a long live job is never reaped and
+a dead one is caught in ~3 min. *Why needed:* **Celery's hard `task_time_limit` does NOT fire under
+`--pool=solo` on Windows** (no signals), so on Windows the heartbeat + reaper are the real timeouts; on
+Linux/prefork the hard limit also applies. Each tick also calls
+`subjective.service.fail_orphaned_sheets_and_tests` to propagate dead/failed jobs to their sheets/tests
+(`current_status`/`skill_generation_status` → `failed`) so the student UI leaves the spinner.
 
 ### Worker-restart recovery (`runtime.py` `worker_ready` signal)
 A hard restart (backend + worker killed mid-job) leaves jobs in `processing` with no live owner — and
 with `task_acks_late=True` + 6 h `visibility_timeout` the broker won't redeliver for hours. On boot,
-`_recover_orphaned_jobs_on_start` fails **all** `processing` jobs
-(`jobs/service.fail_orphaned_processing_jobs` — a fresh worker owns no in-flight tasks) then reconciles
-dependent sheets/tests to `failed`. `_already_terminal` in `run_task` skips any redelivered task whose
-job is now `completed`/`failed`/`cancelled` (Celery *retries* stay in `retrying`, unaffected), so a
-late orphan redelivery can't resurrect a job the student already re-submitted.
+`_recover_orphaned_jobs_on_start` fails ONLY `processing` jobs whose **heartbeat has gone stale**
+(`jobs/service.fail_orphaned_processing_jobs`) then reconciles dependent sheets/tests to `failed`.
+**It must NOT fail all `processing` rows** — under multiple worker processes a sibling worker may be
+actively running them, and a fresh worker can't tell "my orphan" from "someone else's live job" except
+by the heartbeat. A crash-orphaned job whose heartbeat is still recent is left for the reaper to catch
+once it goes stale. `_already_terminal` in `run_task` skips any redelivered task whose job is now
+`completed`/`failed`/`cancelled` (Celery *retries* stay in `retrying`, unaffected).
+
+### Retry idempotency (per-task)
+A Celery `self.retry` re-runs `work()` from the top, so insert-only pipelines must replace prior partial
+state rather than duplicate it: `check_answer_sheet` clears its prior child rows (quality/extraction/
+evaluation/annotation + the deterministic-keyed checked PDF) at the top; MCQ extraction/generation clear
+any prior batch+questions for the same `job_id` (`mcq_extraction_agent._clear_prior_batches`); the
+personalization activity log is idempotent per `(student_id, activity_type, entity_id)` and only fires
+its roll-up on a genuinely new log; the video pipeline already clears its children. **A fully-graded
+sheet is terminal-for-marks:** once it reaches `feedback_ready`, the best-effort annotation phase runs
+under its own `ANNOTATION_BUDGET_SECONDS` and `_mark_sheet_failed` refuses to downgrade a
+`feedback_ready`/`checked` sheet — a slow/failed annotation settles to `checked`, never `failed`.
 
 ### Gemini rate-limit retry
 Free tier is rate-limited **per minute**, so `gemini._generate_content_with_retry` waits a full
@@ -1121,7 +1196,9 @@ a real `chapter` column.
 ### Files + Jobs
 `files`: id, original_filename, display_name, mime_type, file_size, r2_key, uploaded_by, created_at
 `processing_jobs`: id, job_type, status, progress_percent, current_step, input_reference (JSONB),
-output_reference (JSONB), error_message, celery_task_id, created_at, started_at, completed_at, created_by
+output_reference (JSONB), error_message, celery_task_id, owner_token (migration `020`; which worker
+runs it), last_heartbeat_at (migration `020`; refreshed by the worker's heartbeat loop — drives
+multi-worker-safe recovery, §18), created_at, started_at, completed_at, created_by
 
 ### AI Audit
 `ai_requests`: id, provider (azure_openai|gemini), model, api_version, agent_type, task_type,
@@ -1169,7 +1246,8 @@ subtopic (migration `013`; detected per question)
 `question_specific_checking_skills`: id, test_id, question_id, skill_json (JSONB; rich examiner guide),
 version, is_active, evaluation_status, evaluation_notes, iterations (migration `013`), created_at
 `student_answer_sheets`: id, test_id, student_id, file_id, upload_attempt_number, current_status,
-checking_job_id, created_at
+checking_job_id, created_at — **unique(test_id, student_id, upload_attempt_number)** (migration `021`;
+makes concurrent uploads race-safe, §11)
 `answer_quality_checks`: id, sheet_id, blur_score, brightness_score, tilt_angle, resolution_ok,
 readability_score, overall_status, quality_notes, created_at
 `answer_extractions`: id, sheet_id, extracted_data (JSONB; question-level text + question bboxes + page
@@ -1275,8 +1353,9 @@ GET    /api/student/subjective/sheets/{sheet_id}/feedback-chat
 POST   /api/student/subjective/sheets/{sheet_id}/feedback-chat/start
 POST   /api/student/subjective/sheets/{sheet_id}/feedback-chat/{chat_id}/message
 POST   /api/admin/videos                  GET    /api/student/videos
-POST   /api/student/videos/{id}/ask
+POST   /api/student/videos/{id}/ask       POST   /api/student/videos/{id}/ask/stream
 POST   /api/student/tutor/ask             GET    /api/student/tutor/history
+POST   /api/student/tutor/ask/stream
 POST   /api/admin/skills/chat/start
 POST   /api/admin/skills/chat/{id}/message
 POST   /api/admin/skills/chat/{id}/approve
@@ -1303,6 +1382,7 @@ heavy tasks, never expose API keys.
 ```python
 class AIModelProvider:
     async def generate_text(self, prompt, schema=None, agent_type=None, task_type=None, entity_type=None, entity_id=None) -> dict: ...
+    async def stream_text(self, prompt, audit_ctx=None) -> AsyncIterator[str]: ...  # plain-text deltas (Azure tiers only; no json_object)
     async def generate_with_file(self, prompt, file_bytes, mime_type, schema=None, **audit_ctx) -> dict: ...
     async def generate_with_image(self, prompt, image_bytes, schema=None, **audit_ctx) -> dict: ...
     async def embed(self, texts: list[str]) -> list[list[float]]: ...
@@ -1310,7 +1390,8 @@ class AIModelProvider:
 ```
 
 All agents call this via `get_provider(task_type)`, which selects provider AND Azure deployment tier
-(see §4): `"reasoning"`→gpt-5.5, `"text_extraction"`/`"vision_typed"`→gpt-5, `"chunking"`→gpt-5-mini,
+(see §4): `"reasoning"`→gpt-5.5, `"text_extraction"`/`"vision_typed"`→gpt-5,
+`"chunking"`→gpt-5 by default (gpt-5-mini when `CHUNKING_MODEL_TIER=fast`), `"routing"`→gpt-5-mini,
 `"vision"`/`"vision_handwritten"`→Gemini. `get_provider("vision")` returns the **Gemini** provider
 (`ai/providers/gemini.py`, vision-only: `generate_with_image` + `generate_with_images` for the
 multi-page structure pass; text/embed/transcribe raise); the Azure tiers return an
@@ -1326,13 +1407,22 @@ All Azure calls go through a bounded transient-error retry (`_call_with_retry`, 
 Video transcription).
 
 Structured JSON output required for: MCQ extraction/generation, checking skill generation, answer
-extraction, evaluation, PDF annotation, timeline, slide labels, skill updates.
+extraction, evaluation, PDF annotation, timeline, slide labels, skill updates. **NOTE:** the provider
+`schema` argument only toggles `json_object` mode — it guarantees the response is a JSON *object*, not
+the presence/type of each field. Agents whose output is persisted/rendered must validate the shapes
+they depend on (e.g. `VideoSummaryAgent` coerces `key_points`/`possible_questions` to safe containers
+via `_normalize_summary` so malformed AI output degrades instead of crashing the player).
+
+`_audit` writes every AI-request row on its OWN short-lived session (not the caller's session, which is
+held across the long model call) — so audit can't fail on a server-dropped connection and never commits
+the caller's transaction as a side effect. Azure 429s honor the server `retry-after` (with jitter); the
+streaming path always records an audit row, including on client disconnect (`GeneratorExit`).
 
 **Markdown in prose fields (student-facing learning content):** selected agent system prompts instruct
 the model to emit GitHub-flavored markdown (bold key terms, `##` sub-headings, bullet lists) in their
 **prose text fields only**, so the frontend can render real hierarchy via `RichText`
 (`react-markdown` + `remark-gfm`, `prose-brand` typography theme). Markdown-emitting fields:
-`VideoSummaryAgent.detailed_summary`, `VideoTutorAgent.answer`,
+`VideoSummaryAgent.detailed_summary`, `VideoTutorAgent.answer`, `TutorAgent.answer` (main AI tutor),
 `AnswerEvaluationAgent`/`AnswerReviewerAgent` `feedback` + `overall_summary`, and the AI-authored MCQ
 `explanation` (generation/regeneration only — **extraction stays verbatim/plain**). JSON keys/structure
 are unchanged. Fields that must stay PLAIN TEXT are explicitly excluded in the prompts: annotation
@@ -1344,9 +1434,22 @@ are unchanged. Fields that must stay PLAIN TEXT are explicitly excluded in the p
 ## 22. Security
 
 - bcrypt password hashing; JWT access tokens; role-based access on every route.
-- File type + size validation before R2 upload. R2 files private; signed URLs (1 h expiry) or backend proxy.
-- Env vars only for secrets; never in code or API responses. Sanitize AI-generated text before returning.
-- Rate limit: login (10/min/IP), AI chat endpoints (30/min/user). CORS: only `FRONTEND_URL` origin. HTTPS in deployment.
+- **Object authorization (not just authentication):** `GET /files/{id}/url` and `GET /jobs/{id}` are
+  scoped — admins see any, a student only files they uploaded / jobs they created (every admin-owned
+  asset a student is entitled to is served through its own scoped endpoint). Student video player/Q&A
+  and the main-tutor session resume both enforce **enrollment**, not just `status==active`.
+- File type + size validation before R2 upload (size enforced by a **bounded read** so a small-limit
+  context can't be used to buffer gigabytes); client filenames sanitized before they enter an R2 key /
+  are stored. R2 files private; signed URLs (1 h expiry) or backend proxy.
+- Env vars only for secrets; never in code or API responses. `backend/.env` is gitignored and untracked.
+  In `ENVIRONMENT=production` startup **fails closed** on a placeholder `JWT_SECRET` or the weak default
+  `DEFAULT_ADMIN_PASSWORD`. `/health/ready` returns booleans only (no dependency error detail).
+- **Rate limiting (`app/core/ratelimit.py`, slowapi + `SlowAPIMiddleware`):** login 10/min/IP
+  (brute-force guard, keyed by IP), AI chat/stream endpoints 30/min/user (cost guard, keyed by bearer
+  token → falls back to IP). Optional shared storage via `RATELIMIT_STORAGE_URI` for multi-process APIs.
+- Security headers on every response (`SecurityHeadersMiddleware`: nosniff, `X-Frame-Options: DENY`,
+  `Referrer-Policy`, a strict CSP, HSTS). CORS locked to `FRONTEND_URL` with pinned methods/headers
+  (not credentialed wildcards). Sanitize AI-generated text before returning. HTTPS in deployment.
 
 ---
 
@@ -1358,16 +1461,27 @@ Celery queue names + routing live in `workers/celery_config.py` (not env vars).
 ```env
 # ── Database (Azure Postgres — asyncpg driver required) ────────────────────
 # Either set DATABASE_URL directly, or provide the discrete PG* parts (config.py
-# assembles the asyncpg URL with ssl=require). Pool sizing is right-sized per process:
+# assembles the asyncpg URL with ssl=require). Pool sizing is right-sized per process
+# (defaults 8+12 = 20/process; sized for the per-phase AI fan-out concurrency of 6 +
+# the job-mark session — keep API pool + worker×concurrency + beat under Azure PG max_connections):
 DATABASE_URL=postgresql+asyncpg://<user>:<pass>@<host>/<db>?ssl=require
 # PGHOST=<server>.postgres.database.azure.com   PGUSER=...   PGPASSWORD=...   PGDATABASE=...
-DB_POOL_SIZE=5
-DB_MAX_OVERFLOW=10
+DB_POOL_SIZE=8
+DB_MAX_OVERFLOW=12
+
+# ── Environment ────────────────────────────────────────────────────────────
+# "development" (default) or "production". In production startup FAILS CLOSED on a
+# placeholder JWT_SECRET / weak DEFAULT_ADMIN_PASSWORD / missing required settings.
+ENVIRONMENT=development
 
 # ── Auth ───────────────────────────────────────────────────────────────────
 JWT_SECRET=<generate: python -c "import secrets; print(secrets.token_hex(32))">
 JWT_ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=1440
+
+# Optional: shared storage for the HTTP rate limiter across multiple API processes
+# (e.g. the Redis URL). Empty → in-process memory storage (fine for a single process).
+RATELIMIT_STORAGE_URI=
 
 # ── Redis (Upstash; rediss:// for TLS) ─────────────────────────────────────
 REDIS_URL=rediss://default:<token>@<host>.upstash.io:6379
@@ -1400,8 +1514,9 @@ AZURE_OPENAI_API_VERSION_TRANSCRIPTION=2025-03-01-preview
 AZURE_OPENAI_API_VERSION_THINKING=2025-01-01-preview   # api-version for the gpt-5 (thinking) deployment
 AZURE_OPENAI_API_VERSION_FAST=2025-01-01-preview        # api-version for the gpt-5-mini (fast) deployment
 MODEL_REASONING=gpt-5.5         # reasoning tier (default)
-MODEL_CHAT_THINKING=gpt-5       # typed text/vision extraction tier
-MODEL_CHAT_FAST=gpt-5-mini      # semantic-chunking tier
+MODEL_CHAT_THINKING=gpt-5       # typed text/vision extraction tier (+ default chunking tier)
+MODEL_CHAT_FAST=gpt-5-mini      # routing tier (+ chunking when CHUNKING_MODEL_TIER=fast)
+CHUNKING_MODEL_TIER=thinking    # semantic chunking: "thinking" (gpt-5, default) | "fast" (gpt-5-mini)
 MODEL_EMBEDDING=text-embedding-3-large
 MODEL_TRANSCRIPTION=gpt-4o-transcribe
 
@@ -1437,24 +1552,7 @@ DEFAULT_ADMIN_NAME=Institute Admin
 
 ---
 
-## 24. Implementation Order
-
-✅ Phase 1: Foundation (FastAPI, React, PostgreSQL, Alembic, JWT, layouts)
-✅ Phase 2: Users & Syllabus (student CRUD, seed syllabus, fully editable syllabus UI)
-✅ Phase 3: Files & Jobs (R2, Celery, job tracking)
-✅ Phase 4: Knowledge Layer (upload, extract, chunk, embed, Pinecone)
-✅ Phase 5: AI Audit + Files Router + MCQ Extraction & Generation
-✅ Phase 6: MCQ Test Sets & Student Attempts
-✅ Phase 7: Subjective Test Management & Skill Generation (admin-configured tests = source of truth; optional per-test rubric with default fallback; auto-generated question-specific checking guide)
-✅ Phase 8: Answer Checking Pipeline (quality → high-quality images → question-level extraction → question-wise reconstruction → evaluation vs admin config → GPT-5.5 reviewer pass → checked PDF)
-✅ Phase 9: Video Tutor (upload → FFmpeg audio → gpt-4o-transcribe → clean → timeline → syllabus mapping → summary → slide labels; timeline-first synchronous Q&A)
-✅ Phase 10: Skill Layer (seed skills, synchronous Skill Builder chat, draft → approve → activate, global scope, agent integration)
-✅ Phase 11: Analytics & Dashboard (read-only admin analytics for MCQ/subjective/video + dashboard stats with recent-activity feed)
-Phase 12: Hardening (error handling, security, logging, deployment)
-
----
-
-## 25. Do Not Do
+## 24. Do Not Do
 
 - Call this a demo/prototype anywhere in code, docs, prompts, or UI
 - Build fake workflows for core features
@@ -1486,44 +1584,7 @@ Phase 12: Hardening (error handling, security, logging, deployment)
 
 ---
 
-## 26. Definition of Done
-
-1. Admin logs in with email/password
-2. Admin creates student accounts manually
-3. Student logs in, changes password
-4. Objective + subjective syllabi seeded; admin can add/rename/delete chapters/topics/subtopics
-5. Admin uploads knowledge with usage type, processes into Pinecone with Azure embeddings
-6. Admin uploads existing MCQ files, extracts questions + answers + explanations
-7. Admin generates MCQs from content using approved MCQs as style examples
-8. Admin accept/reject/edit/delete/regenerate MCQs with feedback
-9. Admin manually add/edit MCQs
-10. Admin creates MCQ test blueprints, generates unique sets
-11. System warns with shortage breakdown if questions insufficient
-12. Admin activates MCQ sets
-13. Student attempts active set once, sees immediate result + explanations
-14. Admin creates subjective tests with question paper, question-wise marks, model answer, optional rubric file (default rubric when none)
-15. System generates internal question-specific checking skills automatically
-16. Student uploads PDF/image answer sheet
-17. System checks quality, asks reupload up to 2x
-18. System converts pages to high-quality images and performs question-level extraction (text + coordinates)
-19. System reconstructs answers question-wise and evaluates them against the admin-configured test (paper, marks, rubric/default, admin instructions in priority order; never exceeding configured full marks)
-20. System runs a GPT-5.5 reviewer/verification pass (fair marks, max-marks enforced, annotations pruned)
-21. System produces a checked PDF with red handwritten-style marks/comments (line annotations only for specific wrong items; not overcrowded)
-22. Student sees total marks + question-wise marks + feedback + checked PDF immediately (no internal JSON exposed)
-23. Admin uploads video/audio + support slides PDF
-24. System transcribes with gpt-4o-transcribe
-25. System generates transcript, summary, timeline, slide labels with reasoning model
-26. Student watches video, asks tutor questions
-27. Tutor answers from video artifacts, notes fallback only if needed
-28. Skill Layer updates backend agent behavior after admin approval
-29. Skill version history visible
-30. Admin analytics for MCQ, subjective, video
-31. All heavy workflows show job status
-32. App deployable with React, FastAPI, Celery, PostgreSQL, Redis, Pinecone, R2, Azure OpenAI
-
----
-
-## 27. Build Principle
+## 25. Build Principle
 
 Serious production system with limited chapter coverage. Clean module design so expanding from one
 chapter to full syllabus is straightforward. Azure OpenAI credits used strategically. Model
@@ -1531,7 +1592,7 @@ abstraction maintained so another provider can be added later.
 
 ---
 
-## 28. Commands
+## 26. Commands
 
 ```bash
 # Worker + beat in one process (no -Q: consumes all queues declared in

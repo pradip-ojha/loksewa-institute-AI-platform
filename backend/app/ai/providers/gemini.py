@@ -73,29 +73,31 @@ def _parse_json(text: str, *, agent_type: str | None, task_type: str | None) -> 
 async def _audit(audit_ctx: dict | None, *, model: str, input_tokens: int | None,
                  output_tokens: int | None, latency_ms: int, status: str = "success",
                  error_message: str | None = None) -> None:
+    # Audit on its OWN short-lived session — never the caller's session, which is held
+    # open across the (often slow) vision call. See azure_openai._audit for the full
+    # rationale (stale-connection + side-effect-commit avoidance). Best-effort.
     if not audit_ctx:
         return
-    db = audit_ctx.get("db")
-    if db is None:
-        return
     try:
+        from app.core.database import AsyncSessionLocal
         from app.modules.ai_audit.service import log_ai_request
-        await log_ai_request(
-            db,
-            provider="gemini",
-            model=model,
-            api_version=None,
-            agent_type=audit_ctx.get("agent_type"),
-            task_type=audit_ctx.get("task_type"),
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            status=status,
-            latency_ms=latency_ms,
-            error_message=error_message,
-            related_entity_type=audit_ctx.get("entity_type"),
-            related_entity_id=audit_ctx.get("entity_id"),
-            output_summary=audit_ctx.get("output_summary"),
-        )
+        async with AsyncSessionLocal() as db:
+            await log_ai_request(
+                db,
+                provider="gemini",
+                model=model,
+                api_version=None,
+                agent_type=audit_ctx.get("agent_type"),
+                task_type=audit_ctx.get("task_type"),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                status=status,
+                latency_ms=latency_ms,
+                error_message=error_message,
+                related_entity_type=audit_ctx.get("entity_type"),
+                related_entity_id=audit_ctx.get("entity_id"),
+                output_summary=audit_ctx.get("output_summary"),
+            )
     except Exception as exc:
         logger.warning("Gemini audit logging failed: %s", exc)
 

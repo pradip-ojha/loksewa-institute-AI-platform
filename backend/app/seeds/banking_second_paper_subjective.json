@@ -1,0 +1,228 @@
+[
+  {
+    "chapter": "वाणिज्य बैंक व्यवस्थापन (Management of Commercial Banks)",
+    "topics": [
+      {
+        "topic": "वाणिज्य बैंकहरूको नाफा र तरलता व्यवस्थापन (Profitability and liquidity management)",
+        "subtopics": []
+      },
+      {
+        "topic": "कर्जा लगानीका सिद्धान्तहरू (Lending principles of credit)",
+        "subtopics": []
+      },
+      {
+        "topic": "कर्जा असुली र निष्क्रिय कर्जा व्यवस्थापन (Recovery and non-performing loan management)",
+        "subtopics": []
+      },
+      {
+        "topic": "बैंक सञ्चालन उत्कृष्टता र सेवा प्रवाह (Operation excellence and service delivery)",
+        "subtopics": []
+      },
+      {
+        "topic": "मर्जर तथा एक्वीजिसन (Mergers and acquisitions)",
+        "subtopics": []
+      },
+      {
+        "topic": "वाणिज्य बैंकहरूको जोखिम व्यवस्थापन (Risk management of commercial banks)",
+        "subtopics": []
+      },
+      {
+        "topic": "ब्याजदर करिडोर (Interest Rate Corridor - IRC)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपाल राष्ट्र बैंक निर्देशन अनुसार कर्जाको वर्गीकरण (Classification of loan as per NRB directives)",
+        "subtopics": []
+      },
+      {
+        "topic": "कर्जा चक्र तथा कर्जाको व्यवस्थापन (Credit cycle and loan management)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "आधुनिक बैंकिङ्ग सेवाहरू (Modern Banking Products and Services)",
+    "topics": [
+      {
+        "topic": "एजेन्सी बैंकिङ्ग सेवाहरू (Agency banking services)",
+        "subtopics": []
+      },
+      {
+        "topic": "ई-बैंकिङ्ग: प्रकार र महत्त्व (e-Banking: types and importance)",
+        "subtopics": []
+      },
+      {
+        "topic": "मोबाइल बैंकिङ्ग र इन्टरनेट बैंकिङ्ग (Mobile banking and internet banking)",
+        "subtopics": []
+      },
+      {
+        "topic": "नियो बैंकको अवधारणा र फाइदा (Concept and advantage of Neo Bank)",
+        "subtopics": []
+      },
+      {
+        "topic": "कागजरहित बैंकिङ्ग प्रणाली (Paperless banking system)",
+        "subtopics": []
+      },
+      {
+        "topic": "एटिएम, डेबिट/क्रेडिट/प्रिपेड/किसान/भिसा कार्ड (ATM, Debit, Credit, Prepaid, Kisan and Visa cards)",
+        "subtopics": []
+      },
+      {
+        "topic": "पोइन्ट अफ सेल र QR आधारित भुक्तानी (POS and QR based payment)",
+        "subtopics": []
+      },
+      {
+        "topic": "एनी ब्रान्च बैंकिङ्ग प्रणाली — ABBS (Any Branch Banking System)",
+        "subtopics": []
+      },
+      {
+        "topic": "C-ASBA, DEMAT, Mero Share र CDSC",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "बैंकिङ्ग उपकरणहरू (Banking Instruments)",
+    "topics": [
+      {
+        "topic": "प्रतीत पत्र: अवधारणा, प्रकार र जारी गर्ने प्रक्रिया (Letter of credit: concept, types and process)",
+        "subtopics": []
+      },
+      {
+        "topic": "बैंक जमानत: अवधारणा, प्रकार र जारी गर्ने प्रक्रिया (Bank guarantee: concept, types and process)",
+        "subtopics": []
+      },
+      {
+        "topic": "चेक तथा ड्राफ्ट: अर्थ, प्रकार र पक्षहरू (Cheque and draft: meaning, types and parties)",
+        "subtopics": []
+      },
+      {
+        "topic": "बिल कलेक्सन (Bills collection)",
+        "subtopics": []
+      },
+      {
+        "topic": "प्रोमिसरी नोट (Promissory note)",
+        "subtopics": []
+      },
+      {
+        "topic": "SWIFT, RTGS, ECC",
+        "subtopics": []
+      },
+      {
+        "topic": "ट्राभलर चेक (Traveler's cheque)",
+        "subtopics": []
+      },
+      {
+        "topic": "विप्रेषण: अवधारणा र आर्थिक प्रभाव (Remittance: concept and economic impact)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "अर्थशास्त्र (Economics)",
+    "topics": [
+      {
+        "topic": "सूक्ष्म तथा बृहत् अर्थशास्त्रको अवधारणा (Concept of micro and macro economics)",
+        "subtopics": []
+      },
+      {
+        "topic": "माग र पूर्तिका सिद्धान्तहरू (Principles of demand and supply)",
+        "subtopics": []
+      },
+      {
+        "topic": "उत्पादन, उपभोग र बचत (Production, consumption and saving)",
+        "subtopics": []
+      },
+      {
+        "topic": "सरकारी धितोपत्र, धितोपत्र, बन्ड र डिबेन्चर (Government securities, share, bond and debenture)",
+        "subtopics": []
+      },
+      {
+        "topic": "मुद्रास्फीति: अवधारणा, प्रकार, कारण र परिणाम (Inflation: concept, types, causes and consequences)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपाल सरकारको बजेट र आर्थिक नीति (Nepal's government budget and fiscal policy)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपाल राष्ट्र बैंकबाट जारी मौद्रिक नीति (NRB monetary policy)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपालको मुद्रा बजार र पूँजी बजार (Money market and capital market in Nepal)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "कार्यालय व्यवस्थापन (Office Management)",
+    "topics": [
+      {
+        "topic": "पत्र लेखन र अन्तर विभागीय पत्राचार (Letter writing and inter-departmental correspondence)",
+        "subtopics": []
+      },
+      {
+        "topic": "दर्ता र चलानी (Registration and dispatch of documents)",
+        "subtopics": []
+      },
+      {
+        "topic": "टिप्पणी लेखन (Memo/tippani writing)",
+        "subtopics": []
+      },
+      {
+        "topic": "अभिलेख व्यवस्थापन (Records management)",
+        "subtopics": []
+      },
+      {
+        "topic": "फाइलिङ प्रणाली र प्रक्रिया (Filing system and procedure)",
+        "subtopics": []
+      },
+      {
+        "topic": "अनुक्रमणिका र सूचीकरण (Indexing and cataloging)",
+        "subtopics": []
+      },
+      {
+        "topic": "सञ्चार व्यवस्थापन (Communication management)",
+        "subtopics": []
+      },
+      {
+        "topic": "कार्यालयको संरचना र सजावट/लेआउट (Office structure and layout)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "कृषि विकास बैंक लिमिटेडको संक्षिप्त परिचय (Overview of the ADBL)",
+    "topics": [
+      {
+        "topic": "ADBL: विकासक्रम, उपलब्धि, दूरदृष्टि, ध्येय र मूल्य मान्यता (Historical development, achievement, vision, mission and core values)",
+        "subtopics": []
+      },
+      {
+        "topic": "बैंकको वर्तमान संगठनात्मक संरचना (Existing organizational structure)",
+        "subtopics": []
+      },
+      {
+        "topic": "कृषि विकास बैंक लि., कर्मचारी सेवा विनियमावली, २०६२ (ADBL Employees Bylaws, 2062)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपालको आर्थिक (कृषि, ग्रामीण तथा बैंकिङ्ग) क्षेत्रको विकासमा ADBL को योगदान, भूमिका, सम्भावना र चुनौती (Contribution, role, potential and challenges of ADBL)",
+        "subtopics": []
+      },
+      {
+        "topic": "कृषि विकास बैंकको वर्तमान वित्तीय स्थिति र प्रगति झलक (Current financial status and progress)",
+        "subtopics": []
+      },
+      {
+        "topic": "कृषि विकास बैंकको सवल र दुर्बल पक्ष, अवसर र चुनौती (Strengths, weaknesses, opportunities and threats - SWOT)",
+        "subtopics": []
+      },
+      {
+        "topic": "कृषि विकास बैंकमा कोर बैंकिङ्ग प्रणाली — CBS (Core Banking System)",
+        "subtopics": []
+      }
+    ]
+  }
+]

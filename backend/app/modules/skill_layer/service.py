@@ -422,9 +422,20 @@ async def _activate_new_skill_version(
     instruction_text: str,
     change_summary: str,
 ) -> None:
-    """Archive the current active version and create a new active one (single atomic commit)."""
+    """Archive the current active version and create a new active one (single atomic commit).
+
+    Serialized per agent via a row lock on the core skill row: an admin approving a
+    skill at the same instant as the rejection-driven auto-update would otherwise both
+    archive-then-insert, leaving two `active` rows (or a duplicate version_number) that
+    `_active_version` then resolves non-deterministically. Locking the core row makes the
+    second activation wait for the first to commit, then archive the now-correct active
+    and take the next version number."""
     now = datetime.now(timezone.utc)
     core = await _get_or_create_core(db, agent_type)
+    # FOR UPDATE: hold the lock until this transaction commits, serializing activations.
+    await db.execute(
+        select(AgentCoreSkill.id).where(AgentCoreSkill.id == core.id).with_for_update()
+    )
     await _archive_active_versions(db, agent_type)
 
     new_version = AgentSkillVersion(

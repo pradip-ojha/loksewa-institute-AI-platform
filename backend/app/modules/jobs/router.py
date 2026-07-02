@@ -10,7 +10,7 @@ from app.core.exceptions import AppException
 from app.modules.jobs.models import ProcessingJob
 from app.modules.jobs.schemas import JobOut
 from app.modules.jobs.service import create_job
-from app.modules.users.models import User
+from app.modules.users.models import User, UserRole
 
 router = APIRouter(tags=["jobs"])
 
@@ -24,6 +24,10 @@ async def get_job(
     result = await db.execute(select(ProcessingJob).where(ProcessingJob.id == job_id))
     job = result.scalar_one_or_none()
     if not job:
+        raise AppException(404, "not_found", "Job not found.")
+    # Ownership (was an IDOR: any user could poll any job id and read its error_message
+    # + output_reference). Admins see any job; a student only the jobs they created.
+    if current_user.role != UserRole.institute_admin and job.created_by != current_user.id:
         raise AppException(404, "not_found", "Job not found.")
     return JobOut.model_validate(job)
 

@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { Sparkles, GraduationCap, Send, BookOpen } from "lucide-react";
 import { tutorService } from "../../services/tutor";
 import { examsService, type Enrollment } from "../../services/exams";
-import { getErrorMessage } from "../../utils/error";
 import { PageHeader } from "../../components/ui";
 import { RichText } from "../../components/content/RichText";
 
@@ -36,6 +35,12 @@ export function StudentTutor() {
   const [exams, setExams] = useState<Enrollment[]>([]);
   const [examId, setExamId] = useState<string>("");
   const endRef = useRef<HTMLDivElement>(null);
+  // Tracks the in-flight stream so we can abort it (unmount / exam switch / new
+  // question), stopping backend token generation and avoiding setState-after-unmount.
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Abort any in-flight stream when the page unmounts.
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   useEffect(() => {
     examsService.myExams().then((list) => {
@@ -50,6 +55,7 @@ export function StudentTutor() {
 
   // Switching exam starts a fresh conversation (sessions are exam-scoped).
   function switchExam(id: string) {
+    abortRef.current?.abort();
     setExamId(id);
     setSessionId(null);
     setTurns([]);
@@ -63,26 +69,46 @@ export function StudentTutor() {
     setBusy(true);
     const idx = turns.length;
     setTurns((t) => [...t, { question: text, loading: true }]);
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
-      const res = await tutorService.ask({ question: text, exam_id: examId, chat_session_id: sessionId });
-      setSessionId(res.chat_session_id);
-      setTurns((t) =>
-        t.map((turn, i) =>
-          i === idx
-            ? {
-                ...turn,
-                loading: false,
-                answer: res.answer,
-                mode: res.related_mode,
-                topic: res.detected_topic,
-                followUps: res.follow_up_suggestions,
-              }
-            : turn,
-        ),
-      );
-    } catch (err) {
-      setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, error: getErrorMessage(err, "उत्तर ल्याउन सकिएन।") } : turn)));
+    await tutorService.askStream(
+      { question: text, exam_id: examId, chat_session_id: sessionId },
+      {
+        onMeta: (meta) => {
+          setSessionId(meta.chat_session_id);
+          setTurns((t) =>
+            t.map((turn, i) =>
+              i === idx ? { ...turn, topic: (meta.detected_topic as string | null) ?? null } : turn,
+            ),
+          );
+        },
+        onDelta: (delta) => {
+          // First delta clears the loading dots; subsequent deltas append live.
+          setTurns((t) =>
+            t.map((turn, i) =>
+              i === idx ? { ...turn, loading: false, answer: (turn.answer ?? "") + delta } : turn,
+            ),
+          );
+        },
+        onDone: (done) => {
+          setTurns((t) =>
+            t.map((turn, i) =>
+              i === idx
+                ? { ...turn, loading: false, answer: turn.answer ?? "", followUps: done.follow_up_suggestions ?? [] }
+                : turn,
+            ),
+          );
+        },
+        onError: (message) => {
+          setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, error: message } : turn)));
+        },
+      },
+      controller.signal,
+    );
     } finally {
+      // Always re-enable input, even if a handler threw or the stream rejected.
+      if (abortRef.current === controller) abortRef.current = null;
       setBusy(false);
     }
   }

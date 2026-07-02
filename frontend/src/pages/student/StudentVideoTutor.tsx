@@ -338,6 +338,11 @@ function TutorTab({
   const [busy, setBusy] = useState(false);
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
+  // In-flight stream, aborted when the tab/player unmounts so a backgrounded answer
+  // stops generating (saves Azure spend) and never setStates an unmounted component.
+  const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   useEffect(() => {
     let cancelled = false;
@@ -377,29 +382,42 @@ function TutorTab({
     setBusy(true);
     const idx = turns.length;
     setTurns((t) => [...t, { question: text, loading: true }]);
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
-      const res = await videoTutorService.ask(videoId, {
-        question: text,
-        current_video_time: getCurrentTime(),
-        chat_session_id: sessionId,
-      });
-      setSessionId(res.chat_session_id);
-      setTurns((t) =>
-        t.map((turn, i) =>
-          i === idx
-            ? {
-                ...turn,
-                loading: false,
-                answer: res.answer,
-                segments: res.selected_segments,
-                followUps: res.follow_up_suggestions,
-              }
-            : turn,
-        ),
-      );
-    } catch (err) {
-      setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, error: getErrorMessage(err, "उत्तर ल्याउन सकिएन।") } : turn)));
+    await videoTutorService.askStream(
+      videoId,
+      { question: text, current_video_time: getCurrentTime(), chat_session_id: sessionId },
+      {
+        onMeta: (meta) => {
+          setSessionId(meta.chat_session_id);
+          const segs = (meta.selected_segments as AskSelectedSegment[] | undefined) ?? [];
+          setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, segments: segs } : turn)));
+        },
+        onDelta: (delta) => {
+          setTurns((t) =>
+            t.map((turn, i) =>
+              i === idx ? { ...turn, loading: false, answer: (turn.answer ?? "") + delta } : turn,
+            ),
+          );
+        },
+        onDone: (done) => {
+          setTurns((t) =>
+            t.map((turn, i) =>
+              i === idx
+                ? { ...turn, loading: false, answer: turn.answer ?? "", followUps: done.follow_up_suggestions ?? [] }
+                : turn,
+            ),
+          );
+        },
+        onError: (message) => {
+          setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, error: message } : turn)));
+        },
+      },
+      controller.signal,
+    );
     } finally {
+      if (abortRef.current === controller) abortRef.current = null;
       setBusy(false);
     }
   }

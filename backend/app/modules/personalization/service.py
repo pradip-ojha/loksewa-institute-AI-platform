@@ -13,7 +13,7 @@ import logging
 import uuid
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.personalization.models import (
@@ -64,19 +64,36 @@ async def _get_or_create_extended(db: AsyncSession, student_id: uuid.UUID) -> Ex
 async def log_activity(
     db: AsyncSession, *, student_id: uuid.UUID, activity_type: str, entity_id: uuid.UUID | None,
     exam_id: uuid.UUID | None, raw_context: dict, summary_line: str,
-) -> None:
+) -> bool:
     """Persist a raw activity record (full detail kept only for the current day).
-    Fast + best-effort; the AI roll-up happens later via the personalization tasks."""
+    Fast + best-effort; the AI roll-up happens later via the personalization tasks.
+
+    Idempotent per (student_id, activity_type, entity_id): a Celery retry of the
+    producing task (e.g. answer-sheet checking) must NOT double-log the activity or
+    double-count the student's mistake history. Returns True only when a NEW row was
+    written, so the caller can gate the (also non-idempotent) roll-up enqueue on it."""
     try:
+        if entity_id is not None:
+            existing = (await db.execute(
+                select(StudentActivityLog.id).where(
+                    StudentActivityLog.student_id == student_id,
+                    StudentActivityLog.activity_type == activity_type,
+                    StudentActivityLog.entity_id == entity_id,
+                ).limit(1)
+            )).first()
+            if existing is not None:
+                return False
         db.add(StudentActivityLog(
             student_id=student_id, activity_type=activity_type,
             entity_type=activity_type, entity_id=entity_id, exam_id=exam_id,
             activity_date=date.today(), raw_context=raw_context, summary=summary_line[:2000],
         ))
         await db.commit()
+        return True
     except Exception as exc:
         logger.warning("log_activity failed (continuing): %s", exc)
         await db.rollback()
+        return False
 
 
 # ── Rolling daily summary ───────────────────────────────────────────────────
@@ -150,10 +167,17 @@ async def summarize_chat_session(
             ))
         else:
             row.summary_text = summary
-        # Q-A counter on the daily row.
-        daily = await _get_or_create_daily(db, student_id)
-        daily.qa_since_update = (daily.qa_since_update or 0) + 1
-        roll = daily.qa_since_update >= QA_PER_DAILY_UPDATE
+        # Q-A counter on the daily row — incremented ATOMICALLY in SQL so concurrent
+        # chat roll-ups for the same student (different prefork workers) can't lose
+        # increments via a read-modify-write race.
+        await _get_or_create_daily(db, student_id)
+        new_count = (await db.execute(
+            update(StudentDailySummary)
+            .where(StudentDailySummary.student_id == student_id)
+            .values(qa_since_update=StudentDailySummary.qa_since_update + 1)
+            .returning(StudentDailySummary.qa_since_update)
+        )).scalar_one()
+        roll = new_count >= QA_PER_DAILY_UPDATE
         await db.commit()
         if roll:
             await recompute_daily_summary(db, student_id)

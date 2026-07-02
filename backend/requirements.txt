@@ -29,3 +29,5 @@ uharfbuzz>=0.55.0
 freetype-py>=2.5.1
 # Stage 9 (Video Tutor: audio extraction + chunking via the system ffmpeg binary)
 ffmpeg-python>=0.2.0
+# Security: HTTP rate limiting on login + AI chat endpoints (CLAUDE.md §22)
+slowapi>=0.1.9

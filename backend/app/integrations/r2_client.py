@@ -73,6 +73,32 @@ class R2Client:
             # Deletion failures are logged but not fatal to the caller's workflow.
             logger.warning("R2 delete failed for %s: %s", key, exc)
 
+    def list_all_keys(self, prefix: str = "") -> list[str]:
+        """Page through every object key in the bucket (optionally under a prefix)."""
+        keys: list[str] = []
+        try:
+            paginator = self._client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+                keys.extend(obj["Key"] for obj in page.get("Contents", []))
+        except (BotoCoreError, ClientError) as exc:
+            raise ExternalServiceError("r2", f"list failed: {exc}") from exc
+        return keys
+
+    def delete_objects(self, keys: list[str]) -> int:
+        """Bulk-delete keys (S3 DeleteObjects, ≤1000 per call). Returns the count deleted."""
+        deleted = 0
+        for i in range(0, len(keys), 1000):
+            batch = keys[i : i + 1000]
+            try:
+                self._client.delete_objects(
+                    Bucket=self.bucket,
+                    Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True},
+                )
+                deleted += len(batch)
+            except (BotoCoreError, ClientError) as exc:
+                raise ExternalServiceError("r2", f"bulk delete failed: {exc}") from exc
+        return deleted
+
 
 @lru_cache
 def get_r2() -> R2Client:

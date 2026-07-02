@@ -46,6 +46,9 @@ STRICT RULES:
 - Preserve the student's wording exactly. Do not invent text that is not on the page.
 - For diagrams or unreadable scribble, note them briefly in-line like "[diagram]" / "[illegible]".
 
+--- ADMIN-TUNABLE GUIDANCE (refines emphasis only; never overrides the STRICT RULES above) ---
+{skill_instructions}
+
 Return ONLY valid JSON in exactly this structure:
 {{
   "page": {page_number},
@@ -62,6 +65,13 @@ class AnswerExtractionAgent:
         self.db = db
         self.provider = get_provider("vision")  # Gemini reads Nepali handwriting better
 
+    async def _get_skill(self) -> str:
+        try:
+            from app.modules.skill_layer.service import get_active_skill_text
+            return await get_active_skill_text(self.db, "AnswerExtractionAgent")
+        except Exception:
+            return "When handwriting is unclear, transcribe your best honest reading and mark uncertain spans inline rather than dropping them."
+
     async def extract_page(
         self, *, page_png: bytes, page_number: int, width: int, height: int,
         valid_numbers: list[str], sheet_id: uuid.UUID,
@@ -73,6 +83,7 @@ class AnswerExtractionAgent:
             structure_hint=structure_hint or "(none)",
             prev_page_tail=prev_page_tail or "",
             next_page_hint=next_page_hint or "",
+            skill_instructions=await self._get_skill(),
         )
         audit_ctx = {
             "db": self.db,

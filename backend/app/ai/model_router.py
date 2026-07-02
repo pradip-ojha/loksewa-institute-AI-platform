@@ -23,8 +23,11 @@ def get_provider(task_type: str = "text") -> AIModelProvider:
       mapping, qnum/marks mismatch, breakdown ≠ full marks — so gpt-5 is enough; the gpt-5.5
       reasoning tier still does the actual skill GENERATION/regeneration), AND the simpler
       routing/cleaning/labeling agents that don't need reasoning-tier judgement.
-    - "chunking" / "routing" → Azure gpt-5-mini (fast) — semantic chunking, and cheap
-      routing/selection decisions (e.g. which question's context a feedback chat needs).
+    - "chunking" → configurable via settings.CHUNKING_MODEL_TIER (".env"): default
+      "thinking" = Azure gpt-5 (chunking is a one-time per-document cost whose quality
+      underpins all retrieval), or "fast" = Azure gpt-5-mini for the cheaper option.
+    - "routing" → Azure gpt-5-mini (fast) — cheap routing/selection decisions (e.g. which
+      question's context a feedback chat needs).
     - everything else ("reasoning", "text", …) → Azure gpt-5.5 (reasoning) — MCQ
       generation, checking-skill generation, answer evaluation, reviewer pass, tutors,
       chatbots — plus embeddings/transcription (which use their own dedicated deployments).
@@ -36,7 +39,18 @@ def get_provider(task_type: str = "text") -> AIModelProvider:
             model=settings.MODEL_CHAT_THINKING,
             api_version=settings.AZURE_OPENAI_API_VERSION_THINKING,
         )
-    if task_type in ("chunking", "routing"):
+    if task_type == "chunking":
+        # Togglable from .env: default gpt-5 ("thinking"), or gpt-5-mini ("fast").
+        if settings.CHUNKING_MODEL_TIER.strip().lower() == "fast":
+            return AzureOpenAIProvider(
+                model=settings.MODEL_CHAT_FAST,
+                api_version=settings.AZURE_OPENAI_API_VERSION_FAST,
+            )
+        return AzureOpenAIProvider(
+            model=settings.MODEL_CHAT_THINKING,
+            api_version=settings.AZURE_OPENAI_API_VERSION_THINKING,
+        )
+    if task_type == "routing":
         return AzureOpenAIProvider(
             model=settings.MODEL_CHAT_FAST,
             api_version=settings.AZURE_OPENAI_API_VERSION_FAST,

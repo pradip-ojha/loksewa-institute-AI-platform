@@ -1,4 +1,5 @@
 import io
+import re
 import uuid
 
 import magic
@@ -8,6 +9,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import AppException
 from app.integrations.r2_client import get_r2
 from app.modules.files.models import File
+
+
+def _safe_filename(name: str | None) -> str:
+    """Sanitize a client-supplied filename before it goes into an R2 object key or is
+    stored/echoed. Strips any path component and disallows characters that could shape
+    a traversal key or carry an HTML/script payload if the name is later rendered in the
+    admin UI. Always returns a non-empty, bounded name."""
+    base = (name or "upload").replace("\\", "/").rsplit("/", 1)[-1]
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", base).strip("._") or "upload"
+    return cleaned[:120]
 
 # Allowlist: context → (allowed mime types, max bytes)
 FILE_RULES: dict[str, tuple[set[str], int]] = {
@@ -63,14 +74,19 @@ async def store_upload(
     db: AsyncSession,
 ) -> File:
     allowed_mimes, max_size = FILE_RULES.get(context, (set(), 0))
+    mb = max_size // (1024 * 1024)
 
-    raw = await upload.read()
+    # Reject oversized uploads BEFORE buffering the whole body. The advertised
+    # Content-Length is a fast first gate; the authoritative check is the bounded read
+    # below, which never holds more than (max_size + 1) bytes in memory — so a client
+    # can't exhaust API memory by streaming gigabytes at a small-limit context.
+    if upload.size is not None and upload.size > max_size:
+        raise AppException(413, "file_too_large", f"File exceeds {mb} MB limit for {context}.")
+
+    raw = await upload.read(max_size + 1)
     if not raw:
         raise AppException(400, "empty_file", "Uploaded file is empty.")
-
-    # validate size
     if len(raw) > max_size:
-        mb = max_size // (1024 * 1024)
         raise AppException(413, "file_too_large", f"File exceeds {mb} MB limit for {context}.")
 
     # validate type via magic bytes
@@ -82,11 +98,12 @@ async def store_upload(
             f"File type '{detected_mime}' is not allowed for {context}. Allowed: {', '.join(sorted(allowed_mimes))}",
         )
 
-    r2_key = f"{context}/{uuid.uuid4()}/{upload.filename}"
+    safe_name = _safe_filename(upload.filename)
+    r2_key = f"{context}/{uuid.uuid4()}/{safe_name}"
     get_r2().upload_fileobj(r2_key, io.BytesIO(raw), detected_mime)
 
     file_record = File(
-        original_filename=upload.filename or "upload",
+        original_filename=safe_name,
         display_name=display_name,
         mime_type=detected_mime,
         file_size=len(raw),

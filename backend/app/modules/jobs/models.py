@@ -32,6 +32,13 @@ class ProcessingJob(Base):
     output_reference: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     celery_task_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Liveness tracking for multi-worker-safe recovery. `owner_token` identifies the
+    # worker process currently running the task; `last_heartbeat_at` is refreshed
+    # periodically by that worker while the task runs. Startup recovery + the reaper
+    # only fail a `processing` job whose heartbeat has gone STALE — so restarting one
+    # worker can never fail another live worker's in-flight job.
+    owner_token: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

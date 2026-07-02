@@ -1,0 +1,239 @@
+[
+  {
+    "chapter": "भूगोल, वातावरण र जनसंख्या (Geography, Environment and Population)",
+    "topics": [
+      {
+        "topic": "विश्वको भूगोल सम्बन्धी सामान्य ज्ञान (World Geography)",
+        "subtopics": [
+          "महादेश र महासागर (Continents and oceans)",
+          "अक्षांश र देशान्तर (Latitude and longitude)",
+          "पर्वतश्रृंखला, नदी र ताल (Mountain ranges, rivers and lakes)"
+        ]
+      },
+      {
+        "topic": "नेपालको भूगोल सम्बन्धी ज्ञान (Geography of Nepal)",
+        "subtopics": [
+          "भौगोलिक अवस्था र धरातलीय विशेषता (Geographical location and topography)",
+          "भौगोलिक स्वरूप, प्राकृतिक स्रोत र साधनहरू (Physiography and natural resources)",
+          "हावापानी र जनजीवन (Climate and life)"
+        ]
+      },
+      {
+        "topic": "पर्यावरण, जैविक विविधता र वातावरण व्यवस्थापन (Environment, biodiversity and management)",
+        "subtopics": [
+          "जैविक विविधता र दिगो विकास (Biodiversity and sustainable development)",
+          "जलवायु परिवर्तन र वातावरण व्यवस्थापन (Climate change and environmental management)",
+          "जनसंख्या, सहरीकरण र बसोबास (Population, urbanization and settlement)"
+        ]
+      }
+    ]
+  },
+  {
+    "chapter": "इतिहास र संस्कृति (History and Culture)",
+    "topics": [
+      {
+        "topic": "विश्वका महत्त्वपूर्ण ऐतिहासिक घटनाहरू (Important historical events of the world)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपालको इतिहास (History of Nepal)",
+        "subtopics": [
+          "किराँतकाल र लिच्छविकाल (Kirata and Lichchhavi periods)",
+          "मध्यकाल (Medieval period)",
+          "आधुनिक इतिहास (Modern history)"
+        ]
+      },
+      {
+        "topic": "नेपालको सामाजिक तथा साँस्कृतिक पक्ष (Nepal's social and cultural aspects)",
+        "subtopics": [
+          "परम्परा, मूल्य र मान्यता (Traditions, norms and values)",
+          "धर्म, संस्कृति, जात/जाति र भाषा (Religion, culture, caste/ethnicity and language)",
+          "खेलकुद, कला र साहित्य (Sports, arts and literature)"
+        ]
+      }
+    ]
+  },
+  {
+    "chapter": "आर्थिक पक्ष र विकास (Economic Aspects and Development)",
+    "topics": [
+      {
+        "topic": "नेपालका आर्थिक परिसूचकहरू (Nepal's economic indicators)",
+        "subtopics": [
+          "आर्थिक वृद्धि, कुल गार्हस्थ्य उत्पादन र राष्ट्रिय आय (Economic growth, GDP and national income)",
+          "चालु खाता, भुक्तानी सन्तुलन र शोधनान्तर स्थिति (Current account and balance of payment)",
+          "विप्रेषण, वैदेशिक लगानी र वैदेशिक सहयोग (Remittance, foreign investment and foreign aid)"
+        ]
+      },
+      {
+        "topic": "नेपालमा क्षेत्रगत विकासको विद्यमान अवस्था (Present status of sectoral development)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपालमा योजनाबद्ध विकास र चालु आवधिक योजना (Planned development and current periodic plan)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "शासन पद्धति र संविधान (Governance and Constitution)",
+    "topics": [
+      {
+        "topic": "कानूनको अर्थ, महत्त्व र कानूनका स्रोतहरू (Meaning, importance and sources of law)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपालको संवैधानिक विकास (Constitutional development of Nepal)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपालको संविधान — भाग १ देखि ५ सम्म र अनुसूचीहरू (Constitution of Nepal, Parts 1-5 and Schedules)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपालको शासन पद्धति तथा संघ, प्रदेश र स्थानीय सरकार (Governance system: federal, provincial and local government)",
+        "subtopics": []
+      },
+      {
+        "topic": "लोकतन्त्र, मानव अधिकार, आवधिक निर्वाचन र वालिग मताधिकार (Democracy, human rights, periodic election and adult franchise)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "अन्तर्राष्ट्रिय सम्बन्ध र अन्तर्राष्ट्रिय संघ/संस्था (International Affairs and International Organizations)",
+    "topics": [
+      {
+        "topic": "नेपालको छिमेकी तथा प्रमुख देशहरूसँगको सम्बन्ध (Nepal's relations with neighbouring and major countries)",
+        "subtopics": []
+      },
+      {
+        "topic": "संयुक्त राष्ट्र संघ — स्थापना, उद्देश्य, अङ्ग र विशिष्टीकृत संस्था (United Nations: establishment, objectives, organs and specialized agencies)",
+        "subtopics": []
+      },
+      {
+        "topic": "दक्षिण एशियाली क्षेत्रीय सहयोग सङ्गठन — सार्क (SAARC)",
+        "subtopics": []
+      },
+      {
+        "topic": "अन्य क्षेत्रीय तथा अन्तर्राष्ट्रिय संस्थाहरू (BIMSTEC, ASEAN, EU, WB, IMF, ADB, AIIB, SAFTA)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "विज्ञान प्रविधि, जनस्वास्थ्य र समसामयिक गतिविधि (Science, Technology, Public Health and Current Affairs)",
+    "topics": [
+      {
+        "topic": "वैज्ञानिक मापन, मापन पद्धति र एकाइ (Scientific measurement, systems and units)",
+        "subtopics": []
+      },
+      {
+        "topic": "विज्ञानका प्रमुख आविष्कार र नवीनतम गतिविधि (Major scientific inventions and latest activities)",
+        "subtopics": []
+      },
+      {
+        "topic": "कम्प्युटर र सूचना तथा सञ्चार प्रविधि (Computer and information & communication technology)",
+        "subtopics": []
+      },
+      {
+        "topic": "जनस्वास्थ्य, रोग, खाद्य, पोषण र सरसफाइ (Public health, disease, food, nutrition and sanitation)",
+        "subtopics": []
+      },
+      {
+        "topic": "राष्ट्रिय र अन्तर्राष्ट्रिय महत्त्वका समसामयिक घटना (National and international current affairs)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "कार्यालय तथा सार्वजनिक व्यवस्थापन (Office and Public Management)",
+    "topics": [
+      {
+        "topic": "कार्यालय: परिचय, महत्त्व, कार्य र प्रकार (Office: introduction, importance, functions and types)",
+        "subtopics": []
+      },
+      {
+        "topic": "कार्यालयमा सञ्चारको महत्त्व, किसिम र साधन (Communication in office: importance, types and means)",
+        "subtopics": []
+      },
+      {
+        "topic": "कार्यालय कार्यविधि — पत्राचार, दर्ता चलानी, फाइलिङ, परिपत्र, तोक आदेश र टिप्पणी (Office procedure)",
+        "subtopics": []
+      },
+      {
+        "topic": "अभिलेख व्यवस्थापन (Records management)",
+        "subtopics": []
+      },
+      {
+        "topic": "सार्वजनिक व्यवस्थापनमा निर्देशन, नियन्त्रण, समन्वय, निर्णय, उत्प्रेरणा र नेतृत्व (Directing, control, coordination, decision-making, motivation and leadership)",
+        "subtopics": []
+      },
+      {
+        "topic": "सार्वजनिक सेवा प्रवाह — निकाय, तरिका र माध्यम (Public service delivery)",
+        "subtopics": []
+      },
+      {
+        "topic": "सार्वजनिक बडापत्र, विद्युतीय शासन प्रणाली (E-governance) र मानवीय मूल्य/नागरिक अधिकार, कर्तव्य र अनुशासन",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "व्यवहारिक गणित (Applied Mathematics)",
+    "topics": [
+      {
+        "topic": "गणितका आधारभूत क्रिया, ऐकिक नियम, भिन्न र दशमलव (Fundamental operations, unitary method, fraction and decimal)",
+        "subtopics": []
+      },
+      {
+        "topic": "प्रतिशत, अनुपात/समानुपात, नाफा/नोक्सान, कर र कमिशन (Percentage, ratio & proportion, profit & loss, tax & commission)",
+        "subtopics": []
+      },
+      {
+        "topic": "साधारण र मिश्रित ब्याज, औसत/मध्यक र सम्भाव्यता (Simple & compound interest, average/mean and probability)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "सार्वजनिक संस्थान (Public Enterprises)",
+    "topics": [
+      {
+        "topic": "सार्वजनिक संस्थानको अवधारणा, विकासक्रम, उद्देश्य र महत्त्व (Concept, development, objectives and importance)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपालमा सार्वजनिक संस्थानको वर्गीकरण र क्षेत्रगत अवधारणा (Classification and sectoral concept)",
+        "subtopics": []
+      },
+      {
+        "topic": "सार्वजनिक संस्थानको विद्यमान अवस्था र गतिविधि (Current status and activities)",
+        "subtopics": []
+      },
+      {
+        "topic": "संस्थागत सुशासन र संस्थागत सामाजिक उत्तरदायित्व (Corporate governance and CSR)",
+        "subtopics": []
+      },
+      {
+        "topic": "आर्थिक विकासमा सार्वजनिक संस्थानको भूमिका (Role in economic development)",
+        "subtopics": []
+      },
+      {
+        "topic": "सार्वजनिक संस्थानको निजीकरण र विश्वव्यापीकरण (Privatization and globalization)",
+        "subtopics": []
+      },
+      {
+        "topic": "सार्वजनिक संस्थानको मानव संसाधन व्यवस्थापन (Human resource management)",
+        "subtopics": []
+      },
+      {
+        "topic": "बजेट, लेखा प्रणाली, लेखापरीक्षण र वित्तीय साक्षरता (Budget, accounting, auditing and financial literacy)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपालको वित्तीय नियामक निकाय — नेपाल राष्ट्र बैंक, नेपाल बीमा प्राधिकरण र धितोपत्र बोर्ड (Financial regulators of Nepal)",
+        "subtopics": []
+      }
+    ]
+  }
+]

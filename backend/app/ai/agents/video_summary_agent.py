@@ -61,6 +61,35 @@ Return ONLY valid JSON in exactly this structure:
 Include 5–10 MCQs, 3–5 short-answer questions, and 2–3 long-answer questions where the content supports them."""
 
 
+def _as_list(v) -> list:
+    """Coerce a field that must be a list into one (model sometimes returns a string or
+    null). Prevents a shape drift from reaching the React renderers as a crash."""
+    if isinstance(v, list):
+        return v
+    if v in (None, ""):
+        return []
+    return [v]
+
+
+def _normalize_summary(result: dict) -> dict:
+    """Defensive shaping: the layer only guarantees the response is a JSON object, not
+    the type of each field. Coerce the list/object fields the player renders
+    (key_points / exam_focused_points / important_terms / possible_questions) to their
+    expected containers so malformed AI output degrades gracefully instead of crashing
+    PossibleQuestionsCard / KeyPointsList."""
+    for key in ("key_points", "exam_focused_points", "important_terms"):
+        result[key] = _as_list(result.get(key))
+    pq = result.get("possible_questions")
+    if not isinstance(pq, dict):
+        pq = {}
+    result["possible_questions"] = {
+        "mcqs": _as_list(pq.get("mcqs")),
+        "short": _as_list(pq.get("short")),
+        "long": _as_list(pq.get("long")),
+    }
+    return result
+
+
 class VideoSummaryAgent:
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -86,7 +115,7 @@ class VideoSummaryAgent:
             raise RuntimeError(f"Lecture summary generation failed: {exc}") from exc
         if not isinstance(result, dict) or not result.get("detailed_summary"):
             raise AIResponseError("lecture summary did not return a detailed_summary")
-        return result
+        return _normalize_summary(result)
 
     async def _get_skill(self) -> str:
         try:

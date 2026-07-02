@@ -1,9 +1,14 @@
 import asyncio
 import json
 import logging
+import os
+import shutil
+import subprocess
+import tempfile
 import uuid
 from collections import defaultdict
 from io import BytesIO
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
@@ -74,22 +79,10 @@ async def _db_op_with_retry(op, *, attempts: int = 4, label: str = "db op"):
     assert last_exc is not None
     raise last_exc
 
-PREETI_DECODE_PROMPT = """The text below was extracted from a PDF that uses a legacy Nepali font (Preeti or Kantipur).
-These fonts store Devanagari glyphs mapped to ASCII codepoints, so PDF text extraction returns garbled ASCII instead of Unicode Devanagari.
-
-Your task: Reconstruct the original Nepali (and any English) content in proper Unicode Devanagari script.
-
-Rules:
-- Output proper Unicode Devanagari Nepali for all Nepali content.
-- Keep any English words/sentences exactly as they appear.
-- Preserve all structure: headings on their own line, numbered lists, bullet points, paragraphs separated by blank lines.
-- Do not translate, summarise, or add anything not in the original.
-- If a word cannot be decoded confidently, write your best interpretation — do not skip it.
-
-Garbled input text:
-{text}
-
-Output: the reconstructed content in proper Unicode."""
+# NOTE: The old LLM "Preeti decode" fallback was removed deliberately — decoding garbled
+# ASCII without seeing the glyphs is unreliable and would ingest meaningless chunks into
+# the vector store. The pipeline is now OCR-only: Preeti/scanned content is read from the
+# rendered image (PDFs directly; DOCX after a LibreOffice DOCX→PDF conversion).
 
 VISION_EXTRACT_PROMPT = """Extract every word of text visible on this page. Return clean, readable text only — no commentary, no explanations.
 
@@ -202,7 +195,19 @@ def _classify_page_text(text: str) -> str:
     return "broken"
 
 
+# Force vision OCR on EVERY PDF page regardless of the text-layer classification.
+# Rationale: the source documents are all either scanned or written in legacy Nepali
+# fonts (Preeti/Kantipur), whose PDF text layer is unusable ASCII garbage even when the
+# page "parses". Re-OCR'ing every page is the safe default for this corpus. The
+# per-page classification below is still computed — it drives the fallback chain
+# (Preeti-decode / raw text) when a vision call fails. Flip this to False to restore
+# the cost-saving behavior that trusts clean Unicode text layers.
+FORCE_OCR_ALL_PAGES = True
+
+
 def _needs_vision(classification: str) -> bool:
+    if FORCE_OCR_ALL_PAGES:
+        return True
     return classification != "valid_unicode"
 
 
@@ -246,6 +251,141 @@ def _extract_text_from_docx(data: bytes) -> str:
     document = docx.Document(BytesIO(data))
     paragraphs = [p.text for p in document.paragraphs if p.text.strip()]
     return "\n\n".join(paragraphs)
+
+
+def _find_soffice() -> str | None:
+    """Locate the headless LibreOffice binary used to convert DOCX → PDF."""
+    for name in ("soffice", "libreoffice", "soffice.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for candidate in (
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        "/usr/bin/soffice",
+        "/usr/bin/libreoffice",
+        "/opt/libreoffice/program/soffice",
+    ):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _docx_to_pdf_bytes(data: bytes) -> bytes:
+    """Convert DOCX bytes to PDF bytes via headless LibreOffice.
+
+    Used only for Preeti/legacy-font (or otherwise non-Unicode) Word documents, whose
+    text layer is unusable — rendering to PDF lets the SAME vision-OCR pipeline read the
+    glyphs. Raises a clear error if LibreOffice is missing or the conversion fails (the
+    job then fails honestly rather than ingesting garbage).
+    """
+    soffice = _find_soffice()
+    if not soffice:
+        raise RuntimeError(
+            "LibreOffice (soffice) is required to OCR a Preeti/scanned Word document but was "
+            "not found on this worker. Install LibreOffice or re-upload the document as a PDF."
+        )
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = os.path.join(tmp, "input.docx")
+        with open(in_path, "wb") as fh:
+            fh.write(data)
+        # Isolate the LO user profile per conversion so concurrent jobs don't fight over
+        # the shared default profile lock.
+        profile_url = Path(os.path.join(tmp, "lo_profile")).as_uri()
+        try:
+            proc = subprocess.run(
+                [
+                    soffice, "--headless", "--norestore", "--nolockcheck",
+                    f"-env:UserInstallation={profile_url}",
+                    "--convert-to", "pdf", "--outdir", tmp, in_path,
+                ],
+                capture_output=True, timeout=180,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("LibreOffice timed out converting the Word document to PDF.") from exc
+        out_path = os.path.join(tmp, "input.pdf")
+        if not os.path.exists(out_path):
+            stderr = proc.stderr.decode("utf-8", "ignore")[:300] if proc.stderr else ""
+            raise RuntimeError(
+                f"LibreOffice failed to convert the Word document to PDF "
+                f"(exit {proc.returncode}). {stderr}"
+            )
+        with open(out_path, "rb") as fh:
+            return fh.read()
+
+
+async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> str:
+    """OCR every page of a PDF (given as bytes) with the typed-vision model and return the
+    concatenated text. OCR-ONLY: a page that cannot be read is SKIPPED (never backfilled
+    with the raw text layer / a Preeti decode — that content is garbage for this corpus).
+
+    `step_cb(progress:int, msg:str)` is an async progress callback. Shared by direct-PDF
+    uploads and by Preeti/scanned DOCX after the DOCX → PDF conversion.
+    """
+    page_texts_raw: list[str] = await asyncio.to_thread(_extract_pdf_pages_text, file_bytes)
+    total_pages = len(page_texts_raw)
+    # Scanned/legacy-font knowledge PDFs are TYPED text → Azure gpt-5 typed vision OCR
+    # (not Gemini, which is reserved for handwriting; not gpt-5.5).
+    provider = get_provider("vision_typed")
+
+    # Classification still runs (cheap) — only to annotate logs; FORCE_OCR_ALL_PAGES makes
+    # _needs_vision() true for every page, so all pages are OCR'd.
+    classifications: list[str] = [_classify_page_text(t) for t in page_texts_raw]
+    vision_pages: list[int] = [i for i, cls in enumerate(classifications) if _needs_vision(cls)]
+
+    jpeg_map: dict[int, bytes] = {}
+    if vision_pages:
+        summary = ", ".join(f"p{i+1}={classifications[i]}" for i in vision_pages)
+        await step_cb(22, f"Vision OCR — rendering {len(vision_pages)}/{total_pages} pages ({summary[:80]})…")
+        jpeg_map = await asyncio.to_thread(_render_pages_jpeg, file_bytes, vision_pages, 250)
+
+    ocr_sem = asyncio.Semaphore(6)
+    VISION_OCR_ATTEMPTS = 3
+
+    async def _process_one_page(i: int, cls: str) -> tuple[int, str]:
+        async with ocr_sem:
+            last_err: str | None = None
+            for attempt in range(1, VISION_OCR_ATTEMPTS + 1):
+                try:
+                    vision_result = await provider.generate_with_image(
+                        VISION_EXTRACT_PROMPT, jpeg_map[i], schema=None
+                    )
+                    ocr_text = (vision_result.get("text") or "").strip()
+                    if ocr_text:
+                        logger.info("Vision OCR page %d (%s): %d chars", i + 1, cls, len(ocr_text))
+                        return (i, ocr_text)
+                    last_err = "empty text"
+                    logger.warning(
+                        "Vision OCR page %d returned empty text (attempt %d/%d)",
+                        i + 1, attempt, VISION_OCR_ATTEMPTS,
+                    )
+                except Exception as exc:
+                    last_err = str(exc)
+                    if "404" in last_err:
+                        # The deployment cannot accept images at all — retrying is pointless.
+                        # Skip the page; if every page 404s the job fails loudly below.
+                        logger.error(
+                            "Vision not supported by this deployment (404 on page %d) — "
+                            "cannot OCR; page skipped", i + 1,
+                        )
+                        return (i, "")
+                    logger.warning(
+                        "Vision OCR failed page %d (attempt %d/%d): %s",
+                        i + 1, attempt, VISION_OCR_ATTEMPTS, exc,
+                    )
+            logger.error(
+                "Vision OCR exhausted %d attempts on page %d (%s) — page skipped "
+                "(NOT ingesting raw/garbage text)",
+                VISION_OCR_ATTEMPTS, i + 1, last_err,
+            )
+            return (i, "")
+
+    await step_cb(23, f"Vision OCR — processing {len(vision_pages)}/{total_pages} pages in parallel…")
+    page_results = await asyncio.gather(
+        *[_process_one_page(i, cls) for i, cls in enumerate(classifications)]
+    )
+    page_results = sorted(page_results, key=lambda x: x[0])
+    return "\n\n".join(text for _, text in page_results if text)
 
 
 def _split_into_sections(text: str, max_chars: int = 8000) -> list[str]:
@@ -396,113 +536,34 @@ class KnowledgeProcessingAgent:
 
             await _step(JobStatus.processing, 20, "Extracting text…")
 
+            # Async progress callback shared with the OCR helper.
+            async def _ocr_step(progress: int, msg: str) -> None:
+                await _step(JobStatus.processing, progress, msg)
+
             if "pdf" in mime:
-                # ── Per-page smart extraction ──────────────────────────────────
-                # 1. PyMuPDF extracts text from all pages first (fast, no API cost).
-                # 2. Each page is classified: valid_unicode | legacy_font | empty | broken.
-                # 3. Only pages that need vision are sent to the vision model (250 DPI JPEG).
-                # This minimises API calls while handling legacy Preeti/Kantipur fonts,
-                # scanned PDFs, and corrupted text layers correctly.
-
-                page_texts_raw: list[str] = await asyncio.to_thread(
-                    _extract_pdf_pages_text, file_bytes
-                )
-                total_pages = len(page_texts_raw)
-                # Scanned/legacy-font knowledge PDFs are TYPED text → Azure gpt-5 typed
-                # vision OCR (not Gemini, which is reserved for handwriting; not gpt-5.5).
-                provider = get_provider("vision_typed")
-
-                # First pass: classify each page
-                classifications: list[str] = [
-                    _classify_page_text(t) for t in page_texts_raw
-                ]
-                vision_pages: list[int] = [
-                    i for i, cls in enumerate(classifications) if _needs_vision(cls)
-                ]
-
-                # Pre-render all vision pages in one fitz session before parallel dispatch
-                jpeg_map: dict[int, bytes] = {}
-                if vision_pages:
-                    summary = ", ".join(
-                        f"p{i+1}={classifications[i]}" for i in vision_pages
-                    )
-                    await _step(
-                        JobStatus.processing,
-                        22,
-                        f"Vision OCR — rendering {len(vision_pages)}/{total_pages} pages "
-                        f"({summary[:80]})…",
-                    )
-                    jpeg_map = await asyncio.to_thread(
-                        _render_pages_jpeg, file_bytes, vision_pages, 250
-                    )
-
-                # Parallel OCR/decode: max 3 concurrent reasoning-model calls
-                ocr_sem = asyncio.Semaphore(3)
-                vision_unsupported = [False]  # list so nested async fn can mutate via index
-
-                async def _process_one_page(i: int, cls: str) -> tuple[int, str]:
-                    if not _needs_vision(cls):
-                        return (i, page_texts_raw[i].strip())
-                    async with ocr_sem:
-                        # Primary: vision OCR
-                        if not vision_unsupported[0]:
-                            try:
-                                vision_result = await provider.generate_with_image(
-                                    VISION_EXTRACT_PROMPT, jpeg_map[i], schema=None
-                                )
-                                ocr_text = vision_result.get("text", "").strip()
-                                if ocr_text:
-                                    logger.info(
-                                        "Vision OCR page %d (%s): %d chars", i + 1, cls, len(ocr_text)
-                                    )
-                                    return (i, ocr_text)
-                                else:
-                                    logger.warning("Vision OCR page %d returned empty text", i + 1)
-                            except Exception as exc:
-                                if "404" in str(exc):
-                                    logger.warning(
-                                        "Vision not supported by this deployment (404 on page %d) — "
-                                        "switching to text-based fallback for remaining pages",
-                                        i + 1,
-                                    )
-                                    vision_unsupported[0] = True
-                                else:
-                                    logger.warning("Vision OCR failed page %d: %s", i + 1, exc)
-                        # Fallback: Preeti decode for legacy-font pages
-                        if cls == "legacy_font" and page_texts_raw[i].strip():
-                            try:
-                                decode_prompt = PREETI_DECODE_PROMPT.format(
-                                    text=page_texts_raw[i].strip()[:6000]
-                                )
-                                decode_result = await provider.generate_text(decode_prompt, schema=None)
-                                decoded = decode_result.get("text", "").strip()
-                                if decoded:
-                                    logger.info("Preeti decode page %d: %d chars", i + 1, len(decoded))
-                                    return (i, decoded)
-                            except Exception as exc:
-                                logger.warning("Preeti decode failed page %d: %s", i + 1, exc)
-                        # Last resort: raw extracted text
-                        if page_texts_raw[i].strip():
-                            logger.warning(
-                                "Page %d (%s): using raw extracted text as last resort", i + 1, cls
-                            )
-                            return (i, page_texts_raw[i].strip())
-                        return (i, "")
-
-                await _step(
-                    JobStatus.processing, 23,
-                    f"Vision OCR — processing {len(vision_pages)}/{total_pages} pages in parallel…",
-                )
-                page_results = await asyncio.gather(
-                    *[_process_one_page(i, cls) for i, cls in enumerate(classifications)]
-                )
-                page_results = sorted(page_results, key=lambda x: x[0])
-                final_page_texts = [text for _, text in page_results]
-
-                raw_text = "\n\n".join(t for t in final_page_texts if t)
+                # OCR every page (FORCE_OCR_ALL_PAGES) — this corpus is all scanned or
+                # Preeti-font, so the text layer is unusable. See `_ocr_pdf_bytes`.
+                raw_text = await _ocr_pdf_bytes(file_bytes, _ocr_step)
 
             elif "word" in mime or "docx" in mime or "msword" in mime:
-                raw_text = await asyncio.to_thread(_extract_text_from_docx, file_bytes)
+                # A Word document may be real Unicode OR legacy Preeti-encoded. Extract the
+                # text layer and classify it the same way as a PDF page:
+                #   • valid_unicode → real Nepali/English text → use it directly.
+                #   • anything else (Preeti/legacy, empty, broken) → the text is garbage;
+                #     render the DOCX to PDF (LibreOffice) and run the SAME vision-OCR path.
+                raw_docx_text = await asyncio.to_thread(_extract_text_from_docx, file_bytes)
+                docx_cls = _classify_page_text(raw_docx_text)
+                if docx_cls == "valid_unicode":
+                    logger.info("DOCX is valid Unicode → using extracted text directly")
+                    raw_text = raw_docx_text
+                else:
+                    logger.info(
+                        "DOCX classified '%s' (not valid Unicode) → converting to PDF for OCR",
+                        docx_cls,
+                    )
+                    await _step(JobStatus.processing, 18, "Converting Word document to PDF for OCR…")
+                    pdf_bytes = await asyncio.to_thread(_docx_to_pdf_bytes, file_bytes)
+                    raw_text = await _ocr_pdf_bytes(pdf_bytes, _ocr_step)
             else:
                 raise RuntimeError(f"Unsupported file type for text extraction: {mime}")
 
@@ -514,12 +575,15 @@ class KnowledgeProcessingAgent:
                 )
 
             sections = _split_into_sections(raw_text, max_chars=8000)
-            # Semantic chunking is lower-intelligence work → gpt-5-mini (fast tier).
+            # Semantic chunking tier is configurable via settings.CHUNKING_MODEL_TIER
+            # (.env): default gpt-5 ("thinking") for best Nepali segmentation/verbatim
+            # fidelity since chunking is a one-time per-document cost, or gpt-5-mini
+            # ("fast") for the cheaper option. See ai/model_router.py::get_provider.
             # (provider.embed below ignores the chat tier and uses the embedding deployment.)
             provider = get_provider("chunking")
 
-            # Parallel chunking: max 5 concurrent text-model calls
-            chunk_sem = asyncio.Semaphore(5)
+            # Parallel chunking: max 6 concurrent text-model calls
+            chunk_sem = asyncio.Semaphore(6)
 
             async def _chunk_one_section(i: int, section: str) -> list[dict]:
                 async with chunk_sem:

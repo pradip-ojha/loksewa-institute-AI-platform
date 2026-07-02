@@ -48,6 +48,16 @@ async def get_file_url(
     if not file_record:
         raise AppException(404, "not_found", "File not found.")
 
+    # Authorization (was an IDOR: any authenticated user could fetch a signed URL for
+    # ANY file by id — other students' answer sheets, model-answer keys, etc.). Admins
+    # may read any file; a student only files they uploaded (their own answer sheets +
+    # their checked-PDF results, which are stored with uploaded_by = the student). Every
+    # admin-owned asset a student is entitled to (question paper, video media) is served
+    # through its own scoped endpoint with a signed URL — never through this one.
+    from app.modules.users.models import UserRole
+    if current_user.role != UserRole.institute_admin and file_record.uploaded_by != current_user.id:
+        raise AppException(403, "forbidden", "You do not have access to this file.")
+
     signed_url = get_r2().get_signed_url(file_record.r2_key, expires_in=3600)
     return FileWithUrl(**FileOut.model_validate(file_record).model_dump(), signed_url=signed_url)
 

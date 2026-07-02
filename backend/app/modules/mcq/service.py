@@ -6,6 +6,31 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.mcq.models import MCQDocument, MCQReviewBatch, MCQQuestion, MCQRejectionFeedback
 
+_MCQ_DOC_TERMINAL = ("completed", "failed")
+
+
+async def fail_orphaned_mcq_documents(db: AsyncSession) -> int:
+    """Mark in-progress MCQ documents as failed when no live job references them.
+
+    A worker that died mid-extraction/generation leaves the job failed (by the reaper /
+    startup recovery) but the document's `processing_status` stuck, so the admin view
+    spins forever. MCQ docs have no job FK, so we check for any still-live job via
+    `input_reference->>'document_id'`; if none, the document is orphaned → 'failed'.
+    Returns how many were reconciled."""
+    from app.modules.jobs.service import has_live_job_for_document
+
+    reconciled = 0
+    docs = (await db.execute(
+        select(MCQDocument).where(~MCQDocument.processing_status.in_(_MCQ_DOC_TERMINAL))
+    )).scalars().all()
+    for doc in docs:
+        if not await has_live_job_for_document(db, doc.id):
+            doc.processing_status = "failed"
+            reconciled += 1
+    if reconciled:
+        await db.commit()
+    return reconciled
+
 
 async def get_document(db: AsyncSession, doc_id: uuid.UUID) -> MCQDocument | None:
     result = await db.execute(select(MCQDocument).where(MCQDocument.id == doc_id))

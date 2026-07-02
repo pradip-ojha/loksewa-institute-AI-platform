@@ -13,6 +13,12 @@ _DEFAULT_DATABASE_URL = "postgresql+asyncpg://neurafix:neurafix_dev_pass@localho
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE), env_file_encoding="utf-8", extra="ignore")
 
+    # Deployment environment. "production" makes startup FAIL CLOSED on insecure config
+    # (placeholder JWT secret, weak default admin password) instead of merely logging —
+    # so the app can never run publicly on a known secret. Default "development" keeps
+    # local runs convenient.
+    ENVIRONMENT: str = "development"
+
     # Database
     # Either set DATABASE_URL directly (asyncpg driver), or provide the discrete
     # PG* components below (e.g. Azure Postgres connection info) and DATABASE_URL
@@ -31,8 +37,8 @@ class Settings(BaseSettings):
     # DB connection pool (per process: FastAPI + each Celery worker keep their own).
     # Sized so (API + worker×concurrency + beat) stays comfortably under Azure PG
     # max_connections. Raise on a larger PG tier / higher worker concurrency.
-    DB_POOL_SIZE: int = 5
-    DB_MAX_OVERFLOW: int = 10
+    DB_POOL_SIZE: int = 8
+    DB_MAX_OVERFLOW: int = 12
 
     # Auth
     JWT_SECRET: str = "change-this-secret"
@@ -76,6 +82,13 @@ class Settings(BaseSettings):
     MODEL_TRANSCRIPTION: str = "gpt-4o-transcribe"
     EMBEDDING_DIMENSIONS: int = 3072
 
+    # Semantic-chunking tier (knowledge ingest). Chunking is a ONE-TIME cost per
+    # document whose output quality (segmentation + verbatim Devanagari fidelity)
+    # underpins all downstream retrieval, so gpt-5 "thinking" is the default. Set to
+    # "fast" to use the cheaper gpt-5-mini. Only affects get_provider("chunking");
+    # all other tiers (routing, etc.) are unchanged. Read in ai/model_router.py.
+    CHUNKING_MODEL_TIER: str = "thinking"   # "thinking" (gpt-5) | "fast" (gpt-5-mini)
+
     # AI Models — Google Gemini (VISION ONLY: handwriting extraction, structure pass,
     # annotation locator). Reasoning/embeddings/transcription stay on Azure OpenAI.
     GEMINI_API_KEY: str = ""
@@ -94,6 +107,10 @@ class Settings(BaseSettings):
     # URLs
     FRONTEND_URL: str = "http://localhost:5173"
     BACKEND_URL: str = "http://localhost:8000"
+
+    # Optional shared storage URI for the HTTP rate limiter (e.g. the Redis URL) so the
+    # limit is enforced across multiple API processes. Empty → in-process memory storage.
+    RATELIMIT_STORAGE_URI: str = ""
 
     # Seed defaults
     DEFAULT_ADMIN_EMAIL: str = "admin@neurafix.ai"

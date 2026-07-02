@@ -24,17 +24,26 @@ def reap_stale_jobs() -> None:
         from app.core.config import settings
         from app.core.database import AsyncSessionLocal
         from app.modules.jobs.service import reap_stale_jobs as _reap
+        from app.modules.knowledge.service import fail_orphaned_knowledge_documents
+        from app.modules.mcq.service import fail_orphaned_mcq_documents
         from app.modules.subjective.service import fail_orphaned_sheets_and_tests
+        from app.modules.video.service import fail_orphaned_videos
 
         async with AsyncSessionLocal() as db:
             reaped = await _reap(db, task_timeout_seconds=settings.TASK_TIMEOUT_SECONDS)
             if reaped:
                 logger.warning("Reaped %d stale job(s) → failed", reaped)
-            # Propagate failed/dead jobs to their answer sheets / tests so the UI
-            # leaves the spinner and the student can re-upload.
-            reconciled = await fail_orphaned_sheets_and_tests(db)
+            # Propagate failed/dead jobs to their dependent entities (subjective sheets/
+            # tests, videos, knowledge + MCQ documents) so each UI leaves the spinner and
+            # offers re-upload / retry instead of spinning forever.
+            reconciled = (
+                await fail_orphaned_sheets_and_tests(db)
+                + await fail_orphaned_videos(db)
+                + await fail_orphaned_knowledge_documents(db)
+                + await fail_orphaned_mcq_documents(db)
+            )
             if reconciled:
-                logger.warning("Reconciled %d orphaned subjective sheet(s)/test(s) → failed", reconciled)
+                logger.warning("Reconciled %d orphaned entity(ies) → failed", reconciled)
 
     # The persistent loop runs ONE task at a time. If a long task (e.g. video
     # processing) is currently occupying it, calling run_until_complete here would

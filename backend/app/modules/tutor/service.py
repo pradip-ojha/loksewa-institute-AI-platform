@@ -40,6 +40,21 @@ async def get_or_create_session(
     return session
 
 
+async def get_owned_session(
+    db: AsyncSession, student_id: uuid.UUID, session_id: uuid.UUID,
+) -> TutorChatSession | None:
+    """Return the session ONLY if it exists and belongs to this student, else None.
+    Used to resume a chat without the create-on-miss fallback that let a forged
+    session_id bypass the enrollment gate."""
+    r = await db.execute(
+        select(TutorChatSession).where(
+            TutorChatSession.id == session_id,
+            TutorChatSession.student_id == student_id,
+        )
+    )
+    return r.scalar_one_or_none()
+
+
 async def get_history(db: AsyncSession, student_id: uuid.UUID, session_id: uuid.UUID) -> list[TutorChatMessage]:
     r = await db.execute(
         select(TutorChatMessage)
@@ -65,15 +80,13 @@ async def _recent_history_text(db: AsyncSession, session_id: uuid.UUID) -> str:
     return "\n".join(parts)
 
 
-async def run_tutor_chain(
+async def _prepare_tutor_turn(
     db: AsyncSession, *, student_id: uuid.UUID, exam_id: uuid.UUID, question: str, session: TutorChatSession,
 ) -> dict:
-    """Topic selector → exam-filtered notes/book retrieval → main tutor. Grounding stays
-    inside the chosen exam; the selector's topic/subtopics are validated against the
-    exam's live syllabus before any retrieval."""
-    from app.ai.agents.tutor_agent import TutorAgent
+    """Shared pre-answer steps for both the sync and streaming tutor chains: topic
+    selection (validated against the exam tree), optional activity detail, and the
+    exam-filtered notes/book retrieval. Returns everything the answer agent needs."""
     from app.ai.agents.tutor_topic_selector_agent import TutorTopicSelectorAgent
-
     from app.modules.personalization import service as pers
 
     tree_text, valid_topics, valid_subs, valid_chapters, topic_to_chapter = await get_chapter_tree(db, exam_id)
@@ -121,43 +134,125 @@ async def run_tutor_chain(
         subtopic_ids=detected_subtopics, question=retrieval_query,
     )
 
-    # ── Step 3: Main Tutor answers from the retrieved content + student context ──
-    person_block = "\n\n".join(p for p in [personalization, activity_detail] if p)
-    answer = await TutorAgent(db).answer(
-        question=question, scope="EXAM SYLLABUS:\n" + tree_text, knowledge_text=knowledge_text,
-        history=history_text, session_id=session.id, personalization=person_block,
-    )
+    return {
+        "tree_text": tree_text,
+        "history_text": history_text,
+        "person_block": "\n\n".join(p for p in [personalization, activity_detail] if p),
+        "knowledge_text": knowledge_text,
+        "supporting": supporting,
+        "detected_topic": detected_topic,
+        "detected_subtopics": detected_subtopics,
+        "retrieval_query": retrieval_query,
+        "selection_confidence": confidence,
+    }
 
-    # ── Persist ──────────────────────────────────────────────────────────────────
+
+async def _persist_tutor_turn(
+    db: AsyncSession, *, student_id: uuid.UUID, session: TutorChatSession, question: str,
+    prep: dict, answer: str, language: str, confidence: float, follow_ups: list[str],
+) -> None:
     msg = TutorChatMessage(
         session_id=session.id,
         student_id=student_id,
         question=question,
-        answer=answer["answer"],
-        language=answer["language"],
-        detected_topic=detected_topic,
-        detected_subtopic_ids=detected_subtopics,
-        query_rewrite=retrieval_query,
-        supporting_knowledge_json=supporting,
-        confidence=answer["confidence"],
-        follow_up_suggestions=answer["follow_up_suggestions"],
+        answer=answer,
+        language=language,
+        detected_topic=prep["detected_topic"],
+        detected_subtopic_ids=prep["detected_subtopics"],
+        query_rewrite=prep["retrieval_query"],
+        supporting_knowledge_json=prep["supporting"],
+        confidence=confidence,
+        follow_up_suggestions=follow_ups,
     )
     db.add(msg)
     await db.commit()
-
     # Personalization: roll this turn into the session summary + daily summary (best-effort).
-    _enqueue_chat_summary(student_id, session.id, history_text, question, answer["answer"])
+    _enqueue_chat_summary(student_id, session.id, prep["history_text"], question, answer)
+
+
+async def run_tutor_chain(
+    db: AsyncSession, *, student_id: uuid.UUID, exam_id: uuid.UUID, question: str, session: TutorChatSession,
+) -> dict:
+    """Topic selector → exam-filtered notes/book retrieval → main tutor. Grounding stays
+    inside the chosen exam; the selector's topic/subtopics are validated against the
+    exam's live syllabus before any retrieval."""
+    from app.ai.agents.tutor_agent import TutorAgent
+
+    prep = await _prepare_tutor_turn(db, student_id=student_id, exam_id=exam_id, question=question, session=session)
+
+    # ── Main Tutor answers from the retrieved content + student context ──────────
+    answer = await TutorAgent(db).answer(
+        question=question, scope="EXAM SYLLABUS:\n" + prep["tree_text"], knowledge_text=prep["knowledge_text"],
+        history=prep["history_text"], session_id=session.id, personalization=prep["person_block"],
+    )
+
+    await _persist_tutor_turn(
+        db, student_id=student_id, session=session, question=question, prep=prep,
+        answer=answer["answer"], language=answer["language"],
+        confidence=answer["confidence"], follow_ups=answer["follow_up_suggestions"],
+    )
 
     return {
         "answer": answer["answer"],
         "language": answer["language"],
         "chat_session_id": session.id,
-        "detected_topic": detected_topic,
-        "detected_subtopic_ids": detected_subtopics,
-        "supporting_knowledge_used": supporting,
+        "detected_topic": prep["detected_topic"],
+        "detected_subtopic_ids": prep["detected_subtopics"],
+        "supporting_knowledge_used": prep["supporting"],
         "confidence": answer["confidence"],
-        "selection_confidence": confidence,
+        "selection_confidence": prep["selection_confidence"],
         "follow_up_suggestions": answer["follow_up_suggestions"],
+    }
+
+
+async def run_tutor_chain_stream(
+    db: AsyncSession, *, student_id: uuid.UUID, exam_id: uuid.UUID, question: str, session: TutorChatSession,
+):
+    """Streaming variant of ``run_tutor_chain``. Yields NDJSON-ready event dicts:
+    a ``meta`` event (session + detected topic) up front, then ``delta`` events as the
+    answer streams, then a ``done`` event with follow-ups once persisted. Any error
+    yields an ``error`` event and persists nothing half-written."""
+    from app.ai.agents.tutor_agent import TutorAgent
+
+    prep = await _prepare_tutor_turn(db, student_id=student_id, exam_id=exam_id, question=question, session=session)
+
+    yield {
+        "type": "meta",
+        "chat_session_id": str(session.id),
+        "detected_topic": prep["detected_topic"],
+        "detected_subtopic_ids": prep["detected_subtopics"],
+        "supporting_knowledge_used": prep["supporting"],
+        "selection_confidence": prep["selection_confidence"],
+    }
+
+    meta_sink: dict = {}
+    parts: list[str] = []
+    async for delta in TutorAgent(db).answer_stream(
+        question=question, scope="EXAM SYLLABUS:\n" + prep["tree_text"], knowledge_text=prep["knowledge_text"],
+        history=prep["history_text"], session_id=session.id, personalization=prep["person_block"],
+        meta_sink=meta_sink,
+    ):
+        parts.append(delta)
+        yield {"type": "delta", "text": delta}
+
+    answer_text = "".join(parts).strip()
+    if not answer_text:
+        yield {"type": "error", "message": "tutor returned no answer"}
+        return
+
+    follow_ups = meta_sink.get("follow_up_suggestions", [])
+    language = meta_sink.get("language", "nepali")
+    confidence = meta_sink.get("confidence", 0.0)
+    await _persist_tutor_turn(
+        db, student_id=student_id, session=session, question=question, prep=prep,
+        answer=answer_text, language=language, confidence=confidence, follow_ups=follow_ups,
+    )
+
+    yield {
+        "type": "done",
+        "language": language,
+        "confidence": confidence,
+        "follow_up_suggestions": follow_ups,
     }
 
 

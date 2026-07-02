@@ -1,15 +1,33 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.jobs.models import JobStatus, ProcessingJob
 
 # How long a job may sit queued before we assume the worker never picked it up.
 QUEUED_GRACE_SECONDS = 600        # 10 minutes
-# Extra grace on top of the task hard-timeout before we declare a processing job dead.
-PROCESSING_GRACE_SECONDS = 300    # 5 minutes
+# How often a running worker refreshes its job's heartbeat. The worker runs an
+# independent heartbeat loop (see workers/runtime.py), so the heartbeat keeps
+# advancing even during a multi-minute AI/render phase with no progress update.
+HEARTBEAT_INTERVAL_SECONDS = 30
+# A `processing` job whose heartbeat is older than this is considered dead (its
+# worker crashed / was killed). 6 missed beats of margin keeps a transient DB blip
+# from falsely reaping a live job, while still detecting a real death in ~3 min
+# instead of waiting out the full task timeout. Used by BOTH startup recovery and
+# the periodic reaper, so "dead vs. alive" has a single definition.
+JOB_STALE_SECONDS = HEARTBEAT_INTERVAL_SECONDS * 6   # 180s
+
+
+def _last_sign_of_life():
+    """Best timestamp proving a processing job's worker was alive: the heartbeat if
+    present, else when it started, else when it was created."""
+    return func.coalesce(
+        ProcessingJob.last_heartbeat_at,
+        ProcessingJob.started_at,
+        ProcessingJob.created_at,
+    )
 
 
 async def create_job(
@@ -42,6 +60,7 @@ async def update_job(
     error: str | None = None,
     output: dict | None = None,
     celery_task_id: str | None = None,
+    owner_token: str | None = None,
 ) -> None:
     result = await db.execute(select(ProcessingJob).where(ProcessingJob.id == job_id))
     job = result.scalar_one_or_none()
@@ -54,6 +73,12 @@ async def update_job(
             job.started_at = now
         if status in (JobStatus.completed, JobStatus.failed, JobStatus.cancelled):
             job.completed_at = now
+    if owner_token is not None:
+        job.owner_token = owner_token
+    # Any update to a still-running job is a sign of life; progress/step updates
+    # double as heartbeats on top of the worker's periodic heartbeat loop.
+    if job.status == JobStatus.processing:
+        job.last_heartbeat_at = now
     if progress is not None:
         job.progress_percent = progress
     if step is not None:
@@ -67,28 +92,49 @@ async def update_job(
     await db.commit()
 
 
+async def touch_heartbeat(db: AsyncSession, job_id: uuid.UUID, *, owner_token: str | None = None) -> None:
+    """Refresh a running job's heartbeat (and owner) without loading the row.
+
+    Called on a fixed cadence by the worker's heartbeat loop while a task runs. The
+    `status == processing` guard means a heartbeat can never resurrect a job that has
+    already been failed/completed (e.g. by the reaper or a redelivery skip)."""
+    values: dict = {"last_heartbeat_at": datetime.now(timezone.utc)}
+    if owner_token is not None:
+        values["owner_token"] = owner_token
+    await db.execute(
+        update(ProcessingJob)
+        .where(ProcessingJob.id == job_id, ProcessingJob.status == JobStatus.processing)
+        .values(**values)
+    )
+    await db.commit()
+
+
 async def reap_stale_jobs(db: AsyncSession, *, task_timeout_seconds: int) -> int:
     """Fail jobs that can never finish — the system-level backstop for stuck jobs.
 
-    Two cases, both detected from existing timestamps (no schema change):
+    Two cases:
       • `queued` longer than QUEUED_GRACE_SECONDS  → worker never picked it up
         (e.g. an orphaned/misrouted message). started_at is still NULL.
-      • `processing` longer than the hard task timeout + grace → the worker died
-        or wedged without recording a terminal state (covers the Windows case
-        where Celery's hard time limit can't fire).
+      • `processing` whose HEARTBEAT has gone stale (JOB_STALE_SECONDS) → the worker
+        died or wedged without recording a terminal state. Heartbeat-based detection
+        (not "started_at + task timeout") is both multi-worker safe — a live worker
+        keeps its job's heartbeat fresh, so this never reaps another worker's running
+        job — and far faster (a dead job is caught in ~3 min, not after the full task
+        timeout). Covers the Windows case where Celery's hard time limit can't fire.
 
     This guarantees the UI poller always reaches a terminal state even if a
-    terminal write was lost. Returns the number of jobs reaped.
+    terminal write was lost. Returns the number of jobs reaped. `task_timeout_seconds`
+    is retained for signature compatibility; staleness is now heartbeat-driven.
     """
     now = datetime.now(timezone.utc)
     queued_cutoff = now - timedelta(seconds=QUEUED_GRACE_SECONDS)
-    processing_cutoff = now - timedelta(seconds=task_timeout_seconds + PROCESSING_GRACE_SECONDS)
+    stale_cutoff = now - timedelta(seconds=JOB_STALE_SECONDS)
 
     stale_queued = (ProcessingJob.status == JobStatus.queued) & (
         ProcessingJob.created_at < queued_cutoff
     )
     stale_processing = (ProcessingJob.status == JobStatus.processing) & (
-        ProcessingJob.started_at < processing_cutoff
+        _last_sign_of_life() < stale_cutoff
     )
 
     result = await db.execute(
@@ -109,23 +155,50 @@ async def reap_stale_jobs(db: AsyncSession, *, task_timeout_seconds: int) -> int
     return len(stale)
 
 
-async def fail_orphaned_processing_jobs(db: AsyncSession) -> int:
-    """Fail every job still marked `processing` — called once when a worker starts.
+async def has_live_job_for_document(db: AsyncSession, document_id: uuid.UUID) -> bool:
+    """True if a still-live job (queued/processing/retrying) references this document.
 
-    A freshly-started worker owns no in-flight tasks, so any `processing` row is
-    orphaned: its worker died (e.g. the backend/worker was restarted mid-task). We
-    fail them immediately so the UI doesn't spin forever and the user can retry.
-    `queued` jobs are left alone — the broker may still legitimately deliver them.
+    Knowledge and MCQ documents have no direct job FK — their jobs link back via
+    `input_reference->>'document_id'`. Used by the orphan reconcilers to decide whether
+    a document stuck in an in-progress `processing_status` still has a job that may yet
+    finish it, or is truly orphaned and should be failed."""
+    live = (JobStatus.queued, JobStatus.processing, JobStatus.retrying)
+    r = await db.execute(
+        select(ProcessingJob.id)
+        .where(
+            ProcessingJob.status.in_(live),
+            ProcessingJob.input_reference["document_id"].astext == str(document_id),
+        )
+        .limit(1)
+    )
+    return r.first() is not None
+
+
+async def fail_orphaned_processing_jobs(db: AsyncSession) -> int:
+    """Fail `processing` jobs whose heartbeat has gone stale — called when a worker starts.
+
+    CRITICAL (multi-worker safety): we must NOT fail every `processing` row, because
+    under prefork concurrency / multiple worker processes a sibling worker may be
+    actively running those jobs. Failing them would kill live work mid-flight and flip
+    the dependent sheets/tests/videos to `failed` under the user. Instead we only fail
+    jobs whose last sign of life (heartbeat) is older than JOB_STALE_SECONDS — i.e. the
+    owning worker is genuinely dead. A job orphaned by a crash that still has a recent
+    heartbeat is left for the periodic reaper to catch once it goes stale (within a few
+    minutes). `queued` jobs are left alone — the broker may still deliver them.
     """
     now = datetime.now(timezone.utc)
+    stale_cutoff = now - timedelta(seconds=JOB_STALE_SECONDS)
     result = await db.execute(
-        select(ProcessingJob).where(ProcessingJob.status == JobStatus.processing)
+        select(ProcessingJob).where(
+            ProcessingJob.status == JobStatus.processing,
+            _last_sign_of_life() < stale_cutoff,
+        )
     )
     orphaned = result.scalars().all()
     for job in orphaned:
         job.status = JobStatus.failed
         job.completed_at = now
-        job.error_message = "Worker restarted while this task was running; marked failed."
+        job.error_message = "Worker died while this task was running; marked failed."
     if orphaned:
         await db.commit()
     return len(orphaned)

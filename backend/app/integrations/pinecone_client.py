@@ -67,6 +67,27 @@ class PineconeClient:
             self._reset_index()
             raise ExternalServiceError("pinecone", f"delete failed: {exc}") from exc
 
+    def delete_all(self) -> None:
+        """Wipe every vector in the (default namespace of the) index. Used to clear
+        stale content after a metadata/architecture change so fresh knowledge can be
+        re-uploaded clean — the DB knowledge_chunks are the source of truth for what
+        should exist, so an emptied table + emptied index stay consistent."""
+        try:
+            self._get_index().delete(delete_all=True)
+        except Exception as exc:
+            self._reset_index()
+            # A "namespace not found" on an already-empty index is a no-op, not a failure.
+            if "not found" in str(exc).lower():
+                return
+            raise ExternalServiceError("pinecone", f"delete_all failed: {exc}") from exc
+
+    def stats(self) -> dict:
+        try:
+            return self._get_index().describe_index_stats().to_dict()
+        except Exception as exc:
+            self._reset_index()
+            raise ExternalServiceError("pinecone", f"stats failed: {exc}") from exc
+
 
 @lru_cache
 def get_pinecone() -> PineconeClient:

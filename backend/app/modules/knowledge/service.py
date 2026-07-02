@@ -4,6 +4,31 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.knowledge.models import KnowledgeDocument, KnowledgeChunk
 
+_KNOWLEDGE_TERMINAL = ("completed", "failed")
+
+
+async def fail_orphaned_knowledge_documents(db: AsyncSession) -> int:
+    """Mark in-progress knowledge documents as failed when no live job references them.
+
+    A worker that died mid-ingest leaves the job failed (by the reaper / startup
+    recovery) but the document's `processing_status` stuck at 'pending'/'processing',
+    so the admin Processing view spins forever. Knowledge docs have no job FK, so we
+    check for any still-live job via `input_reference->>'document_id'`; if none, the
+    document is orphaned → 'failed'. Returns how many were reconciled."""
+    from app.modules.jobs.service import has_live_job_for_document
+
+    reconciled = 0
+    docs = (await db.execute(
+        select(KnowledgeDocument).where(~KnowledgeDocument.processing_status.in_(_KNOWLEDGE_TERMINAL))
+    )).scalars().all()
+    for doc in docs:
+        if not await has_live_job_for_document(db, doc.id):
+            doc.processing_status = "failed"
+            reconciled += 1
+    if reconciled:
+        await db.commit()
+    return reconciled
+
 
 async def list_documents(db: AsyncSession, skip: int = 0, limit: int = 50) -> list[KnowledgeDocument]:
     result = await db.execute(

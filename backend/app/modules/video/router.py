@@ -1,13 +1,16 @@
+import json
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import require_admin, require_student
 from app.core.database import get_db
 from app.core.exceptions import AppException
+from app.core.ratelimit import AI_CHAT_LIMIT, limiter
 from app.modules.files.service import store_upload
 from app.modules.jobs.models import JobStatus, ProcessingJob
 from app.modules.jobs.schemas import JobOut
@@ -221,6 +224,11 @@ async def student_player_data(
     v = await svc.get_video(db, video_id)
     if not v or v.status != "active" or v.processing_status != "completed":
         raise AppException(404, "not_found", "Video is not available.")
+    # Scope to the student's enrolled exams — the list endpoint already filters, but
+    # direct-by-id access must too, or any student could stream any active video / run
+    # its tutor across exams they aren't enrolled in.
+    from app.modules.exams.service import ensure_enrolled
+    await ensure_enrolled(db, student_id=current_user.id, exam_id=v.exam_id)
     timeline = await svc.get_timeline(db, video_id)
     summary = await svc.get_summary(db, video_id)
     slides = await svc.get_slides(db, video_id)
@@ -238,7 +246,9 @@ async def student_player_data(
 
 
 @router.post("/student/videos/{video_id}/ask", response_model=AskResponse)
+@limiter.limit(AI_CHAT_LIMIT)
 async def ask_tutor(
+    request: Request,
     video_id: uuid.UUID,
     body: AskRequest,
     db: AsyncSession = Depends(get_db),
@@ -247,6 +257,8 @@ async def ask_tutor(
     v = await svc.get_video(db, video_id)
     if not v or v.status != "active" or v.processing_status != "completed":
         raise AppException(404, "not_found", "Video is not available.")
+    from app.modules.exams.service import ensure_enrolled
+    await ensure_enrolled(db, student_id=current_user.id, exam_id=v.exam_id)
     question = (body.question or "").strip()
     if not question:
         raise AppException(422, "empty_question", "Question cannot be empty.")
@@ -257,6 +269,42 @@ async def ask_tutor(
         current_video_time=body.current_video_time, session=session,
     )
     return AskResponse(**result)
+
+
+@router.post("/student/videos/{video_id}/ask/stream")
+@limiter.limit(AI_CHAT_LIMIT)
+async def ask_tutor_stream(
+    request: Request,
+    video_id: uuid.UUID,
+    body: AskRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_student),
+):
+    """Streaming variant of /student/videos/{id}/ask. Returns NDJSON: a `meta` event
+    (selected segments + topic), then `delta` events as the answer streams, then `done`."""
+    v = await svc.get_video(db, video_id)
+    if not v or v.status != "active" or v.processing_status != "completed":
+        raise AppException(404, "not_found", "Video is not available.")
+    from app.modules.exams.service import ensure_enrolled
+    await ensure_enrolled(db, student_id=current_user.id, exam_id=v.exam_id)
+    question = (body.question or "").strip()
+    if not question:
+        raise AppException(422, "empty_question", "Question cannot be empty.")
+
+    session = await svc.get_or_create_chat_session(db, video_id, current_user.id, body.chat_session_id)
+
+    async def event_stream():
+        try:
+            async for event in svc.run_qa_chain_stream(
+                db, video=v, question=question,
+                current_video_time=body.current_video_time, session=session,
+            ):
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+        except Exception as exc:  # noqa: BLE001 — surface as a stream error
+            logger.exception("video tutor stream failed: %s", exc)
+            yield json.dumps({"type": "error", "message": "उत्तर ल्याउन सकिएन।"}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
 
 @router.get("/student/videos/{video_id}/history", response_model=list[ChatMessageOut])

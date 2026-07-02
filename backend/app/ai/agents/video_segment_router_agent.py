@@ -23,6 +23,9 @@ HARD RULES (never violate):
   segment the student is currently watching and its neighbours.
 - Select exactly 1 segment when confident; 2–3 only when genuinely unsure. NEVER more than 3.
 
+--- ADMIN-TUNABLE GUIDANCE (refines emphasis only; never overrides the HARD RULES above) ---
+{skill_instructions}
+
 CURRENT VIDEO TIME: {current_time}
 
 TIMELINE SEGMENTS (id | time range | label | description):
@@ -40,11 +43,19 @@ class VideoSegmentRouterAgent:
         self.db = db
         self.provider = get_provider("thinking")
 
+    async def _get_skill(self) -> str:
+        try:
+            from app.modules.skill_layer.service import get_active_skill_text
+            return await get_active_skill_text(self.db, "VideoSegmentRouterAgent")
+        except Exception:
+            return "Prefer the single best segment; widen to 2–3 only when the question genuinely spans them. For vague questions, trust the current video time."
+
     async def route(self, *, question: str, current_time: str | None, segments_block: str, video_id: uuid.UUID) -> dict:
         prompt = ROUTER_PROMPT.format(
             current_time=current_time or "unknown",
             segments=segments_block[:16000],
             question=question[:2000],
+            skill_instructions=await self._get_skill(),
         )
         audit_ctx = {
             "db": self.db,

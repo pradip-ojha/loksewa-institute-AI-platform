@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import String, Integer, Float, DateTime, ForeignKey, Text, Boolean, func
+from sqlalchemy import String, Integer, Float, DateTime, ForeignKey, Text, Boolean, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -87,6 +87,13 @@ class StudentAnswerSheet(Base):
     rows with an incremented attempt number (quality-gate allows up to 2)."""
 
     __tablename__ = "student_answer_sheets"
+    # A student gets at most one row per (test, attempt). This makes the read-modify-write
+    # in `upload_answer` race-safe: two near-simultaneous uploads compute the same next
+    # attempt number, but only one INSERT can land — the loser hits IntegrityError and is
+    # handled as a concurrent-submission conflict instead of double-charging AI checking.
+    __table_args__ = (
+        UniqueConstraint("test_id", "student_id", "upload_attempt_number", name="uq_answer_sheet_test_student_attempt"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     test_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("subjective_tests.id", ondelete="CASCADE"), nullable=False)

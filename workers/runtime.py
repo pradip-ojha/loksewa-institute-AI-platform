@@ -20,6 +20,7 @@ hard timeout so a hung AI/DB call can't pin a worker forever.
 """
 import asyncio
 import logging
+import os
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -29,6 +30,23 @@ from celery.signals import worker_ready, worker_shutdown
 logger = logging.getLogger(__name__)
 
 _loop: asyncio.AbstractEventLoop | None = None
+
+# Per-process identity, used to stamp the jobs this worker owns. Computed lazily so
+# that under the prefork pool — where children are FORKED from a master that already
+# imported this module — each child gets a DISTINCT token (the pid differs), instead
+# of inheriting one shared token from the master. A fresh uuid per process/restart
+# means a restarted worker never collides with its previous incarnation.
+_worker_token: str | None = None
+_worker_token_pid: int | None = None
+
+
+def worker_token() -> str:
+    global _worker_token, _worker_token_pid
+    pid = os.getpid()
+    if _worker_token is None or _worker_token_pid != pid:
+        _worker_token = f"{uuid.uuid4().hex[:12]}:{pid}"
+        _worker_token_pid = pid
+    return _worker_token
 
 
 def get_loop() -> asyncio.AbstractEventLoop:
@@ -104,6 +122,28 @@ async def _already_terminal(job_uuid: uuid.UUID) -> bool:
         return False
 
 
+async def _heartbeat_loop(job_uuid: uuid.UUID) -> None:
+    """Refresh this job's heartbeat on a fixed cadence while the task runs.
+
+    Runs as a concurrent asyncio task on the worker's loop, independent of the
+    pipeline's own progress updates — so the heartbeat keeps advancing even through a
+    multi-minute AI/render phase that emits no progress. Each beat opens its own short
+    session (borrow-per-use), so it never holds a pooled connection. A failed beat is
+    swallowed (best-effort liveness); the reaper's stale window tolerates a few misses.
+    """
+    from app.core.database import AsyncSessionLocal
+    from app.modules.jobs.service import HEARTBEAT_INTERVAL_SECONDS, touch_heartbeat
+
+    token = worker_token()
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+        try:
+            async with AsyncSessionLocal() as db:
+                await touch_heartbeat(db, job_uuid, owner_token=token)
+        except Exception:
+            logger.debug("Heartbeat write failed for job %s (will retry next beat)", job_uuid)
+
+
 async def _run_task(work: Callable[..., Awaitable[None]], *, job_id: str, timeout: int, will_retry: bool, manage_session: bool) -> None:
     from app.core.database import AsyncSessionLocal
     from app.modules.jobs.models import JobStatus
@@ -113,6 +153,7 @@ async def _run_task(work: Callable[..., Awaitable[None]], *, job_id: str, timeou
     if await _already_terminal(job_uuid):
         logger.info("Job %s already in a terminal state; skipping redelivered task", job_uuid)
         return
+    heartbeat: asyncio.Task | None = None
     try:
         # Mark `processing` in its OWN short session that is closed immediately.
         # The session passed into `work` must never be the one we reuse for the
@@ -120,8 +161,16 @@ async def _run_task(work: Callable[..., Awaitable[None]], *, job_id: str, timeou
         # minutes, during which an idle pooled connection is dropped server-side
         # (Neon). Reusing that stale connection for the final commit is exactly
         # the "connection is closed" failure we are eliminating.
+        # Stamp this worker's token + an initial heartbeat so recovery can tell a
+        # live job (heartbeat fresh) from a dead one (heartbeat stale).
         async with AsyncSessionLocal() as mark_db:
-            await update_job(mark_db, job_uuid, status=JobStatus.processing, step="Starting…")
+            await update_job(
+                mark_db, job_uuid, status=JobStatus.processing, step="Starting…",
+                owner_token=worker_token(),
+            )
+
+        # Start the liveness heartbeat now, so a long first phase can't look dead.
+        heartbeat = get_loop().create_task(_heartbeat_loop(job_uuid))
 
         if manage_session:
             # Legacy mode: `work` receives one session held open for its whole run.
@@ -149,6 +198,14 @@ async def _run_task(work: Callable[..., Awaitable[None]], *, job_id: str, timeou
         status = JobStatus.retrying if will_retry else JobStatus.failed
         await _record_terminal(job_uuid, status=status, message=_sanitize_error(exc))
         raise
+    finally:
+        # Stop the heartbeat loop whether the task succeeded, failed, or timed out.
+        if heartbeat is not None:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 def run_task(
@@ -191,21 +248,32 @@ def run_task(
 
 @worker_ready.connect
 def _recover_orphaned_jobs_on_start(**_kwargs) -> None:
-    """When a worker boots, fail any job left `processing` by a previous run (its
-    worker died / was restarted mid-task) and reconcile the dependent answer sheets
-    / tests to `failed`. This stops the UI spinning forever and lets the student
-    re-upload. A fresh worker owns no in-flight tasks, so every `processing` row is
-    orphaned. Redelivered orphan tasks are then skipped by `_already_terminal`."""
+    """When a worker boots, fail `processing` jobs whose heartbeat has gone stale —
+    left behind by a previous run whose worker died/was restarted mid-task — and
+    reconcile their dependent answer sheets / tests to `failed`. This stops the UI
+    spinning forever and lets the student re-upload. Heartbeat-stale (not "all
+    processing") is what makes this safe under multiple worker processes: a sibling
+    worker's live job keeps a fresh heartbeat and is left untouched; a crash-orphaned
+    job with a still-recent heartbeat is caught by the periodic reaper once it goes
+    stale. Redelivered orphan tasks are then skipped by `_already_terminal`."""
     async def _recover() -> None:
         from app.core.database import AsyncSessionLocal
         from app.modules.jobs.service import fail_orphaned_processing_jobs
+        from app.modules.knowledge.service import fail_orphaned_knowledge_documents
+        from app.modules.mcq.service import fail_orphaned_mcq_documents
         from app.modules.subjective.service import fail_orphaned_sheets_and_tests
+        from app.modules.video.service import fail_orphaned_videos
 
         async with AsyncSessionLocal() as db:
             failed = await fail_orphaned_processing_jobs(db)
-            reconciled = await fail_orphaned_sheets_and_tests(db)
+            reconciled = (
+                await fail_orphaned_sheets_and_tests(db)
+                + await fail_orphaned_videos(db)
+                + await fail_orphaned_knowledge_documents(db)
+                + await fail_orphaned_mcq_documents(db)
+            )
         if failed or reconciled:
-            logger.warning("Startup recovery: failed %d orphaned job(s), reconciled %d sheet(s)/test(s)",
+            logger.warning("Startup recovery: failed %d orphaned job(s), reconciled %d entity(ies)",
                            failed, reconciled)
 
     try:

@@ -29,6 +29,9 @@ HARD RULES:
 You are given the per-slide text (extracted from the slides PDF) and the lecture timeline
 (segments with their time ranges and labels).
 
+--- ADMIN-TUNABLE GUIDANCE (refines emphasis only; never overrides the HARD RULES above) ---
+{skill_instructions}
+
 LECTURE TIMELINE (segment label — time range):
 {timeline}
 
@@ -54,8 +57,18 @@ class VideoSlideLabelAgent:
         self.db = db
         self.provider = get_provider("thinking")
 
+    async def _get_skill(self) -> str:
+        try:
+            from app.modules.skill_layer.service import get_active_skill_text
+            return await get_active_skill_text(self.db, "VideoSlideLabelAgent")
+        except Exception:
+            return "Title slides by the concept they teach, not their position; align by meaning even when slide order and lecture order differ."
+
     async def generate(self, *, slides_block: str, timeline_block: str, video_id: uuid.UUID) -> list[dict]:
-        prompt = SLIDE_PROMPT.format(timeline=timeline_block[:12000], slides=slides_block[:40000])
+        prompt = SLIDE_PROMPT.format(
+            timeline=timeline_block[:12000], slides=slides_block[:40000],
+            skill_instructions=await self._get_skill(),
+        )
         audit_ctx = {
             "db": self.db,
             "agent_type": "VideoSlideLabelAgent",

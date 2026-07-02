@@ -28,7 +28,12 @@ MAX_TARGETS_PER_QUESTION = 3
 MAX_TARGETS_PER_PAGE = 6
 # How many per-(question,page) vision locator calls run concurrently. Each call also
 # borrows one short-lived DB session for audit, so keep this within DB pool headroom.
-LOCATOR_CONCURRENCY = 4
+LOCATOR_CONCURRENCY = 6
+# The annotation phase runs AFTER marks are final and the sheet is already
+# `feedback_ready`. Bound it well under the task hard-timeout so a slow ~40-call
+# locator loop on a large sheet settles to `checked` (results stand, PDF unavailable)
+# instead of letting the OUTER task timeout fire mid-annotation and fail the task.
+ANNOTATION_BUDGET_SECONDS = 600
 
 
 # ── Test setup: question extraction + multi-agent skill generation ───────────────
@@ -128,7 +133,7 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
         async with AsyncSessionLocal() as db:
             tree_text, valid_topics, valid_subtopics, valid_chapters, topic_to_chapter = await get_chapter_tree(db, exam_id)
 
-        route_sem = asyncio.Semaphore(4)
+        route_sem = asyncio.Semaphore(6)
 
         async def _route_one(qd):
             async with route_sem:
@@ -178,24 +183,36 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
         # Each question's grouped knowledge fetch + skill generation runs CONCURRENTLY
         # on its own short-lived session (audit logging makes one AsyncSession unsafe
         # to share, and borrow-per-use keeps no connection idle across the AI calls). ─
-        gen_sem = asyncio.Semaphore(3)
+        gen_sem = asyncio.Semaphore(6)
 
-        async def _gen_one(qd) -> dict:
+        async def _gen_one(qd) -> dict | None:
+            # Per-question fault isolation: one question's transient AI failure must NOT
+            # discard every other question's completed skill (matches _route_one/_extract_one).
             async with gen_sem:
-                async with AsyncSessionLocal() as gdb:
-                    knowledge = await svc.fetch_question_resources(
-                        gdb, exam_id=exam_id, chapter=qd["chapter"], topic=qd["topic"],
-                        subtopic=qd["subtopic"], query=qd["question_text"],
-                    )
-                    skill_json = await SkillGeneratorAgent(gdb).generate(
-                        question_number=qd["question_number"], question_text=qd["question_text"], marks=qd["marks"],
-                        topic=qd["topic"], subtopic=qd["subtopic"], model_answer=model_answer, rubric=rubric_text,
-                        custom_instruction=custom_instruction, knowledge=knowledge, test_id=test_uuid,
-                    )
-                return {"q": qd, "skill_json": skill_json, "knowledge": knowledge, "iterations": 1,
-                        "evaluation_status": "passed", "evaluation_notes": None}
+                try:
+                    async with AsyncSessionLocal() as gdb:
+                        knowledge = await svc.fetch_question_resources(
+                            gdb, exam_id=exam_id, chapter=qd["chapter"], topic=qd["topic"],
+                            subtopic=qd["subtopic"], query=qd["question_text"],
+                        )
+                        skill_json = await SkillGeneratorAgent(gdb).generate(
+                            question_number=qd["question_number"], question_text=qd["question_text"], marks=qd["marks"],
+                            topic=qd["topic"], subtopic=qd["subtopic"], model_answer=model_answer, rubric=rubric_text,
+                            custom_instruction=custom_instruction, knowledge=knowledge, test_id=test_uuid,
+                        )
+                    return {"q": qd, "skill_json": skill_json, "knowledge": knowledge, "iterations": 1,
+                            "evaluation_status": "passed", "evaluation_notes": None}
+                except Exception as exc:
+                    logger.warning("skill generation failed for %s: %s", qd["question_number"], exc)
+                    return None
 
-        skills: list[dict] = list(await asyncio.gather(*[_gen_one(qd) for qd in qdata]))
+        skills: list[dict] = [s for s in await asyncio.gather(*[_gen_one(qd) for qd in qdata]) if s]
+        skipped = [qd["question_number"] for qd in qdata if qd["question_number"] not in {s["q"]["question_number"] for s in skills}]
+        # Only a TOTAL wipeout fails the job — partial success still locks the skills that built.
+        if not skills:
+            raise RuntimeError("checking-skill generation produced no usable skills for any question")
+        if skipped:
+            logger.warning("skill generation skipped %d/%d question(s): %s", len(skipped), total, skipped)
 
         # Evaluate the generated skills (lenient gate), then improve only the weak ones.
         await _job(progress=74, step="Evaluating checking skills")
@@ -248,7 +265,8 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
             await db.commit()
 
         await _job(status=JobStatus.completed, progress=100, step="Test ready",
-                   output={"questions": total, "total_marks": total_marks, "improved": len(weak)})
+                   output={"questions": total, "skills_locked": len(skills), "skipped_questions": skipped,
+                           "total_marks": total_marks, "improved": len(weak)})
 
     try:
         run_task(work, job_id=job_id, task=self, manage_session=False)
@@ -307,7 +325,7 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
     # so nothing is ever held idle across an AI/render phase (LOAD → WORK → SAVE).
     async def work() -> None:
         import asyncio
-        from sqlalchemy import select
+        from sqlalchemy import delete, select
         from app.core.database import AsyncSessionLocal
         from app.integrations.r2_client import get_r2
         from app.modules.files.models import File
@@ -366,6 +384,20 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
             full_marks_by_qid = {q.question_number: q.marks for q in questions}
             await update_job(db, jid, status=JobStatus.processing, progress=8, step="Rendering pages")
 
+        # ── Idempotency for retries ─────────────────────────────────────────────
+        # A Celery retry (max_retries=1) re-runs work() from the top, and every phase
+        # below is insert-only (quality check, extraction, evaluation, annotation +
+        # checked-PDF File). Clear any rows a prior attempt created for this sheet so a
+        # retry REPLACES rather than duplicates them. The checked-PDF R2 key is
+        # deterministic ("answer-sheets/checked/{sid}/checked.pdf") and overwritten in
+        # place, so we also drop the stale checked-File row that pointed at it.
+        checked_key_for_sheet = f"answer-sheets/checked/{sid}/checked.pdf"
+        async with AsyncSessionLocal() as db:
+            for model in (AnswerQualityCheck, AnswerExtraction, AnswerEvaluation, PDFAnnotation):
+                await db.execute(delete(model).where(model.sheet_id == sid))
+            await db.execute(delete(File).where(File.r2_key == checked_key_for_sheet))
+            await db.commit()
+
         # ── Render pages (no DB held) ───────────────────────────────────────────
         file_bytes = await asyncio.to_thread(get_r2().download_fileobj, r2_key)
         pages = pdf_tools.render_to_page_images(file_bytes, mime_type)
@@ -401,7 +433,7 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         # not concurrency-safe). Partial success: a failing page → empty output. ──
         await _set_sheet_status("extracting")
         await _job(progress=24, step=f"Extracting {len(pages)} pages in parallel")
-        extract_sem = asyncio.Semaphore(3)
+        extract_sem = asyncio.Semaphore(6)
 
         async def _extract_one(page) -> dict:
             nxt = AnswerStructureAgent.page_hint(structure_map, page.page_number + 1)
@@ -513,10 +545,14 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
             logger.warning("subjective personalization hook failed (continuing): %s", exc)
 
         # 5) Locate + validate annotation geometry → checked PDF (best-effort) ────
-        # Each locator call opens its own short-lived session inside
-        # _locate_and_build_commands, so the ~40-call loop holds no idle connection.
-        annotation_ok = False
-        try:
+        # Marks are ALREADY final and the sheet is `feedback_ready`, so from here on the
+        # result must NEVER be lost. The annotation is wrapped in its own time budget
+        # (ANNOTATION_BUDGET_SECONDS): if the ~40-call locator loop runs long on a big
+        # sheet, the inner timeout settles the sheet to `checked` (feedback stands, PDF
+        # simply unavailable) rather than letting the outer task timeout fire here and
+        # flip a fully-graded sheet to `failed`. Each locator call opens its own
+        # short-lived session, so the loop holds no idle connection.
+        async def _annotate() -> None:
             await _job(progress=78, step="Locating annotations")
             regions_by_q = _regions_by_question(extraction)
             commands_by_page, locator_plans = await _locate_and_build_commands(
@@ -533,7 +569,9 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
             checked_pdf = pdf_tools.build_pdf_from_images(annotated_pngs)
 
             checked_key = f"answer-sheets/checked/{sid}/checked.pdf"
-            get_r2().upload_fileobj(checked_key, io.BytesIO(checked_pdf), "application/pdf")
+            await asyncio.to_thread(
+                get_r2().upload_fileobj, checked_key, io.BytesIO(checked_pdf), "application/pdf"
+            )
             async with AsyncSessionLocal() as db:
                 checked_file = File(
                     original_filename="checked.pdf", display_name=f"{display_name} — Checked",
@@ -552,11 +590,15 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
                 if s:
                     s.current_status = "checked"
                 await db.commit()
+
+        annotation_ok = False
+        try:
+            await asyncio.wait_for(_annotate(), timeout=ANNOTATION_BUDGET_SECONDS)
             annotation_ok = True
-        except Exception as exc:
+        except Exception as exc:  # includes asyncio.TimeoutError from the inner budget
             # Annotation is secondary — the feedback stands. Record the failure on a
-            # fresh session and still mark the sheet checked (the result page shows
-            # feedback; the checked PDF is simply unavailable).
+            # fresh session and still settle the sheet to `checked` (the result page
+            # shows feedback; the checked PDF is simply unavailable).
             logger.warning("annotation phase failed (feedback already saved): %s", exc)
             async with AsyncSessionLocal() as db:
                 db.add(PDFAnnotation(sheet_id=sid, annotation_status="failed"))
@@ -598,10 +640,15 @@ async def _log_subjective_activity(db, *, student_id, sheet_id, exam_id, display
         )
     test_text = (f"Subjective test '{display_name}': {awarded}/{possible} total.\n" + "\n".join(lines))[:6000]
     summary = f"Subjective test '{display_name}': {awarded}/{possible} marks."
-    await pers.log_activity(
+    newly_logged = await pers.log_activity(
         db, student_id=student_id, activity_type="subjective_test", entity_id=sheet_id,
         exam_id=exam_id, raw_context={"summary": test_text}, summary_line=summary,
     )
+    # Only roll up when this is a genuinely new activity — on a checking-task retry the
+    # activity is already logged, so we must not re-run the (non-idempotent) extended-
+    # subjective summary that would double-count this sheet's mistakes.
+    if not newly_logged:
+        return
     try:
         from app.core.celery_client import get_celery
         get_celery().send_task(
@@ -970,9 +1017,20 @@ def _mark_sheet_failed(sheet_id: str) -> None:
             async with AsyncSessionLocal() as db:
                 r = await db.execute(select(StudentAnswerSheet).where(StudentAnswerSheet.id == uuid.UUID(sheet_id)))
                 s = r.scalar_one_or_none()
-                if s:
-                    s.current_status = "failed"
+                if not s:
+                    return
+                # NEVER downgrade a sheet whose marks are already final. Once the
+                # reviewer pass commits `feedback_ready` (and certainly once `checked`),
+                # the result is student-visible and must survive any later failure —
+                # e.g. an outer task timeout/cancel during the best-effort annotation
+                # phase. Settle such a sheet to `checked` (PDF may be absent) instead.
+                if s.current_status in ("feedback_ready", "checked"):
+                    s.current_status = "checked"
                     await db.commit()
+                    logger.warning("Sheet %s already graded; settled to checked instead of failed", sheet_id)
+                    return
+                s.current_status = "failed"
+                await db.commit()
         except Exception:
             logger.exception("Could not mark sheet %s failed", sheet_id)
 

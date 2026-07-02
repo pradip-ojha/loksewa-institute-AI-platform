@@ -26,6 +26,38 @@ from app.modules.video.models import (
 
 logger = logging.getLogger(__name__)
 
+_VIDEO_TERMINAL = ("completed", "failed")
+
+
+async def fail_orphaned_videos(db: AsyncSession) -> int:
+    """Mark in-progress videos as failed when their processing job is gone.
+
+    Backstop for a worker that died mid-job: the job row is failed by the reaper /
+    startup recovery, but the video's own `processing_status` stays at
+    'transcribing'/'generating_timeline'/… forever, so the admin Library spins with no
+    path back to retry. Any video not in a terminal status whose `processing_job_id` is
+    missing or points at a failed/cancelled job becomes 'failed' (which enables retry).
+    Returns how many were reconciled."""
+    from app.modules.jobs.models import JobStatus, ProcessingJob
+
+    dead = {JobStatus.failed, JobStatus.cancelled}
+    reconciled = 0
+    videos = (await db.execute(
+        select(Video).where(~Video.processing_status.in_(_VIDEO_TERMINAL))
+    )).scalars().all()
+    for v in videos:
+        job = None
+        if v.processing_job_id:
+            job = (await db.execute(
+                select(ProcessingJob).where(ProcessingJob.id == v.processing_job_id)
+            )).scalar_one_or_none()
+        if job is None or job.status in dead:
+            v.processing_status = "failed"
+            reconciled += 1
+    if reconciled:
+        await db.commit()
+    return reconciled
+
 
 # ── Time helpers ─────────────────────────────────────────────────────────────────
 
@@ -296,16 +328,15 @@ async def get_chapter_tree(
 
 # ── Q&A chain (timeline-first) ───────────────────────────────────────────────────
 
-async def run_qa_chain(
+async def _prepare_qa_turn(
     db: AsyncSession, *, video: Video, question: str,
     current_video_time: str | None, session: VideoChatSession,
 ) -> dict:
-    """Full timeline-first Q&A: segment router → topic/subtopic router →
-    filtered knowledge retrieval → main tutor. The full lecture summary is always
-    included for global context."""
+    """Shared pre-answer steps for both the sync and streaming Q&A chains: segment
+    router → topic/subtopic router → conditional knowledge retrieval → personalization.
+    Returns everything the answer agent + persistence need."""
     from app.ai.agents.video_segment_router_agent import VideoSegmentRouterAgent
     from app.ai.agents.video_topic_router_agent import VideoTopicRouterAgent
-    from app.ai.agents.video_tutor_agent import VideoTutorAgent
 
     segments = await get_timeline(db, video.id)
     summary = await get_summary(db, video.id)
@@ -374,14 +405,9 @@ async def run_qa_chain(
             topic=detected_topic, subtopic_ids=detected_subtopics, question=question,
         )
 
-    # ── Step 5: Main Tutor (with personalization) ────────────────────────────────
+    # ── Step 5 prefix: personalization context (the answer itself runs in the caller) ─
     from app.modules.personalization import service as pers
     personalization = await pers.build_video_tutor_context(db, session.student_id)
-    answer = await VideoTutorAgent(db).answer(
-        question=question, lecture_summary=lecture_summary_text,
-        segment_content=segment_content or "(no specific lecture segment matched this question)",
-        knowledge_text=knowledge_text, video_id=video.id, personalization=personalization,
-    )
 
     selected_out = [{
         "segment_id": _seg_id(s.segment_index),
@@ -391,21 +417,37 @@ async def run_qa_chain(
         "start_seconds": s.start_seconds,
     } for s in selected]
 
-    # ── Persist the chat message ─────────────────────────────────────────────────
+    return {
+        "lecture_summary_text": lecture_summary_text,
+        "segment_content": segment_content or "(no specific lecture segment matched this question)",
+        "knowledge_text": knowledge_text,
+        "supporting": supporting,
+        "detected_topic": detected_topic,
+        "detected_subtopics": detected_subtopics,
+        "selected_out": selected_out,
+        "personalization": personalization,
+    }
+
+
+async def _persist_qa_turn(
+    db: AsyncSession, *, video: Video, session: VideoChatSession, question: str, prep: dict,
+    answer: str, language: str, confidence: float, follow_ups: list[str],
+) -> None:
+    selected_out = prep["selected_out"]
     msg = VideoChatMessage(
         session_id=session.id,
         video_id=video.id,
         student_id=session.student_id,
         question=question,
-        answer=answer["answer"],
-        language=answer["language"],
+        answer=answer,
+        language=language,
         selected_segment_ids=[s["segment_id"] for s in selected_out],
-        detected_topic=detected_topic,
-        detected_subtopic_ids=detected_subtopics,
+        detected_topic=prep["detected_topic"],
+        detected_subtopic_ids=prep["detected_subtopics"],
         sources_json={"selected_segments": selected_out},
-        supporting_knowledge_json=supporting,
-        confidence=answer["confidence"],
-        follow_up_suggestions=answer["follow_up_suggestions"],
+        supporting_knowledge_json=prep["supporting"],
+        confidence=confidence,
+        follow_up_suggestions=follow_ups,
     )
     db.add(msg)
     await db.commit()
@@ -416,22 +458,97 @@ async def run_qa_chain(
         get_celery().send_task(
             "workers.tasks.personalization_tasks.pers_update_chat",
             args=[str(session.student_id), "video", str(session.id),
-                  f"STUDENT: {question}\nTUTOR: {answer['answer']}"[:8000]],
+                  f"STUDENT: {question}\nTUTOR: {answer}"[:8000]],
             queue="kvi_ai_default",
         )
     except Exception:  # noqa: BLE001
         pass
 
+
+async def run_qa_chain(
+    db: AsyncSession, *, video: Video, question: str,
+    current_video_time: str | None, session: VideoChatSession,
+) -> dict:
+    """Full timeline-first Q&A: segment router → topic/subtopic router →
+    filtered knowledge retrieval → main tutor. The full lecture summary is always
+    included for global context."""
+    from app.ai.agents.video_tutor_agent import VideoTutorAgent
+
+    prep = await _prepare_qa_turn(db, video=video, question=question, current_video_time=current_video_time, session=session)
+
+    answer = await VideoTutorAgent(db).answer(
+        question=question, lecture_summary=prep["lecture_summary_text"],
+        segment_content=prep["segment_content"], knowledge_text=prep["knowledge_text"],
+        video_id=video.id, personalization=prep["personalization"],
+    )
+
+    await _persist_qa_turn(
+        db, video=video, session=session, question=question, prep=prep,
+        answer=answer["answer"], language=answer["language"],
+        confidence=answer["confidence"], follow_ups=answer["follow_up_suggestions"],
+    )
+
     return {
         "answer": answer["answer"],
         "language": answer["language"],
         "chat_session_id": session.id,
-        "selected_segments": selected_out,
-        "detected_topic": detected_topic,
-        "detected_subtopic_ids": detected_subtopics,
-        "supporting_knowledge_used": supporting,
+        "selected_segments": prep["selected_out"],
+        "detected_topic": prep["detected_topic"],
+        "detected_subtopic_ids": prep["detected_subtopics"],
+        "supporting_knowledge_used": prep["supporting"],
         "confidence": answer["confidence"],
         "follow_up_suggestions": answer["follow_up_suggestions"],
+    }
+
+
+async def run_qa_chain_stream(
+    db: AsyncSession, *, video: Video, question: str,
+    current_video_time: str | None, session: VideoChatSession,
+):
+    """Streaming variant of ``run_qa_chain``. Yields a ``meta`` event (session +
+    selected segments + detected topic), then ``delta`` events as the answer streams,
+    then a ``done`` event with follow-ups once persisted. Errors yield an ``error`` event."""
+    from app.ai.agents.video_tutor_agent import VideoTutorAgent
+
+    prep = await _prepare_qa_turn(db, video=video, question=question, current_video_time=current_video_time, session=session)
+
+    yield {
+        "type": "meta",
+        "chat_session_id": str(session.id),
+        "selected_segments": prep["selected_out"],
+        "detected_topic": prep["detected_topic"],
+        "detected_subtopic_ids": prep["detected_subtopics"],
+        "supporting_knowledge_used": prep["supporting"],
+    }
+
+    meta_sink: dict = {}
+    parts: list[str] = []
+    async for delta in VideoTutorAgent(db).answer_stream(
+        question=question, lecture_summary=prep["lecture_summary_text"],
+        segment_content=prep["segment_content"], knowledge_text=prep["knowledge_text"],
+        video_id=video.id, personalization=prep["personalization"], meta_sink=meta_sink,
+    ):
+        parts.append(delta)
+        yield {"type": "delta", "text": delta}
+
+    answer_text = "".join(parts).strip()
+    if not answer_text:
+        yield {"type": "error", "message": "tutor returned no answer"}
+        return
+
+    follow_ups = meta_sink.get("follow_up_suggestions", [])
+    language = meta_sink.get("language", "nepali")
+    confidence = meta_sink.get("confidence", 0.0)
+    await _persist_qa_turn(
+        db, video=video, session=session, question=question, prep=prep,
+        answer=answer_text, language=language, confidence=confidence, follow_ups=follow_ups,
+    )
+
+    yield {
+        "type": "done",
+        "language": language,
+        "confidence": confidence,
+        "follow_up_suggestions": follow_ups,
     }
 
 

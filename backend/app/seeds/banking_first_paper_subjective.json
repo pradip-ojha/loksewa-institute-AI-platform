@@ -1,0 +1,212 @@
+[
+  {
+    "chapter": "बैंकिङ्ग (Banking)",
+    "topics": [
+      {
+        "topic": "बैंकिङ्ग प्रणालीको इतिहास र विकासक्रम (History and development of banking system)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपालको बैंकिङ्ग क्षेत्रको वर्तमान परिदृश्य र अवस्था (Present scenario and status of banking in Nepal)",
+        "subtopics": []
+      },
+      {
+        "topic": "बैंक तथा वित्तीय संस्था (BFIs) का प्रकार र वर्गीकरण (Types and classification of BFIs)",
+        "subtopics": []
+      },
+      {
+        "topic": "केन्द्रीय बैंक र वाणिज्य बैंकको भूमिका र कार्यहरू (Role and functions of central bank and commercial banks)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपालको बैंकिङ्ग क्षेत्रका चुनौती, समस्या र अवसरहरू (Challenges, issues and opportunities of banking in Nepal)",
+        "subtopics": []
+      },
+      {
+        "topic": "वित्तीय पहुँच, वित्तीय साक्षरता र वित्तीय समावेशीकरण (Financial access, literacy and inclusion)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "बैंकिङ्ग कानूनहरू (Banking Laws)",
+    "topics": [
+      {
+        "topic": "बैंक तथा वित्तीय संस्था सम्बन्धी ऐन, २०७३ (Bank and Financial Institution Act, 2073)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपाल राष्ट्र बैंक ऐन, २०५८ (Nepal Rastra Bank Act, 2058)",
+        "subtopics": []
+      },
+      {
+        "topic": "बैंकिङ्ग कसुर तथा सजाय ऐन, २०६४ (Banking Offence and Punishment Act, 2064)",
+        "subtopics": []
+      },
+      {
+        "topic": "सम्पत्ति शुद्धीकरण (मनी लाउन्डरिङ) निवारण ऐन, २०६४ (Asset Laundering Prevention Act, 2064)",
+        "subtopics": []
+      },
+      {
+        "topic": "नेपाल राष्ट्र बैंकबाट जारी एकीकृत निर्देशन (Unified Directives issued by NRB)",
+        "subtopics": []
+      },
+      {
+        "topic": "विनिमेय अधिकारपत्र ऐन, २०३४ (Negotiable Instrument Act, 2034)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "व्यवस्थापन (Management)",
+    "topics": [
+      {
+        "topic": "संगठन: परिभाषा, उद्देश्य, प्रकार र संरचना (Organization: definition, objectives, types and structure)",
+        "subtopics": []
+      },
+      {
+        "topic": "व्यवस्थापनको परिभाषा, सिद्धान्त र कार्यहरू (Definition, principles and functions of management)",
+        "subtopics": []
+      },
+      {
+        "topic": "संगठनात्मक परिवर्तन र विकास (Organizational change and development)",
+        "subtopics": []
+      },
+      {
+        "topic": "उत्प्रेरणा: अवधारणा र सिद्धान्तहरू (Motivation: concept and theories)",
+        "subtopics": []
+      },
+      {
+        "topic": "सञ्चार प्रणाली: प्रकार र उपकरणहरू (Communication system: types and tools)",
+        "subtopics": []
+      },
+      {
+        "topic": "सुपरीवेक्षण, अनुगमन र नियन्त्रण (Supervision, monitoring and control)",
+        "subtopics": []
+      },
+      {
+        "topic": "संस्थागत सुशासन (Corporate governance)",
+        "subtopics": []
+      },
+      {
+        "topic": "व्यवस्थापन सूचना प्रणाली (Management information systems)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "लेखा (Accounting)",
+    "topics": [
+      {
+        "topic": "लेखा प्रणालीको अवधारणा र सिद्धान्त (Concept and principle of book keeping and accounting)",
+        "subtopics": []
+      },
+      {
+        "topic": "लेखा प्रणालीका विशेषता, प्रकार र उद्देश्यहरू (Characteristics, types and objectives of accounting)",
+        "subtopics": []
+      },
+      {
+        "topic": "एकल र दोहोरो लेखा प्रणाली (Single-entry and double-entry accounting system)",
+        "subtopics": []
+      },
+      {
+        "topic": "लेखा भौचर र सानो नगदी कोष (Accounting vouchers and petty cash book)",
+        "subtopics": []
+      },
+      {
+        "topic": "सन्तुलन परीक्षण, हिसाब मिलान, अन्तर बैंक र अन्तर शाखा कारोबार (Trial balance, reconciliation, inter-bank and inter-branch transactions)",
+        "subtopics": []
+      },
+      {
+        "topic": "नाफा नोक्सान हिसाब, आम्दानी–खर्च हिसाब तथा वासलात (Profit & loss, income & expenditure account and balance sheet)",
+        "subtopics": []
+      },
+      {
+        "topic": "वित्तीय विवरणहरूको महत्त्व र प्रयोग (Importance and uses of financial statements)",
+        "subtopics": []
+      },
+      {
+        "topic": "आन्तरिक परीक्षण, आन्तरिक नियन्त्रण र आन्तरिक/बाह्य लेखापरीक्षण (Internal check, internal control, internal & external audit)",
+        "subtopics": []
+      },
+      {
+        "topic": "ह्रासकट्टी: अवधारणा, प्रकार र गणना विधि (Depreciation: concept, types and methods)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "गणित (Mathematics)",
+    "topics": [
+      {
+        "topic": "ऐकिक नियम (Unitary method)",
+        "subtopics": []
+      },
+      {
+        "topic": "भिन्न र दशमलव (Fraction and decimal)",
+        "subtopics": []
+      },
+      {
+        "topic": "प्रतिशत (Percentage)",
+        "subtopics": []
+      },
+      {
+        "topic": "अनुपात र समानुपात (Ratio and proportion)",
+        "subtopics": []
+      },
+      {
+        "topic": "नाफा र नोक्सान (Profit and loss)",
+        "subtopics": []
+      },
+      {
+        "topic": "छुट र कमिशन (Discount and commission)",
+        "subtopics": []
+      },
+      {
+        "topic": "साधारण ब्याज र चक्रीय ब्याज (Simple interest and compound interest)",
+        "subtopics": []
+      },
+      {
+        "topic": "साधारण तथा भारित औसत (Simple and weighted average)",
+        "subtopics": []
+      }
+    ]
+  },
+  {
+    "chapter": "सूचना प्रविधि (Information Technology)",
+    "topics": [
+      {
+        "topic": "कम्प्युटर तथा सूचना प्रविधि सम्बन्धी आधारभूत ज्ञान (Introduction to computer basics and IT)",
+        "subtopics": []
+      },
+      {
+        "topic": "कम्प्युटर प्रणाली, इनपुट र आउटपुट डिभाइस (Computer system, input and output devices)",
+        "subtopics": []
+      },
+      {
+        "topic": "कम्प्युटर अपरेटिङ सिस्टम (Computer operating systems)",
+        "subtopics": []
+      },
+      {
+        "topic": "हार्डवेयर र एप्लिकेसन सफ्टवेयर (Hardware and application software)",
+        "subtopics": []
+      },
+      {
+        "topic": "इन्टरनेट, इन्ट्रानेट, एक्स्ट्रानेट र ई-मेल (Internet, intranet, extranet and e-mail)",
+        "subtopics": []
+      },
+      {
+        "topic": "विन्डोज र अफिस प्याकेज — वर्ड, एक्सेल, पावरपोइन्ट (Windows and office package)",
+        "subtopics": []
+      },
+      {
+        "topic": "डाटाबेस म्यानेजमेन्ट सिस्टम — DBMS (Database Management System)",
+        "subtopics": []
+      },
+      {
+        "topic": "बैंकिङ्ग प्रणालीमा सूचना प्रविधि र कृत्रिम बौद्धिकता (AI) को प्रयोग (Use of IT and AI in banking)",
+        "subtopics": []
+      }
+    ]
+  }
+]

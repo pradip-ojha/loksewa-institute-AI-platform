@@ -1,4 +1,5 @@
 import api, { UPLOAD_TIMEOUT } from "./api";
+import { streamNdjson, type StreamHandlers } from "./stream";
 
 export interface JobRef {
   id: string;
@@ -171,6 +172,8 @@ export const videoTutorService = {
     api.get(`/api/student/videos/${id}`).then((r) => r.data),
   ask: (id: string, body: AskBody): Promise<AskResponse> =>
     api.post(`/api/student/videos/${id}/ask`, body, { timeout: 120_000 }).then((r) => r.data),
+  askStream: (id: string, body: AskBody, handlers: StreamHandlers, signal?: AbortSignal): Promise<void> =>
+    streamNdjson(`/api/student/videos/${id}/ask/stream`, body, handlers, signal),
   getHistory: (id: string): Promise<ChatHistoryItem[]> =>
     api.get(`/api/student/videos/${id}/history`).then((r) => r.data),
 };

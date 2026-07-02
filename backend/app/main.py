@@ -1,11 +1,17 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
+from app.core.ratelimit import limiter
 from app.modules.auth.router import router as auth_router
 from app.modules.users.router import router as users_router
 from app.modules.exams.router import router as exams_router
@@ -42,6 +48,23 @@ async def lifespan(app: FastAPI):
             ", ".join(missing),
         )
 
+    # FAIL CLOSED in production: never run publicly on a known/placeholder secret or the
+    # weak default admin password. In development these are warnings (above); in
+    # production they abort startup so the misconfiguration is caught at deploy time.
+    if settings.ENVIRONMENT.lower() == "production":
+        problems: list[str] = []
+        if not settings.JWT_SECRET or settings.JWT_SECRET == "change-this-secret":
+            problems.append("JWT_SECRET is unset or the placeholder value")
+        if settings.DEFAULT_ADMIN_PASSWORD in ("", "Admin@123"):
+            problems.append("DEFAULT_ADMIN_PASSWORD is unset or the weak default")
+        if missing:
+            problems.append(f"required settings still unset: {', '.join(missing)}")
+        if problems:
+            raise RuntimeError(
+                "Refusing to start in production with insecure configuration: "
+                + "; ".join(problems)
+            )
+
     # Run seeds one at a time so a failure names the exact step instead of a
     # cryptic stack trace at startup.
     seeds = (
@@ -65,12 +88,39 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── Rate limiting (CLAUDE.md §22) ─────────────────────────────────────────────
+# The limiter is shared via app.state; SlowAPIMiddleware enforces the per-route
+# @limiter.limit decorators (login 10/min/IP, AI chat 30/min/user).
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Baseline hardening headers on every response. The API serves JSON (not HTML), so
+    a strict CSP + nosniff + framing/Referrer controls cost nothing and block MIME
+    sniffing / clickjacking / referrer leakage. HSTS is sent so browsers pin HTTPS once
+    the app is served over TLS (harmless over plain HTTP during local dev)."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.FRONTEND_URL],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # Pin to the methods/headers the SPA actually uses rather than credentialed wildcards.
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 register_exception_handlers(app)
@@ -135,7 +185,11 @@ async def health_ready():
             await (fn() if asyncio.iscoroutinefunction(fn) else asyncio.to_thread(fn))
             return name, {"ok": True}
         except Exception as exc:  # noqa: BLE001
-            return name, {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+            # Log the detail server-side, but NEVER return it: this endpoint is
+            # unauthenticated, and dependency error strings leak host/driver/connection
+            # internals useful for reconnaissance.
+            logger.warning("Readiness probe %s failed: %s: %s", name, type(exc).__name__, exc)
+            return name, {"ok": False}
 
     results = await asyncio.gather(
         _probe("database", _db),

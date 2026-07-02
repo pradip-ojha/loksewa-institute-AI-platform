@@ -1,12 +1,13 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_current_user
 from app.core.database import get_db
 from app.core.exceptions import AppException
+from app.core.ratelimit import LOGIN_LIMIT, client_ip_key, limiter
 from app.core.security import create_access_token, verify_password
 from app.modules.auth.schemas import LoginRequest, TokenResponse
 from app.modules.users.models import User, UserStatus
@@ -16,7 +17,8 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit(LOGIN_LIMIT, key_func=client_ip_key)
+async def login(request: Request, payload: LoginRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == payload.email))
     user = result.scalar_one_or_none()
 
