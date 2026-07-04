@@ -278,7 +278,7 @@ async def get_chat_history(db: AsyncSession, video_id: uuid.UUID, student_id: uu
 # ── Syllabus tree (per exam) ──────────────────────────────────────────────────
 
 async def get_chapter_tree(
-    db: AsyncSession, exam_id: uuid.UUID
+    db: AsyncSession, exam_id: uuid.UUID, chapter: str | None = None
 ) -> tuple[str, set[str], set[str], set[str], dict[str, str]]:
     """Return (tree_text, valid_topics, valid_subtopics, valid_chapters, topic_to_chapter).
 
@@ -289,6 +289,11 @@ async def get_chapter_tree(
     topic→chapter lookup (each topic belongs to one chapter; on the rare collision the
     agent's explicit chapter disambiguates). Shared by the video Q&A chain, the main AI
     tutor, and subjective skill generation.
+
+    Pass `chapter` to scope the whole result to a single chapter (the knowledge layer's
+    "locked-chapter" ingest mode, CLAUDE.md §8): every returned structure then covers only
+    that chapter's topics/subtopics. Default `None` = the full exam tree (all callers that
+    omit it are unchanged).
     """
     r = await db.execute(
         select(SyllabusItem)
@@ -296,6 +301,8 @@ async def get_chapter_tree(
         .order_by(SyllabusItem.sort_order)
     )
     items = list(r.scalars().all())
+    if chapter:
+        items = [it for it in items if (it.chapter or "(unspecified)") == chapter]
 
     valid_topics: set[str] = set()
     valid_subtopics: set[str] = set()
@@ -324,6 +331,40 @@ async def get_chapter_tree(
                 lines.append(f"        - SUBTOPIC: {sub}")
     tree_text = "\n".join(lines) or "(no syllabus topics configured)"
     return tree_text, valid_topics, valid_subtopics, valid_chapters, topic_to_chapter
+
+
+def resolve_syllabus_labels(
+    *,
+    topic: str | None,
+    subtopic: str | None,
+    chapter: str | None,
+    valid_topics: set[str],
+    valid_subtopics: set[str],
+    valid_chapters: set[str],
+    topic_to_chapter: dict[str, str],
+    locked_chapter: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Validate a single item's (topic, subtopic, chapter) against the exam syllabus and
+    return official-or-None labels. CHAPTER (the PRIMARY retrieval dimension) is resolved
+    deterministically from the validated topic via `topic_to_chapter`; the caller's explicit
+    chapter is used only when no topic resolved. Mirrors `tutor/service.py::_validate` for a
+    single (not plural) subtopic — used by the knowledge chunk→syllabus mapper (CLAUDE.md §8).
+
+    `locked_chapter` forces the chapter to a single admin-chosen value (the knowledge layer's
+    single-chapter ingest mode): the chapter is always that value, only topic/subtopic vary
+    within it. The literal "(unspecified)" chapter (rows with no chapter) is treated as None.
+    """
+    t = topic if (topic and topic in valid_topics) else None
+    sub = subtopic if (t and subtopic and subtopic in valid_subtopics) else None
+    if locked_chapter:
+        ch: str | None = locked_chapter
+    else:
+        ch = topic_to_chapter.get(t) if t else None
+        if not ch and chapter and chapter in valid_chapters:
+            ch = chapter
+    if ch == "(unspecified)":
+        ch = None
+    return t, sub, ch
 
 
 # ── Q&A chain (timeline-first) ───────────────────────────────────────────────────

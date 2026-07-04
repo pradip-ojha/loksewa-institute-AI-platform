@@ -1,4 +1,4 @@
-import api from "./api";
+import api, { UPLOAD_TIMEOUT } from "./api";
 
 export interface SubtopicEntry {
   id: string;
@@ -45,4 +45,17 @@ export const syllabusService = {
 
   deleteTopic: (examId: string, chapter: string, topic: string): Promise<SyllabusTree> =>
     api.delete(`${base(examId)}/topic`, { data: { chapter, topic } }).then((r) => r.data),
+
+  // Upload a syllabus PDF/Word file → background job extracts the chapter/topic/subtopic tree
+  // and REPLACES this exam's syllabus. Returns the job id to poll via <JobStatusPoller/>.
+  importFromPdf: (examId: string, file: File): Promise<{ job_id: string }> => {
+    const form = new FormData();
+    form.append("file", file);
+    return api
+      .post(`${base(examId)}/import`, form, {
+        headers: { "Content-Type": "multipart/form-data" },
+        timeout: UPLOAD_TIMEOUT,
+      })
+      .then((r) => r.data);
+  },
 };

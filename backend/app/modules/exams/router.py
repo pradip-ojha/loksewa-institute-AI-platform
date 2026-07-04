@@ -47,6 +47,18 @@ async def update_exam(
     )
 
 
+@router.delete("/admin/exams/{exam_id}", status_code=204)
+async def delete_exam(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> None:
+    """Permanently delete an exam and ALL its content (syllabus, knowledge + vectors, MCQ,
+    tests + attempts, subjective tests + submissions, videos, tutor chats, enrollments, and
+    the uploaded files). Irreversible — the UI must confirm before calling this."""
+    await service.delete_exam(db, exam_id)
+
+
 # ── Student: enrolled exams ──────────────────────────────────────────────────
 
 @router.get("/student/exams", response_model=list[EnrollmentOut])

@@ -1,7 +1,7 @@
 import uuid
 from collections import defaultdict
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File as FastAPIFile, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +10,9 @@ from app.core.auth import require_admin
 from app.core.database import get_db
 from app.core.exceptions import AppException
 from app.modules.exams.service import get_exam_or_404
+from app.modules.files.service import store_upload
+from app.modules.jobs.models import JobStatus
+from app.modules.jobs.service import create_job, update_job
 from app.modules.syllabus.models import SyllabusItem
 from app.modules.syllabus.schemas import ChapterNode, SubtopicEntry, SyllabusTree, TopicNode
 from app.modules.users.models import User
@@ -87,6 +90,47 @@ async def add_item(
     ))
     await db.commit()
     return await _build_tree(db, exam_id)
+
+
+# ── import syllabus from an uploaded PDF/Word file (background extraction job) ──
+
+@router.post("/exams/{exam_id}/import", status_code=202)
+async def import_syllabus_from_file(
+    exam_id: uuid.UUID,
+    file: UploadFile = FastAPIFile(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> dict:
+    """Upload a syllabus PDF/Word file → queue a background job that OCRs/reads it, extracts
+    the chapter/topic/subtopic tree, and REPLACES this exam's syllabus with it. Returns the
+    job id so the caller can poll `/api/jobs/{id}`. Saves the admin from entering every leaf
+    by hand; everything stays editable on the Syllabus page afterward."""
+    exam = await get_exam_or_404(db, exam_id)
+
+    file_record = await store_upload(
+        file,
+        context="document",
+        display_name=f"Syllabus import — {exam.name}",
+        uploaded_by=current_user.id,
+        db=db,
+    )
+
+    job = await create_job(
+        db,
+        job_type="syllabus_extraction",
+        created_by=current_user.id,
+        input_reference={"exam_id": str(exam_id), "file_id": str(file_record.id)},
+    )
+
+    from app.core.celery_client import get_celery
+    task = get_celery().send_task(
+        "workers.tasks.syllabus_tasks.extract_syllabus",
+        args=[str(job.id), str(exam_id), str(file_record.id)],
+        queue="kvi_ai_knowledge",
+    )
+    await update_job(db, job.id, celery_task_id=task.id, status=JobStatus.queued)
+
+    return {"job_id": str(job.id)}
 
 
 # ── update single item ────────────────────────────────────────────────────────

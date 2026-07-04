@@ -6,7 +6,6 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
 
@@ -23,7 +22,6 @@ from app.modules.files.models import File
 from app.modules.jobs.service import update_job
 from app.modules.jobs.models import JobStatus
 from app.modules.knowledge.models import KnowledgeChunk, KnowledgeDocument
-from app.modules.syllabus.models import SyllabusItem
 from app.modules.exams.models import Exam
 
 logger = logging.getLogger(__name__)
@@ -84,7 +82,32 @@ async def _db_op_with_retry(op, *, attempts: int = 4, label: str = "db op"):
 # the vector store. The pipeline is now OCR-only: Preeti/scanned content is read from the
 # rendered image (PDFs directly; DOCX after a LibreOffice DOCX→PDF conversion).
 
-VISION_EXTRACT_PROMPT = """Extract every word of text visible on this page. Return clean, readable text only — no commentary, no explanations.
+# A page that carries no real study content (front/back-matter or pure decoration) is
+# reported by the vision model with THIS exact marker instead of transcribed text, so the
+# same single per-page OCR call also classifies the page — no extra AI cost. `_is_non_content`
+# detects it and the page is dropped before it ever reaches the chunker (see `_ocr_pdf_bytes`).
+NON_CONTENT_MARKER = "[[NOT_KNOWLEDGE_CONTENT]]"
+
+VISION_EXTRACT_PROMPT = """You are reading one page of a Nepali Loksewa/banking notes or textbook that is being ingested into a study-knowledge base. Do TWO things: (1) decide whether this page is real study content, then (2) transcribe it.
+
+STEP 1 — Is this page actual study content, or non-content?
+NON-CONTENT pages carry no teachable subject matter. Reject the page if the WHOLE page is one of:
+- cover / title page, or a page of only the book title / author / publisher name
+- copyright / publication / ISBN / edition / printing information
+- dedication, preface, foreword, introduction-by-the-author, acknowledgements, a writer's or publisher's message
+- table of contents / index / "विषय सूची" — a page that just LISTS chapter/topic names (often with page numbers) rather than explaining them
+- syllabus / course outline / exam pattern / exam scheme / marking-scheme pages (they describe the exam, they do not teach a topic)
+- blank pages, or pages that are purely decorative
+- advertisements, "about the author", or lists of the publisher's other books
+
+STUDY CONTENT is anything that teaches a topic/subtopic: explanations, definitions, examples, exam points, notes, data tables, formulas, AND in-book practice questions / model answers / solved Q&A (keep these — they are valuable study material).
+
+BIAS STRONGLY TOWARD KEEPING. Reject ONLY when you are confident the ENTIRE page is non-content. If a page has a chapter/section heading and then real content, or contains ANY substantive study content at all, it is STUDY CONTENT — keep and transcribe it. Key distinction: a contents/syllabus page LISTS topic names; a study page EXPLAINS them.
+
+If the page is NON-CONTENT: output EXACTLY this and nothing else (no quotes, no explanation):
+""" + NON_CONTENT_MARKER + """
+
+STEP 2 — Otherwise, extract every word of study content. Return clean, readable text only — no commentary, no explanations.
 
 Formatting rules:
 - Nepali text → proper Unicode Devanagari (e.g. नेपाल, विकास, बैंकिङ). Never return Romanised transliteration or ASCII encodings.
@@ -95,7 +118,7 @@ Formatting rules:
 - Bullet lists → preserve bullets (•, -, or ▪).
 - Paragraphs → separate with a blank line.
 - Tables → output row by row, columns separated by |.
-- Page numbers, headers/footers → skip them.
+- DECORATION — remove running headers and footers (the book title or chapter title repeated across the top or bottom of the page), page numbers, watermarks, and printed institute or website names. This decoration removal is the ONLY change you may make: never reword, summarise, translate, reorder, or drop any actual content.
 - If a word is partially illegible → write your best guess, do not skip.
 
 Return only the extracted text."""
@@ -106,7 +129,8 @@ ROLE: You prepare Nepali Loksewa/banking study material for semantic retrieval. 
 (MCQ generation, answer checking, the video tutor) will fetch these chunks by meaning, so each
 chunk must stand on its own and carry one coherent idea.
 
-TASK: Split the text below into meaningful, self-contained chunks and tag each one.
+TASK: Split the text below into meaningful, self-contained chunks and map each one to the OFFICIAL
+exam syllabus.
 
 HARD RULES (never violate):
 - Each chunk is complete and independently understandable out of context. Preserve Devanagari and
@@ -119,36 +143,45 @@ HARD RULES (never violate):
 Context:
 - Document type: {document_type}
 - Exam type: {exam_type}
-- CHAPTER (the primary scope — this whole document belongs to it): {chapter}
 - Custom instruction: {custom_instruction}
 
-CHAPTER IS THE PRIMARY RETRIEVAL KEY. This document was uploaded under the chapter above, so every
-chunk belongs to that chapter. Topic/subtopic are a SECONDARY, finer label *within* that chapter —
-they only narrow within it, they never override it.
+OFFICIAL SYLLABUS TREE (chapter → topic → subtopic) — the ONLY valid labels. The source material may
+use different chapter/topic names or a different ordering than the official syllabus; you MUST map
+each chunk to the OFFICIAL strings below, copied EXACTLY — never the book's own chapter/topic names:
+{syllabus_tree}
 
-VALID SYLLABUS TOPICS AND SUBTOPICS for THIS CHAPTER — use ONLY these exact strings:
-{syllabus_topics}
-
-Topic assignment rules:
-- The chunk's chapter is already fixed ({chapter}); you only choose its topic/subtopic within it.
-- Set "topic" to the exact string from the list above that best matches the chunk content.
-- Set "subtopic" to the exact string from the list above, or null if no subtopic applies.
-- If the chunk content does not match any listed topic, set both to null (it still belongs to the chapter).
-- Never invent topic or subtopic strings not in the list above.
+{mapping_block}
 
 Return a JSON object with a single key "chunks" whose value is an array. Each item must have:
   "content"      : the chunk text (string)
   "content_type" : one of [concept_explanation, definition, example, exam_point, procedure, comparison, list_items, summary]
-  "topic"        : exact topic string from the list, or null
-  "subtopic"     : exact subtopic string from the list, or null
+  "chapter"      : exact CHAPTER string from the tree above, or null
+  "topic"        : exact TOPIC string from the tree above, or null
+  "subtopic"     : exact SUBTOPIC string from the tree above, or null
   "language"     : "english" | "nepali" | "nepali_english_mixed"
 
 Example format:
-{{"chunks": [{{"content": "...", "content_type": "definition", "topic": "...", "subtopic": null, "language": "nepali"}}]}}
+{{"chunks": [{{"content": "...", "content_type": "definition", "chapter": "...", "topic": "...", "subtopic": null, "language": "nepali"}}]}}
 
 TEXT TO CHUNK:
 {text}
 """
+
+# The mapping-rules block injected into CHUNK_PROMPT differs by ingest mode (CLAUDE.md §8):
+# whole-book (no admin chapter) → the model classifies each chunk's chapter from the full tree;
+# single-chapter (admin picked a chapter) → the chapter is fixed and only topic/subtopic vary.
+MAPPING_BLOCK_WHOLE_BOOK = """MAPPING RULES (this document spans MULTIPLE chapters — classify EACH chunk independently):
+- For every chunk pick, in order, the CHAPTER, then a TOPIC within that chapter, then a SUBTOPIC
+  within that topic — using ONLY exact strings from the tree above.
+- A chunk's real subject decides its official chapter, NOT where it sat in the source book.
+- If a chunk fits no official chapter/topic, set chapter, topic AND subtopic all to null.
+- Never invent labels that are not in the tree above."""
+
+MAPPING_BLOCK_LOCKED = """MAPPING RULES (this whole document belongs to CHAPTER: {chapter}):
+- The chapter is FIXED — set every chunk's "chapter" to exactly "{chapter}".
+- Choose only the TOPIC (and its SUBTOPIC) within that chapter, using exact strings from the tree.
+- If a chunk matches no listed topic, set topic and subtopic to null (chapter stays "{chapter}").
+- Never invent labels that are not in the tree above."""
 
 # ── PDF text classification ────────────────────────────────────────────────────
 
@@ -314,10 +347,22 @@ def _docx_to_pdf_bytes(data: bytes) -> bytes:
             return fh.read()
 
 
-async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> str:
-    """OCR every page of a PDF (given as bytes) with the typed-vision model and return the
-    concatenated text. OCR-ONLY: a page that cannot be read is SKIPPED (never backfilled
-    with the raw text layer / a Preeti decode — that content is garbage for this corpus).
+def _is_non_content(text: str) -> bool:
+    """True only when the WHOLE vision response is the non-content marker (tolerating
+    surrounding whitespace / quotes / backticks / markdown emphasis) — never when the
+    marker merely appears as a substring inside a real content page."""
+    t = text.strip().strip("`\"' *").upper()
+    return t == NON_CONTENT_MARKER.upper()
+
+
+async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> tuple[str, dict]:
+    """OCR every page of a PDF (given as bytes) with the typed-vision model and return
+    ``(concatenated_text, stats)``. The SAME per-page vision call also classifies the page:
+    a page the model reports as non-content (cover / TOC / syllabus / preface / decoration
+    via ``NON_CONTENT_MARKER``) is dropped (``rejected``); a page that cannot be read is
+    SKIPPED (``failed``) — never backfilled with the raw text layer / a Preeti decode (that
+    content is garbage for this corpus). ``stats`` = ``{total, extracted, rejected, failed}``
+    so the caller can tell "all pages were non-content" from "OCR failed".
 
     `step_cb(progress:int, msg:str)` is an async progress callback. Shared by direct-PDF
     uploads and by Preeti/scanned DOCX after the DOCX → PDF conversion.
@@ -342,6 +387,9 @@ async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> str:
     ocr_sem = asyncio.Semaphore(6)
     VISION_OCR_ATTEMPTS = 3
 
+    rejected_pages: list[int] = []   # classified NON-CONTENT (front-matter/decoration) — dropped
+    failed_pages: list[int] = []     # unreadable after retries / 404 — skipped
+
     async def _process_one_page(i: int, cls: str) -> tuple[int, str]:
         async with ocr_sem:
             last_err: str | None = None
@@ -351,6 +399,16 @@ async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> str:
                         VISION_EXTRACT_PROMPT, jpeg_map[i], schema=None
                     )
                     ocr_text = (vision_result.get("text") or "").strip()
+                    # Non-content page (cover/TOC/syllabus/preface/decoration): the model
+                    # returns the marker instead of text → deliberate skip, NOT a failure,
+                    # do NOT retry. Must be checked BEFORE the empty-text retry branch.
+                    if _is_non_content(ocr_text):
+                        logger.info(
+                            "Vision OCR page %d (%s): classified NON-CONTENT — rejected/skipped",
+                            i + 1, cls,
+                        )
+                        rejected_pages.append(i)
+                        return (i, "")
                     if ocr_text:
                         logger.info("Vision OCR page %d (%s): %d chars", i + 1, cls, len(ocr_text))
                         return (i, ocr_text)
@@ -368,6 +426,7 @@ async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> str:
                             "Vision not supported by this deployment (404 on page %d) — "
                             "cannot OCR; page skipped", i + 1,
                         )
+                        failed_pages.append(i)
                         return (i, "")
                     logger.warning(
                         "Vision OCR failed page %d (attempt %d/%d): %s",
@@ -378,6 +437,7 @@ async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> str:
                 "(NOT ingesting raw/garbage text)",
                 VISION_OCR_ATTEMPTS, i + 1, last_err,
             )
+            failed_pages.append(i)
             return (i, "")
 
     await step_cb(23, f"Vision OCR — processing {len(vision_pages)}/{total_pages} pages in parallel…")
@@ -385,7 +445,19 @@ async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> str:
         *[_process_one_page(i, cls) for i, cls in enumerate(classifications)]
     )
     page_results = sorted(page_results, key=lambda x: x[0])
-    return "\n\n".join(text for _, text in page_results if text)
+    text = "\n\n".join(t for _, t in page_results if t)
+
+    extracted = total_pages - len(rejected_pages) - len(failed_pages)
+    stats = {
+        "total": total_pages,
+        "extracted": extracted,
+        "rejected": len(rejected_pages),
+        "failed": len(failed_pages),
+    }
+    summary = f"OCR complete — {extracted} extracted, {len(rejected_pages)} rejected as non-content, {len(failed_pages)} unreadable (of {total_pages} pages)."
+    logger.info(summary)
+    await step_cb(24, summary)
+    return text, stats
 
 
 def _split_into_sections(text: str, max_chars: int = 8000) -> list[str]:
@@ -486,37 +558,29 @@ class KnowledgeProcessingAgent:
                 exam_type = exam.exam_type if exam else ""
                 doc_chapter = doc.chapter or ""
 
-                # Load syllabus topics/subtopics for metadata validation and prompt injection.
-                # CHAPTER IS PRIMARY: when the document is uploaded under a chapter, scope the
-                # valid topics to THAT chapter so chunks can't be mis-tagged with a topic from a
-                # different chapter of the same exam (cross-chapter leakage). With no chapter we
-                # fall back to the whole exam tree.
-                _syl_where = [
-                    SyllabusItem.exam_id == exam_id,
-                    SyllabusItem.is_active == True,
-                ]
-                if doc_chapter:
-                    _syl_where.append(SyllabusItem.chapter == doc_chapter)
-                syl_result = await load_db.execute(
-                    select(SyllabusItem)
-                    .where(*_syl_where)
-                    .order_by(SyllabusItem.sort_order)
+                # Load the OFFICIAL syllabus tree for chunk→syllabus mapping + validation
+                # (CLAUDE.md §8). Chapter is the PRIMARY retrieval dimension, mapped per chunk:
+                #   • Single-chapter upload (admin picked a chapter) → LOCKED mode: scope the tree
+                #     to that chapter (get_chapter_tree(chapter=…)) so chunks can only carry that
+                #     chapter's topics, and the chapter itself is forced to it below.
+                #   • Whole-book upload (no chapter) → the AI classifies EACH chunk to a
+                #     chapter+topic+subtopic from the full exam tree, so a book spanning many
+                #     official chapters is filed correctly (never all under one/blank chapter).
+                # get_chapter_tree lives in the video service and is the shared builder used by the
+                # tutor + subjective workers; import lazily to avoid an import cycle at module load.
+                from app.modules.video.service import get_chapter_tree, resolve_syllabus_labels
+                (
+                    syllabus_tree_text,
+                    valid_topics,
+                    valid_subtopics,
+                    valid_chapters,
+                    topic_to_chapter,
+                ) = await get_chapter_tree(load_db, exam_id, chapter=doc_chapter or None)
+                mapping_block = (
+                    MAPPING_BLOCK_LOCKED.format(chapter=doc_chapter)
+                    if doc_chapter
+                    else MAPPING_BLOCK_WHOLE_BOOK
                 )
-                syllabus_items = syl_result.scalars().all()
-                valid_topics: set[str] = {item.topic for item in syllabus_items}
-                valid_subtopics: set[str] = {item.subtopic for item in syllabus_items if item.subtopic}
-                _topic_sub_map: dict[str, list[str]] = defaultdict(list)
-                for _item in syllabus_items:
-                    if _item.subtopic:
-                        _topic_sub_map[_item.topic].append(_item.subtopic)
-                    elif _item.topic not in _topic_sub_map:
-                        _topic_sub_map[_item.topic] = []
-                _lines: list[str] = []
-                for _topic, _subs in _topic_sub_map.items():
-                    _lines.append(f"- {_topic}")
-                    for _sub in _subs:
-                        _lines.append(f"  - {_sub}")
-                syllabus_topics_block = "\n".join(_lines)
 
                 # Load file record
                 file_result = await load_db.execute(select(File).where(File.id == file_id))
@@ -540,10 +604,13 @@ class KnowledgeProcessingAgent:
             async def _ocr_step(progress: int, msg: str) -> None:
                 await _step(JobStatus.processing, progress, msg)
 
+            # OCR stats (total/extracted/rejected/failed); None when the DOCX text layer
+            # was used directly (no per-page vision, so no page-level classification).
+            ocr_stats: dict | None = None
             if "pdf" in mime:
                 # OCR every page (FORCE_OCR_ALL_PAGES) — this corpus is all scanned or
                 # Preeti-font, so the text layer is unusable. See `_ocr_pdf_bytes`.
-                raw_text = await _ocr_pdf_bytes(file_bytes, _ocr_step)
+                raw_text, ocr_stats = await _ocr_pdf_bytes(file_bytes, _ocr_step)
 
             elif "word" in mime or "docx" in mime or "msword" in mime:
                 # A Word document may be real Unicode OR legacy Preeti-encoded. Extract the
@@ -563,11 +630,20 @@ class KnowledgeProcessingAgent:
                     )
                     await _step(JobStatus.processing, 18, "Converting Word document to PDF for OCR…")
                     pdf_bytes = await asyncio.to_thread(_docx_to_pdf_bytes, file_bytes)
-                    raw_text = await _ocr_pdf_bytes(pdf_bytes, _ocr_step)
+                    raw_text, ocr_stats = await _ocr_pdf_bytes(pdf_bytes, _ocr_step)
             else:
                 raise RuntimeError(f"Unsupported file type for text extraction: {mime}")
 
             if not raw_text.strip():
+                # Distinguish "every page was non-content" from "OCR could not read the file"
+                # so the failed job carries an honest, actionable message.
+                if ocr_stats and ocr_stats["rejected"] and not ocr_stats["extracted"] and not ocr_stats["failed"]:
+                    raise RuntimeError(
+                        f"Every page ({ocr_stats['rejected']}/{ocr_stats['total']}) was classified as "
+                        "non-content (cover, table of contents, syllabus, preface or decoration), so "
+                        "there is no study material to ingest. Upload a document that contains actual "
+                        "topic content."
+                    )
                 raise RuntimeError(
                     "No text could be extracted from the document. "
                     "Check that the PDF is readable and not password-protected, "
@@ -590,20 +666,23 @@ class KnowledgeProcessingAgent:
                     prompt = CHUNK_PROMPT.format(
                         document_type=document_type,
                         exam_type=exam_type,
-                        chapter=doc_chapter or "(unspecified)",
                         custom_instruction=custom_instruction or "None",
-                        syllabus_topics=syllabus_topics_block,
+                        syllabus_tree=syllabus_tree_text,
+                        mapping_block=mapping_block,
                         text=section,
                     )
                     try:
                         result_json = await provider.generate_text(prompt, schema={"type": "array"})
                     except Exception as exc:
                         logger.warning("AI chunking failed for section %d: %s", i, exc)
+                        # Keep the section as one un-mapped chunk; the validation pass below
+                        # resolves its chapter/topic (locked chapter is forced there).
                         return [{
                             "content": section,
                             "content_type": "concept_explanation",
-                            "topic": doc_topic or "",
-                            "subtopic": doc_subtopic or "",
+                            "chapter": doc_chapter or None,
+                            "topic": doc_topic or None,
+                            "subtopic": doc_subtopic or None,
                             "language": "nepali_english_mixed",
                         }]
                     if isinstance(result_json, list):
@@ -622,15 +701,25 @@ class KnowledgeProcessingAgent:
 
             await _step(JobStatus.processing, 55, f"Embedding {len(all_chunks)} chunks…")
 
-            # Post-validate AI-assigned topics against the loaded syllabus
+            # Post-validate every chunk's AI-assigned (chapter, topic, subtopic) against the
+            # official syllabus. Chapter is resolved deterministically from the validated topic
+            # via topic_to_chapter (never trusted raw from the model); in locked mode it is
+            # forced to doc_chapter. An unmappable chunk (whole-book, no matching topic) keeps a
+            # null chapter/topic — still embedded + retrievable in broad queries, never mis-filed.
             for _c in all_chunks:
-                _ai_topic = _c.get("topic")
-                _ai_subtopic = _c.get("subtopic")
-                if _ai_topic not in valid_topics:
-                    _c["topic"] = None
-                    _c["subtopic"] = None
-                elif _ai_subtopic is not None and _ai_subtopic not in valid_subtopics:
-                    _c["subtopic"] = None
+                _t, _sub, _ch = resolve_syllabus_labels(
+                    topic=_c.get("topic"),
+                    subtopic=_c.get("subtopic"),
+                    chapter=_c.get("chapter"),
+                    valid_topics=valid_topics,
+                    valid_subtopics=valid_subtopics,
+                    valid_chapters=valid_chapters,
+                    topic_to_chapter=topic_to_chapter,
+                    locked_chapter=(doc_chapter or None),
+                )
+                _c["topic"] = _t
+                _c["subtopic"] = _sub
+                _c["chapter"] = _ch
 
             chunk_texts = [c.get("content", "") for c in all_chunks]
             embeddings = await provider.embed(chunk_texts)
@@ -644,15 +733,23 @@ class KnowledgeProcessingAgent:
             for idx, (chunk, embedding) in enumerate(zip(all_chunks, embeddings)):
                 vector_id = f"{doc_uuid}:{idx}"
 
+                # Per-chunk official-syllabus labels (validated above). The admin's doc-level
+                # topic/subtopic only backfill in LOCKED mode (doc_chapter set) where they belong
+                # to that chapter; in whole-book mode a null chapter/topic stays null so an
+                # unmappable chunk is never given a topic without a chapter.
+                resolved_chapter = chunk.get("chapter")
+                resolved_topic = chunk.get("topic") or (doc_topic if doc_chapter else None)
+                resolved_subtopic = chunk.get("subtopic") or (doc_subtopic if doc_chapter else None)
+
                 metadata = {
                     "document_id": str(doc_uuid),
                     "document_name": display_name,
                     "document_type": document_type,
                     "exam_id": str(exam_id),
                     "exam_type": exam_type,
-                    "chapter": doc_chapter,
-                    "topic": chunk.get("topic") or doc_topic or "",
-                    "subtopic": chunk.get("subtopic") or doc_subtopic or "",
+                    "chapter": resolved_chapter or "",
+                    "topic": resolved_topic or "",
+                    "subtopic": resolved_subtopic or "",
                     "language": chunk.get("language", "nepali_english_mixed"),
                     "content_type": chunk.get("content_type", "concept_explanation"),
                     "quality_status": "processed",
@@ -669,8 +766,9 @@ class KnowledgeProcessingAgent:
                     "chunk_index": idx,
                     "content": chunk.get("content", ""),
                     "content_type": chunk.get("content_type"),
-                    "topic": chunk.get("topic") or doc_topic,
-                    "subtopic": chunk.get("subtopic") or doc_subtopic,
+                    "chapter": resolved_chapter,
+                    "topic": resolved_topic,
+                    "subtopic": resolved_subtopic,
                     "language": chunk.get("language", "nepali_english_mixed"),
                     "pinecone_vector_id": vector_id,
                     "metadata": metadata,
@@ -749,7 +847,7 @@ class KnowledgeProcessingAgent:
                                     chunk_index=p["chunk_index"],
                                     content=p["content"],
                                     content_type=p["content_type"],
-                                    chapter=doc_chapter or None,
+                                    chapter=p["chapter"],
                                     topic=p["topic"],
                                     subtopic=p["subtopic"],
                                     language=p["language"],

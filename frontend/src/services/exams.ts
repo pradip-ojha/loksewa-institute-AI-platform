@@ -28,6 +28,10 @@ export const examsService = {
   update: (examId: string, payload: { name?: string; description?: string; status?: string }): Promise<Exam> =>
     api.put(`/api/admin/exams/${examId}`, payload).then((r) => r.data),
 
+  // Permanently delete an exam and ALL its content (irreversible). Confirm before calling.
+  remove: (examId: string): Promise<void> =>
+    api.delete(`/api/admin/exams/${examId}`).then(() => undefined),
+
   // Student enrollment (admin-managed, under the Students UI)
   listStudentExams: (studentId: string): Promise<Enrollment[]> =>
     api.get(`/api/admin/students/${studentId}/exams`).then((r) => r.data),

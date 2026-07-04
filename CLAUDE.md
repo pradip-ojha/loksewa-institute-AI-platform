@@ -152,7 +152,7 @@ project-root/
 │   ├── celery_app.py     (worker app: shared conf + beat schedule + task includes)
 │   ├── celery_config.py  (single source of truth: QUEUES, TASK_ROUTES, build_common_conf — shared by worker + FastAPI sender)
 │   ├── runtime.py        (persistent event loop per worker + run_task helper)
-│   └── tasks/            (keepalive, maintenance/reaper, knowledge, mcq, subjective, video, skill, analytics)
+│   └── tasks/            (keepalive, maintenance/reaper, knowledge, syllabus, mcq, subjective, video, skill, analytics)
 ├── infra/ (docker-compose, Dockerfiles, env.example)
 └── CLAUDE.md
 ```
@@ -182,10 +182,24 @@ Structure within an exam: chapter → topic → subtopic.
 Admin can: add chapters (≥1 topic required), rename a chapter (cascades), delete a chapter (cascades
 topics+subtopics); add/rename (cascades)/delete topics; add/edit/delete subtopics.
 
+**Import syllabus from a PDF/Word file (background extraction).** Rather than typing every leaf by
+hand, the admin can upload the exam's syllabus/course-outline file and a Celery job
+(`syllabus_extraction`, `SyllabusExtractionAgent`) OCRs/reads it and populates the tree. Offered in
+BOTH the exam-creation form (`pages/admin/Exams.tsx` — attach the file while creating the exam;
+extraction runs after the exam is created, poller shown) and on the Syllabus page ("Import from PDF"
+button, replaces the current tree after a confirm). The agent reuses the Knowledge Layer OCR/render
+helpers (`knowledge_processing_agent`) but with its OWN vision prompt that KEEPS syllabus pages (the
+knowledge OCR prompt rejects them), uses the PDF text layer when it is clean Unicode else OCRs every
+page (`get_provider("vision_typed")`), then a `get_provider("thinking")` structuring call emits
+`{chapters:[{chapter, topics:[{topic, subtopics:[…]}]}]}`. `syllabus.service.replace_syllabus_tree`
+bulk-writes it (idempotent: clears the exam's existing `syllabus_items` first). It is structural
+extraction — NOT skill-tunable. Everything stays fully editable afterward.
+
 Backend routes (all admin-only; scoped by `exam_id`):
 ```
 GET    /api/admin/syllabus/exams/{exam_id}          → the exam's tree
 POST   /api/admin/syllabus/exams/{exam_id}/items    → add chapter/topic/subtopic
+POST   /api/admin/syllabus/exams/{exam_id}/import   → upload syllabus PDF/Word → extraction job (returns job_id)
 PUT    /api/admin/syllabus/items/{id}               → edit single item
 DELETE /api/admin/syllabus/items/{id}               → delete single item
 PUT    /api/admin/syllabus/exams/{exam_id}/chapter  → rename chapter (cascades)
@@ -197,11 +211,19 @@ DELETE /api/admin/syllabus/exams/{exam_id}/topic    → delete topic (cascades)
 **Exams + enrollment** (`app/modules/exams/`, all admin-only except the last):
 ```
 GET    /api/admin/exams                       POST /api/admin/exams
-PUT    /api/admin/exams/{exam_id}
+PUT    /api/admin/exams/{exam_id}             DELETE /api/admin/exams/{exam_id}
 GET    /api/admin/students/{id}/exams          POST /api/admin/students/{id}/exams
 DELETE /api/admin/students/{id}/exams/{exam_id}
 GET    /api/student/exams                      → the logged-in student's enrolled exams
 ```
+Admin can **archive** an exam (hide it, reversible) OR **hard-delete** it (`DELETE /api/admin/exams/{exam_id}`
+→ `service.delete_exam`). Delete is irreversible and removes ALL of the exam's content: every
+`exam_id` FK is `ON DELETE CASCADE` (migration `022`) and each of those tables' children cascade from
+it, so one `DELETE` on `exams` wipes syllabus, knowledge, MCQ, MCQ tests + attempts, subjective tests
++ submissions, videos, tutor chats and enrollments atomically. `delete_exam` additionally cleans the
+external resources a DB cascade can't reach — the exam's **Pinecone vectors**, its **R2 objects**, and
+the now-orphaned **`files` rows** — best-effort (a storage hiccup never blocks/rolls back the DB
+delete). `personalization.student_activity_logs.exam_id` is a plain (non-FK) column and is left as-is.
 Student listing endpoints (MCQ tests, subjective tests, videos) filter to the student's enrolled exams.
 
 ---
@@ -216,7 +238,8 @@ already have explanations).
 **Exam** (select), **Chapter** (opt), File, Topic (opt), Subtopic (opt), Custom Instruction.
 
 **Pipeline:** Upload → store R2 → extract text (**OCR-ONLY: every PDF page is re-OCR'd by parallel
-Azure gpt-5 typed-vision** — NOT Gemini, which is handwriting-only) → semantic chunking (parallel,
+Azure gpt-5 typed-vision** — NOT Gemini, which is handwriting-only; the SAME per-page call also
+**strips headers/footers/watermarks** and **rejects non-content pages**, see below) → semantic chunking (parallel,
 `get_provider("chunking")`, tier set by `CHUNKING_MODEL_TIER` .env — **default gpt-5**, or gpt-5-mini
 when `fast`) → embed (`text-embedding-3-large`, 3072d) → upsert Pinecone
 → metadata to PG. Chunking = meaningful semantic units (concepts, definitions, exam points), not blind
@@ -233,6 +256,25 @@ OCR is RETRIED (`VISION_OCR_ATTEMPTS=3`) and then SKIPPED (empty) — the pipeli
 the raw text layer or an LLM "Preeti decode" (both removed), because that would only poison the vector
 store. If every page fails (e.g. the deployment can't accept images → 404), the job fails honestly
 rather than ingesting nothing/garbage.
+**In-call decoration stripping + page rejection (NO extra AI cost — same single per-page vision call).**
+`VISION_EXTRACT_PROMPT` instructs the typed-vision model to (a) **remove running headers/footers, page
+numbers, watermarks and printed institute/website names** — the ONLY manipulation allowed; it never
+rewords/summarises/reorders/drops actual content — and (b) **first classify the page**: a page that is
+entirely front/back-matter or decoration (cover/title, copyright, dedication, preface/foreword/writer's
+or publisher's message, table of contents/index/विषय सूची, syllabus/exam-pattern/marking-scheme,
+blank/decorative, ads/about-the-author) is returned as the exact marker `NON_CONTENT_MARKER`
+(`[[NOT_KNOWLEDGE_CONTENT]]`) instead of text. The prompt biases STRONGLY toward keeping — it rejects
+only when the WHOLE page is non-content, keeps any page with real study content (including
+chapter-divider pages that also carry content and **in-book practice questions/model answers**), and
+draws the key line that a TOC/syllabus page LISTS topic names whereas a study page EXPLAINS them.
+`_is_non_content()` detects the marker (tolerant of surrounding whitespace/quotes/backticks/emphasis,
+whole-response match only) and the page is dropped BEFORE chunking — a deliberate **reject** (no retry),
+distinct from an OCR **failure** (retried). `_ocr_pdf_bytes` returns `(text, stats)` with
+`{total, extracted, rejected, failed}`, logs+emits a one-line summary to the Processing Logs, and the
+empty-document guard uses it to distinguish **"every page was non-content"** (upload has no study
+material) from **"OCR could not read the file"** — both fail the job honestly with an accurate message.
+(The valid-Unicode DOCX branch uses its text layer directly and is NOT page-classified — acceptable
+since the corpus is overwhelmingly scanned/Preeti.)
 **DOCX handling (both Unicode and Preeti):** the `.docx` text is extracted and classified the same way
 — `valid_unicode` → used directly; anything else (Preeti/legacy/empty/broken) → the DOCX is converted
 to PDF via **headless LibreOffice** (`_docx_to_pdf_bytes`, `soffice --headless --convert-to pdf`,
@@ -241,26 +283,42 @@ a worker dependency** for Preeti/scanned DOCX; missing it fails such a job with 
 LibreOffice or re-upload as PDF" message (Unicode DOCX still works without it). The shared OCR routine
 is `_ocr_pdf_bytes(file_bytes, step_cb)`, used by both the PDF path and the converted-DOCX path.
 
-**CHAPTER IS THE PRIMARY RETRIEVAL DIMENSION (topic/subtopic are secondary within it).** A document is
-uploaded under one chapter, so every chunk inherits it. The chunking prompt is told the chapter and is
-fed ONLY that chapter's syllabus topics/subtopics (the LOAD phase filters `SyllabusItem` by the doc's
-`chapter`), so the model can't tag a chunk with a topic from a different chapter (no cross-chapter
-leakage). Retrieval (`_fetch_knowledge_by_type` for MCQ gen/regeneration) filters by `chapter` FIRST —
-topic/subtopic only narrow within it, and with no topic match the chapter's chunks still return.
+**CHAPTER IS THE PRIMARY RETRIEVAL DIMENSION (topic/subtopic are secondary within it), and is mapped
+PER CHUNK to the OFFICIAL syllabus — not taken from the book's own chapter/topic names.** Admins upload
+whole books / full note sets spanning many chapters, and a book's own layout often differs from the
+official syllabus (the same topic can sit in a different chapter). So every chunk is classified to the
+exact official `chapter → topic → subtopic` strings for the exam. **Two ingest modes** (LOAD phase
+calls `video.service.get_chapter_tree(exam_id, chapter=doc_chapter or None)`):
+- **Whole-book (no admin chapter):** the chunker is fed the FULL exam tree and maps EACH chunk to a
+  chapter+topic+subtopic independently (a multi-chapter book is filed across its real chapters, never
+  all under one/blank chapter).
+- **Single-chapter (admin picked a chapter):** the tree is scoped to that chapter, the chapter is
+  LOCKED onto every chunk, and only topic/subtopic vary within it (no cross-chapter leakage).
+
+After chunking, each chunk's `(chapter, topic, subtopic)` is validated by the shared
+`video.service.resolve_syllabus_labels` (mirrors `tutor/service.py::_validate`): topic/subtopic must be
+exact tree strings, and **chapter is resolved deterministically from the validated topic via
+`topic_to_chapter`** — never trusted raw from the model (locked mode forces `doc_chapter`). A chunk that
+matches no official chapter/topic keeps **null** chapter/topic (still embedded + retrievable in broad
+queries, never mis-filed). Retrieval (`_fetch_knowledge_by_type` for MCQ gen/regeneration) filters by
+`chapter` FIRST — topic/subtopic only narrow within it, and with no topic match the chapter's chunks
+still return.
 
 **Chunk metadata:**
 ```json
 {
   "document_id", "document_name", "document_type", "exam_id", "exam_type",
-  "chapter": "real admin-defined chapter from the document (no longer hardcoded)",
+  "chapter": "exact official-syllabus chapter, mapped PER CHUNK (empty string if unmappable)",
   "topic": "exact match from the exam's syllabus, or empty string",
   "subtopic": "exact match from the exam's syllabus, or empty string",
   "language": "nepali_english_mixed", "content_type", "quality_status"
 }
 ```
 - Keyed on `exam_id`/`exam_type` (the old `content_usage_type`/`syllabus_type` are gone).
-- `chapter` is the admin-entered value on the document and is the PRIMARY dimension; topic/subtopic
-  are validated against that **chapter's** live syllabus after AI assigns them (non-chapter values nulled).
+- `chapter` is now assigned PER CHUNK from the official syllabus (whole-book mode) or LOCKED to the
+  admin-picked chapter (single-chapter mode) — no longer one doc-level value stamped on every chunk.
+  topic/subtopic are validated against that chapter's live syllabus after AI assigns them (non-chapter
+  values nulled), and chapter is resolved from the validated topic via `topic_to_chapter`.
 - **Every Pinecone query filter includes `exam_id`** so retrieval never crosses exams; chapter is the
   primary in-exam narrowing key. **Chapter is now threaded into EVERY retrieval path**, not just MCQ:
   subjective skill-gen (`fetch_question_resources`), video Q&A and the main AI tutor
@@ -844,8 +902,9 @@ the 8 Video agents (`VideoTranscriptCleanerAgent`, `VideoTimelineAgent`,
 (`TutorTopicSelectorAgent`, `TutorAgent`, §13.1), plus the **4 Personalization summarizers**
 (`DailySummaryAgent`, `WeeklySummaryAgent`, `ChatSessionSummaryAgent`, `ExtendedSubjectiveSummaryAgent`,
 §Personalization).
-(`KnowledgeProcessingAgent` and `AnswerFeedbackSelectorAgent` exist but are intentionally NOT
-skill-tunable; there is no test-set-generation or analytics agent.)
+(`KnowledgeProcessingAgent`, `AnswerFeedbackSelectorAgent` and `SyllabusExtractionAgent` (§7
+syllabus-from-PDF import) exist but are intentionally NOT skill-tunable; there is no
+test-set-generation or analytics agent.)
 
 ### Skill Scopes
 Global agent skill / Objective chapter / Subjective chapter / Test-specific / Question-specific.
@@ -987,9 +1046,10 @@ Subjective Tests | Skill Layer | Students | Analytics | Settings
 
 **Active-exam selector** in the top bar (persisted): the universal scope for every admin workspace —
 Knowledge/MCQ/MCQ-Tests/Video/Subjective uploads and the Syllabus editor all operate within it
-(`ExamContext`, `pages/admin/Exams.tsx`, `services/exams.ts`). **Exams** page = create/list/archive
-exams (each strictly objective OR subjective). **Students** page = create/edit/reset + **manage exam
-enrollment** per student.
+(`ExamContext`, `pages/admin/Exams.tsx`, `services/exams.ts`). **Exams** page = create/list/archive/
+**delete** exams (each strictly objective OR subjective; delete is irreversible and cascades all the
+exam's content + external files/vectors — see §7). **Students** page = create/edit/reset + **manage
+exam enrollment** per student.
 
 **Dashboard cards:** Total Students, Active Students, Knowledge Documents, Total MCQs, Active MCQ Sets,
 Subjective Tests, Videos, Pending Jobs, Failed Jobs. Recent activity feed.
@@ -1134,6 +1194,7 @@ Free tier is rate-limited **per minute**, so `gemini._generate_content_with_retr
 ### Queue Routing (defined in `TASK_ROUTES`)
 ```
 knowledge_processing          → kvi_ai_knowledge
+syllabus_extraction           → kvi_ai_knowledge
 mcq_extraction/generation     → kvi_ai_mcq
 mcq_test_set_generation       → kvi_ai_mcq
 subjective/answer checking    → kvi_ai_subjective
@@ -1148,7 +1209,8 @@ compress** (`crontab 00:20`), **personalization weekly** summary+intro refresh (
 every night so the weekly summaries stay current).
 
 ### Job Types
-knowledge_processing, mcq_extraction, mcq_generation, mcq_regeneration, mcq_test_set_generation,
+knowledge_processing, syllabus_extraction (syllabus-from-PDF import → chapter/topic/subtopic tree),
+mcq_extraction, mcq_generation, mcq_regeneration, mcq_test_set_generation,
 subjective_test_processing (skill generation: topic routing → knowledge fetch → skill generate →
 evaluate → improve → lock), question_specific_skill_generation, skill_evaluation,
 answer_sheet_quality_check, answer_sheet_structure (whole-sheet page→question map, Gemini vision),
@@ -1184,9 +1246,10 @@ created_at, started_at, completed_at, created_by.
 created_at
 `student_exam_enrollments`: id, student_id (FK users CASCADE), exam_id (FK exams CASCADE), enrolled_at,
 unique(student_id, exam_id)
-**`exam_id` is added (NOT NULL FK → exams) to:** `syllabus_items`, `knowledge_documents`,
-`knowledge_chunks`, `mcq_documents`, `mcq_questions`, `mcq_test_blueprints`, `mcq_test_sets`,
-`subjective_tests`, `videos`, `tutor_chat_sessions`. The old `content_usage_type` columns
+**`exam_id` is added (NOT NULL FK → exams, `ON DELETE CASCADE` as of migration `022`) to:**
+`syllabus_items`, `knowledge_documents`, `knowledge_chunks`, `mcq_documents`, `mcq_questions`,
+`mcq_test_blueprints`, `mcq_test_sets`, `subjective_tests`, `videos`, `tutor_chat_sessions` — so
+deleting an exam cascades all its content (§7). The old `content_usage_type` columns
 (`knowledge_documents`, `videos`) and the `syllabus_type` enum are dropped; `knowledge_documents` gains
 a real `chapter` column.
 
@@ -1329,6 +1392,7 @@ GET    /api/student/profile               PUT    /api/student/profile/password
 GET    /api/admin/profile                 PUT    /api/admin/profile/password
 PUT    /api/admin/profile/email
 GET    /api/admin/syllabus/{type}
+POST   /api/admin/syllabus/exams/{exam_id}/import   → upload syllabus PDF/Word → extraction job
 GET    /api/files/{file_id}/url           GET    /api/admin/files
 POST   /api/admin/knowledge/documents     GET    /api/admin/knowledge/documents
 GET    /api/admin/knowledge/documents/{id}/chunks

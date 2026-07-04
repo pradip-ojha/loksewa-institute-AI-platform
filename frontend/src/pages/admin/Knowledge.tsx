@@ -158,11 +158,15 @@ function UploadTab() {
         <div>
           <Label>Chapter <span className="font-normal text-gray-400">(optional)</span></Label>
           <Select value={form.chapter} onChange={(e) => handleChapterChange(e.target.value)}>
-            <option value="">— All / unspecified —</option>
+            <option value="">— Whole book / all chapters —</option>
             {availableChapters.map((c) => (
               <option key={c.chapter} value={c.chapter}>{c.chapter}</option>
             ))}
           </Select>
+          <p className="mt-1 text-xs text-gray-400">
+            Leave blank for a whole book or note set spanning multiple chapters — each chunk is
+            auto-mapped to the syllabus. Pick a chapter only for single-chapter material.
+          </p>
           <p className="mt-1 text-xs text-gray-400">
             Exam: <span className="font-medium text-gray-600">{selectedExam?.name ?? "none selected"}</span>
           </p>

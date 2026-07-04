@@ -17,7 +17,7 @@ class SubjectiveTest(Base):
     __tablename__ = "subjective_tests"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    exam_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("exams.id"), nullable=False)
+    exam_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("exams.id", ondelete="CASCADE"), nullable=False)
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     total_time_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     num_questions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

@@ -17,7 +17,7 @@ class SyllabusItem(Base):
     __tablename__ = "syllabus_items"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    exam_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("exams.id"), nullable=False)
+    exam_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("exams.id", ondelete="CASCADE"), nullable=False)
     chapter: Mapped[str] = mapped_column(String(500), nullable=False)
     topic: Mapped[str] = mapped_column(String(500), nullable=False)
     subtopic: Mapped[str | None] = mapped_column(String(500), nullable=True)

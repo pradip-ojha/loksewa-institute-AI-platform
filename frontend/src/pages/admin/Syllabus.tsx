@@ -1,11 +1,15 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { syllabusService, type SyllabusTree } from "../../services/syllabus";
+import { JobStatusPoller } from "../../components/JobStatusPoller";
 import { useExam } from "../../context/ExamContext";
 
 export function AdminSyllabus() {
   const { selectedExamId, selectedExam, exams } = useExam();
   const [tree, setTree] = useState<SyllabusTree | null>(null);
   const [loading, setLoading] = useState(true);
+  const [importJobId, setImportJobId] = useState<string | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   const load = async () => {
     if (!selectedExamId) { setLoading(false); return; }
@@ -19,6 +23,23 @@ export function AdminSyllabus() {
 
   const update = (newTree: SyllabusTree) => setTree(newTree);
 
+  const onPickImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (fileRef.current) fileRef.current.value = "";
+    if (!file || !selectedExamId) return;
+    const hasSyllabus = (tree?.chapters.length ?? 0) > 0;
+    if (hasSyllabus && !confirm(
+      "Importing a syllabus file REPLACES the entire current syllabus for this exam. Continue?"
+    )) return;
+    setImportError(null);
+    try {
+      const { job_id } = await syllabusService.importFromPdf(selectedExamId, file);
+      setImportJobId(job_id);
+    } catch {
+      setImportError("Could not upload the syllabus file. Check the file type (PDF/Word) and size.");
+    }
+  };
+
   if (!selectedExamId) {
     return (
       <div className="flex h-48 items-center justify-center text-sm text-gray-400">
@@ -29,7 +50,7 @@ export function AdminSyllabus() {
 
   return (
     <div>
-      <div className="mb-6 flex items-start justify-between">
+      <div className="mb-6 flex items-start justify-between gap-4">
         <div>
           <h2 className="text-xl font-semibold text-gray-900">Syllabus</h2>
           <p className="mt-1 text-sm text-gray-500">
@@ -37,7 +58,32 @@ export function AdminSyllabus() {
             Add, rename, or delete any chapter / topic / subtopic.
           </p>
         </div>
+        <div className="flex-shrink-0">
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".pdf,.docx,.doc"
+            onChange={onPickImportFile}
+            className="hidden"
+          />
+          <button
+            onClick={() => fileRef.current?.click()}
+            className="rounded-lg border border-brand-200 bg-brand-50 px-3 py-2 text-sm font-medium text-brand-700 hover:bg-brand-100"
+          >
+            Import from PDF
+          </button>
+        </div>
       </div>
+
+      {importError && <p className="mb-3 text-sm text-red-600">{importError}</p>}
+      {importJobId && (
+        <JobStatusPoller
+          jobId={importJobId}
+          className="mb-4"
+          onComplete={() => { setImportJobId(null); load(); }}
+          onFail={() => setImportError("Syllabus extraction failed. Try another file or add the syllabus manually.")}
+        />
+      )}
 
       {loading ? (
         <div className="flex h-48 items-center justify-center text-sm text-gray-400">Loading…</div>

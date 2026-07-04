@@ -32,6 +32,7 @@ DEFAULT_QUEUE = "kvi_ai_default"
 # unconsumed queue. Add a line here when a new task module lands.
 TASK_ROUTES = {
     "workers.tasks.knowledge_tasks.*": {"queue": "kvi_ai_knowledge"},
+    "workers.tasks.syllabus_tasks.*": {"queue": "kvi_ai_knowledge"},
     "workers.tasks.mcq_tasks.*": {"queue": "kvi_ai_mcq"},
     "workers.tasks.mcq_test_tasks.*": {"queue": "kvi_ai_mcq"},
     "workers.tasks.subjective_tasks.*": {"queue": "kvi_ai_subjective"},

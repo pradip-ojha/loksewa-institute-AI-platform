@@ -31,7 +31,7 @@ class Video(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     # Which exam (and thus syllabus tree + knowledge set) this lecture maps to.
-    exam_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("exams.id"), nullable=False)
+    exam_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("exams.id", ondelete="CASCADE"), nullable=False)
     # Chapter is the PRIMARY retrieval dimension (CLAUDE.md §8): a lecture is uploaded under
     # one chapter, so Q&A knowledge retrieval filters Pinecone by it (like an MCQ document).
     chapter: Mapped[str | None] = mapped_column(String(500), nullable=True)

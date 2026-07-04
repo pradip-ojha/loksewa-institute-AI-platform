@@ -35,6 +35,7 @@ celery_app = Celery(
         "workers.tasks.maintenance",
         "workers.tasks.test_task",
         "workers.tasks.knowledge_tasks",
+        "workers.tasks.syllabus_tasks",
         "workers.tasks.mcq_tasks",
         "workers.tasks.mcq_test_tasks",
         "workers.tasks.subjective_tasks",
