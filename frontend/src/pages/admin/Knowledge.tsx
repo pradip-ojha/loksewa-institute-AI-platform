@@ -9,6 +9,7 @@ const DOC_TYPES = [
   { value: "book_content", label: "Book Content" },
   { value: "handout", label: "Handout" },
   { value: "reference_material", label: "Reference Material" },
+  { value: "model_qa", label: "Model Q&A" },
 ];
 
 const STATUS_COLORS: Record<string, string> = {
@@ -153,6 +154,12 @@ function UploadTab() {
           <Select value={form.document_type} onChange={(e) => set("document_type", e.target.value)}>
             {DOC_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
           </Select>
+          {form.document_type === "model_qa" && (
+            <p className="mt-1 text-xs text-gray-500">
+              Upload a question paper with model answers. Each question–answer pair is stored
+              separately and retrieved by its question.
+            </p>
+          )}
         </div>
 
         <div>

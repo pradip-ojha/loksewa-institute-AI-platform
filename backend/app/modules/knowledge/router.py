@@ -28,7 +28,7 @@ from app.modules.users.models import User
 
 router = APIRouter(prefix="/admin/knowledge", tags=["knowledge"])
 
-VALID_DOC_TYPES = {"notes", "book_content", "handout", "reference_material"}
+VALID_DOC_TYPES = {"notes", "book_content", "handout", "reference_material", "model_qa"}
 
 
 @router.post("/documents", response_model=KnowledgeDocumentWithJob, status_code=201)

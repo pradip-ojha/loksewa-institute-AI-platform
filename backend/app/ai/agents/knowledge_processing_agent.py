@@ -158,6 +158,55 @@ MAPPING_BLOCK_LOCKED = """MAPPING RULES (this whole document belongs to CHAPTER:
 - If a chunk matches no listed topic, set topic and subtopic to null (chapter stays "{chapter}").
 - Never invent labels that are not in the tree above."""
 
+
+# Extraction prompt for `model_qa` documents (question papers with model answers). Unlike the prose
+# chunker, the unit of meaning here is a QUESTION ↔ ANSWER pair: each pair becomes one chunk whose
+# "content" is the ANSWER and which additionally carries the "question". Retrieval embeds
+# question+answer together and can match on the question, so the pairing must be preserved exactly.
+QA_EXTRACT_PROMPT = EXAM_CONTEXT + """
+
+ROLE: You prepare Nepali Loksewa/banking MODEL ANSWER material for semantic retrieval. The document
+below is a question paper together with its model/ideal answers. Downstream agents fetch these by
+meaning to ground answer-checking and tutoring.
+
+TASK: Extract EVERY complete question–answer pair and map each one to the OFFICIAL exam syllabus.
+
+HARD RULES (never violate):
+- One item per question. "answer" = the FULL model answer to that question, transcribed VERBATIM
+  (preserve Devanagari, formulas, tables, numbering and technical/Loksewa terms exactly). Never
+  reword, translate, summarise, shorten, or add content.
+- "question" = the question text exactly as written (drop only the printed marks/number decoration
+  like "[8 marks]" / "प्रश्न नं. १" if you wish, but keep the actual question wording).
+- If a question's answer is CUT OFF at the end of this excerpt (incomplete), SKIP that pair — it
+  reappears complete in the next overlapping excerpt. Never emit a half answer.
+- Ignore pure front-matter (cover, instructions) that is not a question with an answer.
+
+Context:
+- Exam type: {exam_type}
+- Custom instruction: {custom_instruction}
+
+OFFICIAL SYLLABUS TREE (chapter → topic → subtopic) — the ONLY valid labels. The paper may use
+different chapter/topic names or ordering than the official syllabus; you MUST map each pair to the
+OFFICIAL strings below, copied EXACTLY — never the paper's own names:
+{syllabus_tree}
+
+{mapping_block}
+
+Return a JSON object with a single key "pairs" whose value is an array. Each item must have:
+  "question"  : the question text (string)
+  "answer"    : the full model answer text (string)
+  "chapter"   : exact CHAPTER string from the tree above, or null
+  "topic"     : exact TOPIC string from the tree above, or null
+  "subtopic"  : exact SUBTOPIC string from the tree above, or null
+  "language"  : "english" | "nepali" | "nepali_english_mixed"
+
+Example format:
+{{"pairs": [{{"question": "...", "answer": "...", "chapter": "...", "topic": "...", "subtopic": null, "language": "nepali"}}]}}
+
+TEXT TO EXTRACT PAIRS FROM:
+{text}
+"""
+
 # ── PDF text classification ────────────────────────────────────────────────────
 
 _DEVANAGARI_START = "ऀ"
@@ -629,9 +678,54 @@ class KnowledgeProcessingAgent:
                                 return val
                     return []
 
-            await _step(JobStatus.processing, 30, f"Chunking {len(sections)} sections in parallel…")
+            # `model_qa` documents (question papers with model answers) are extracted as
+            # QUESTION↔ANSWER pairs — one pair per chunk (content = answer, plus "question") —
+            # instead of semantic prose chunks. Everything downstream (syllabus validation,
+            # embedding, save) is shared; only the per-section extractor differs.
+            is_model_qa = document_type == "model_qa"
+
+            async def _extract_qa_pairs_section(i: int, section: str) -> list[dict]:
+                async with chunk_sem:
+                    prompt = QA_EXTRACT_PROMPT.format(
+                        exam_type=exam_type,
+                        custom_instruction=custom_instruction or "None",
+                        syllabus_tree=syllabus_tree_text,
+                        mapping_block=mapping_block,
+                        text=section,
+                    )
+                    try:
+                        result_json = await provider.generate_text(prompt, schema={"type": "object"})
+                    except Exception as exc:
+                        logger.warning("AI Q&A extraction failed for section %d: %s", i, exc)
+                        return []
+                    pairs = result_json.get("pairs") if isinstance(result_json, dict) else None
+                    if not isinstance(pairs, list):
+                        return []
+                    chunks: list[dict] = []
+                    for p in pairs:
+                        if not isinstance(p, dict):
+                            continue
+                        question = (p.get("question") or "").strip()
+                        answer = (p.get("answer") or "").strip()
+                        if not question or not answer:
+                            continue
+                        chunks.append({
+                            "content": answer,
+                            "question": question,
+                            "embed_text": f"{question}\n{answer}",
+                            "content_type": "model_qa",
+                            "chapter": p.get("chapter"),
+                            "topic": p.get("topic"),
+                            "subtopic": p.get("subtopic"),
+                            "language": p.get("language", "nepali_english_mixed"),
+                        })
+                    return chunks
+
+            _section_fn = _extract_qa_pairs_section if is_model_qa else _chunk_one_section
+            _verb = "Extracting Q&A pairs from" if is_model_qa else "Chunking"
+            await _step(JobStatus.processing, 30, f"{_verb} {len(sections)} sections in parallel…")
             section_results = await asyncio.gather(
-                *[_chunk_one_section(i, s) for i, s in enumerate(sections)]
+                *[_section_fn(i, s) for i, s in enumerate(sections)]
             )
             all_chunks: list[dict] = [chunk for sr in section_results for chunk in sr]
 
@@ -657,7 +751,9 @@ class KnowledgeProcessingAgent:
                 _c["subtopic"] = _sub
                 _c["chapter"] = _ch
 
-            chunk_texts = [c.get("content", "") for c in all_chunks]
+            # For model_qa chunks embed question+answer (embed_text) so retrieval matches on the
+            # question; prose chunks have no embed_text and embed their content as before.
+            chunk_texts = [c.get("embed_text") or c.get("content", "") for c in all_chunks]
             embeddings = await provider.embed(chunk_texts)
 
             # Build vectors + plain chunk payloads (NOT ORM objects — no session
@@ -691,6 +787,11 @@ class KnowledgeProcessingAgent:
                     "quality_status": "processed",
                     "chunk_index": idx,
                 }
+                # model_qa chunks carry the source question so retrieval can surface
+                # "the model answer to exactly this question" (stored in Pinecone metadata
+                # + the knowledge_chunks.metadata JSONB — no dedicated column).
+                if chunk.get("question"):
+                    metadata["question"] = chunk["question"]
 
                 vectors.append({
                     "id": vector_id,

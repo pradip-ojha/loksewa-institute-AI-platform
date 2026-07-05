@@ -630,14 +630,12 @@ async def fetch_supporting_knowledge(
     by `exam_id` so retrieval never crosses exams, and by `chapter` (the PRIMARY retrieval
     dimension, CLAUDE.md §8) when known so it never crosses chapters within an exam;
     topic/subtopic narrow within the chapter.
-    Returns (knowledge_text, supporting_list). Best-effort: returns empty on any failure
-    so Q&A still works grounded in the lecture alone."""
-    from app.modules.knowledge.models import KnowledgeChunk
-
+    Runs a dual (prose + model_qa) query so model-answer pairs are retrieved alongside prose
+    (CLAUDE.md §8). Returns (knowledge_text, supporting_list). Best-effort: returns empty on any
+    failure so Q&A still works grounded in the lecture alone."""
     try:
-        import asyncio
         from app.ai.model_router import get_provider
-        from app.integrations.pinecone_client import get_pinecone
+        from app.modules.knowledge.retrieval import query_knowledge_dual
 
         embeddings = await get_provider("reasoning").embed([question])
         if not embeddings:
@@ -650,28 +648,24 @@ async def fetch_supporting_knowledge(
         if subtopic_ids:
             filter_dict["subtopic"] = {"$in": subtopic_ids}
 
-        # Offload the blocking (sync) Pinecone SDK call so it can't stall the event loop.
-        matches = await asyncio.to_thread(
-            get_pinecone().query, embeddings[0], top_k, filter_dict,
+        hits = await query_knowledge_dual(
+            db, embedding=embeddings[0], base_filter=filter_dict, prose_top_k=top_k,
         )
-        vector_ids = [m["id"] for m in matches if m.get("id")]
-        if not vector_ids:
+        if not hits:
             return "", []
-
-        r = await db.execute(
-            select(KnowledgeChunk).where(KnowledgeChunk.pinecone_vector_id.in_(vector_ids))
-        )
-        chunks = {c.pinecone_vector_id: c for c in r.scalars().all()}
 
         lines: list[str] = []
         supporting: list[dict] = []
-        for vid in vector_ids:
-            c = chunks.get(vid)
-            if not c:
-                continue
-            label = " | ".join(filter(None, [c.topic, c.subtopic])) or "General"
-            lines.append(f"[{label}]\n{c.content}")
-            supporting.append({"chunk_id": str(c.id), "topic": c.topic, "subtopic": c.subtopic})
+        for h in hits:
+            if h.is_qa:
+                lines.append(f"[Model Q&A — प्रश्न: {h.question or 'General'}]\n{h.content}")
+                supporting.append(
+                    {"chunk_id": h.chunk_id, "topic": h.topic, "subtopic": h.subtopic, "question": h.question}
+                )
+            else:
+                label = " | ".join(filter(None, [h.topic, h.subtopic])) or "General"
+                lines.append(f"[{label}]\n{h.content}")
+                supporting.append({"chunk_id": h.chunk_id, "topic": h.topic, "subtopic": h.subtopic})
         return "\n\n".join(lines), supporting
     except Exception as exc:
         logger.warning("supporting-knowledge retrieval failed (continuing lecture-only): %s", exc)

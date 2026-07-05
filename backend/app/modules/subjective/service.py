@@ -563,12 +563,11 @@ async def fetch_question_resources(
     never crosses chapters within an exam; topic/subtopic narrow within the chapter.
     Best-effort: returns "" on any failure or when no knowledge is uploaded, so skill
     generation never blocks (CLAUDE.md §11 — knowledge is used ONLY here at skill-generation
-    time, never during per-sheet checking)."""
-    from app.modules.knowledge.models import KnowledgeChunk
+    time, never during per-sheet checking). Runs a dual (prose + model_qa) query so model-answer
+    pairs are retrieved alongside prose (CLAUDE.md §8)."""
     try:
-        import asyncio
         from app.ai.model_router import get_provider
-        from app.integrations.pinecone_client import get_pinecone
+        from app.modules.knowledge.retrieval import query_knowledge_dual
 
         embeddings = await get_provider("reasoning").embed([query[:6000]])
         if not embeddings:
@@ -581,24 +580,18 @@ async def fetch_question_resources(
         if subtopic:
             filter_dict["subtopic"] = {"$in": [subtopic]}
 
-        # Offload the blocking (sync) Pinecone SDK call so it can't stall the event loop.
-        matches = await asyncio.to_thread(
-            get_pinecone().query, embeddings[0], top_k, filter_dict,
+        hits = await query_knowledge_dual(
+            db, embedding=embeddings[0], base_filter=filter_dict, prose_top_k=top_k,
         )
-        vector_ids = [m["id"] for m in matches if m.get("id")]
-        if not vector_ids:
+        if not hits:
             return ""
-        r = await db.execute(
-            select(KnowledgeChunk).where(KnowledgeChunk.pinecone_vector_id.in_(vector_ids))
-        )
-        chunks = {c.pinecone_vector_id: c for c in r.scalars().all()}
         lines: list[str] = []
-        for vid in vector_ids:
-            c = chunks.get(vid)
-            if not c:
-                continue
-            label = " | ".join(filter(None, [c.topic, c.subtopic])) or "General"
-            lines.append(f"[{label}]\n{c.content}")
+        for h in hits:
+            if h.is_qa:
+                lines.append(f"[Model Q&A — प्रश्न: {h.question or 'General'}]\n{h.content}")
+            else:
+                label = " | ".join(filter(None, [h.topic, h.subtopic])) or "General"
+                lines.append(f"[{label}]\n{h.content}")
         return "\n\n".join(lines)
     except Exception as exc:
         logger.warning("question-resource retrieval failed (continuing without it): %s", exc)

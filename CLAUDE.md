@@ -234,16 +234,29 @@ Stores notes/book content/handouts/reference material for AI workflows (MCQ gene
 checking, video-tutor fallback). NOT used to add explanations to uploaded original MCQs (those
 already have explanations).
 
-**Upload fields:** Display Name, Document Type (notes/book_content/handout/reference_material),
-**Exam** (select), **Chapter** (opt), File, Topic (opt), Subtopic (opt), Custom Instruction.
+**Upload fields:** Display Name, Document Type
+(notes/book_content/handout/reference_material/**model_qa**), **Exam** (select), **Chapter** (opt),
+File, Topic (opt), Subtopic (opt), Custom Instruction.
 
-**Pipeline:** Upload → store R2 → extract text (**OCR-ONLY: every PDF page is re-OCR'd by parallel
-Azure gpt-5 typed-vision** — NOT Gemini, which is handwriting-only; the SAME per-page call also
+**Two ingestion shapes by document_type** (validated in `knowledge/router.py::VALID_DOC_TYPES`; a
+free `VARCHAR(50)`, no DB enum):
+- **Prose** (notes/book_content/handout/reference_material) → semantic chunking (below); the chunk's
+  `content` is what gets embedded; NO `question` in metadata.
+- **`model_qa`** (a question paper WITH model/ideal answers) → the unit is a QUESTION↔ANSWER pair, not
+  a paragraph. Instead of the prose chunker, `QA_EXTRACT_PROMPT` extracts each complete pair as one
+  chunk: `content` = the ANSWER, `content_type="model_qa"`, and a **`question`** field in metadata
+  (Pinecone + the `knowledge_chunks.metadata` JSONB — no dedicated column). The embedding is built from
+  **`question + "\n" + answer`** so retrieval matches on the question (Option 1 — trust the vector, no
+  reranking). Partial pairs cut off at a section boundary are skipped (they recur in the 20%-overlapping
+  next section). Same OCR path, syllabus validation, `Semaphore(6)` fan-out, embed/upsert/save as prose.
+
+**Pipeline (prose):** Upload → store R2 → extract text (**OCR-ONLY: every PDF page is re-OCR'd by
+parallel Azure gpt-5 typed-vision** — NOT Gemini, which is handwriting-only; the SAME per-page call also
 **strips headers/footers/watermarks**, see below) → semantic chunking (parallel,
 `get_provider("chunking")`, tier set by `CHUNKING_MODEL_TIER` .env — **default gpt-5**, or gpt-5-mini
 when `fast`) → embed (`text-embedding-3-large`, 3072d) → upsert Pinecone
 → metadata to PG. Chunking = meaningful semantic units (concepts, definitions, exam points), not blind
-token splits.
+token splits. (`model_qa` runs the SAME pipeline but with pair-extraction in place of chunking.)
 Vision OCR parallel across pages (`asyncio.Semaphore(6)`); chunking parallel across sections
 (`asyncio.Semaphore(6)`). (All AI-fan-out semaphores across the platform are 6.)
 
@@ -304,10 +317,12 @@ still return.
   "chapter": "exact official-syllabus chapter, mapped PER CHUNK (empty string if unmappable)",
   "topic": "exact match from the exam's syllabus, or empty string",
   "subtopic": "exact match from the exam's syllabus, or empty string",
-  "language": "nepali_english_mixed", "content_type", "quality_status"
+  "language": "nepali_english_mixed", "content_type", "quality_status",
+  "question": "ONLY on model_qa chunks — the source question this answer belongs to"
 }
 ```
 - Keyed on `exam_id`/`exam_type` (the old `content_usage_type`/`syllabus_type` are gone).
+- `question` is present ONLY on `model_qa` chunks (content_type `model_qa`); prose chunks omit it.
 - `chapter` is now assigned PER CHUNK from the official syllabus (whole-book mode) or LOCKED to the
   admin-picked chapter (single-chapter mode) — no longer one doc-level value stamped on every chunk.
   topic/subtopic are validated against that chapter's live syllabus after AI assigns them (non-chapter
@@ -320,6 +335,15 @@ still return.
   router), `Video.chapter` (set at upload, like an MCQ document → inherited by `VideoTimelineSegment`),
   and the tutor topic selector's returned chapter. `get_chapter_tree` returns chapters in its tree text
   + a deterministic `topic_to_chapter` map; the syllabus routing/mapping agents now emit `chapter`.
+- **Dual retrieval (prose + model_qa).** The Pinecone-backed retrieval paths (`fetch_supporting_knowledge`
+  for video Q&A + main tutor; `fetch_question_resources` for subjective skill-gen) go through the shared
+  `knowledge/retrieval.py::query_knowledge_dual`, which runs TWO parallel queries over the same
+  exam_id/chapter/topic/subtopic filter — one `document_type $nin [model_qa]` (prose, its normal top_k),
+  one `document_type == model_qa` (top-3) — and merges, so a fetch always draws from both content shapes
+  rather than letting them compete for one top_k. model_qa hits are surfaced distinctly
+  (`[Model Q&A — प्रश्न: {question}]\n{answer}`) so the agent knows it is the model answer to exactly that
+  question. Best-effort (returns [] on failure → callers continue). MCQ generation's `_fetch_knowledge_by_type`
+  is a Postgres-only query and is deliberately NOT part of this — `model_qa` does not feed MCQ generation.
 
 ---
 
