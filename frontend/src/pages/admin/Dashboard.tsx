@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   LayoutDashboard, Users, BookOpen, HelpCircle, FileText, FileCheck2, Video,
-  Clock, AlertTriangle, Activity,
+  Clock, Activity,
 } from "lucide-react";
 import api from "../../services/api";
 import { PageHeader, Card, StatCard, EmptyState, Skeleton, Badge } from "../../components/ui";
@@ -15,7 +15,6 @@ interface Stats {
   total_subjective_tests: number;
   total_videos: number;
   pending_jobs: number;
-  failed_jobs: number;
 }
 
 interface ActivityItem {
@@ -33,7 +32,6 @@ const CARD_DEFS = [
   { key: "total_subjective_tests", label: "Subjective Tests", icon: FileCheck2, tone: "warning" as const },
   { key: "total_videos", label: "Video Lectures", icon: Video, tone: "accent" as const },
   { key: "pending_jobs", label: "Pending Jobs", icon: Clock, tone: "neutral" as const },
-  { key: "failed_jobs", label: "Failed Jobs", icon: AlertTriangle, tone: "danger" as const },
 ] as const;
 
 const TYPE_LABELS: Record<string, string> = {

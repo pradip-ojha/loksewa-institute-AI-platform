@@ -82,32 +82,7 @@ async def _db_op_with_retry(op, *, attempts: int = 4, label: str = "db op"):
 # the vector store. The pipeline is now OCR-only: Preeti/scanned content is read from the
 # rendered image (PDFs directly; DOCX after a LibreOffice DOCX→PDF conversion).
 
-# A page that carries no real study content (front/back-matter or pure decoration) is
-# reported by the vision model with THIS exact marker instead of transcribed text, so the
-# same single per-page OCR call also classifies the page — no extra AI cost. `_is_non_content`
-# detects it and the page is dropped before it ever reaches the chunker (see `_ocr_pdf_bytes`).
-NON_CONTENT_MARKER = "[[NOT_KNOWLEDGE_CONTENT]]"
-
-VISION_EXTRACT_PROMPT = """You are reading one page of a Nepali Loksewa/banking notes or textbook that is being ingested into a study-knowledge base. Do TWO things: (1) decide whether this page is real study content, then (2) transcribe it.
-
-STEP 1 — Is this page actual study content, or non-content?
-NON-CONTENT pages carry no teachable subject matter. Reject the page if the WHOLE page is one of:
-- cover / title page, or a page of only the book title / author / publisher name
-- copyright / publication / ISBN / edition / printing information
-- dedication, preface, foreword, introduction-by-the-author, acknowledgements, a writer's or publisher's message
-- table of contents / index / "विषय सूची" — a page that just LISTS chapter/topic names (often with page numbers) rather than explaining them
-- syllabus / course outline / exam pattern / exam scheme / marking-scheme pages (they describe the exam, they do not teach a topic)
-- blank pages, or pages that are purely decorative
-- advertisements, "about the author", or lists of the publisher's other books
-
-STUDY CONTENT is anything that teaches a topic/subtopic: explanations, definitions, examples, exam points, notes, data tables, formulas, AND in-book practice questions / model answers / solved Q&A (keep these — they are valuable study material).
-
-BIAS STRONGLY TOWARD KEEPING. Reject ONLY when you are confident the ENTIRE page is non-content. If a page has a chapter/section heading and then real content, or contains ANY substantive study content at all, it is STUDY CONTENT — keep and transcribe it. Key distinction: a contents/syllabus page LISTS topic names; a study page EXPLAINS them.
-
-If the page is NON-CONTENT: output EXACTLY this and nothing else (no quotes, no explanation):
-""" + NON_CONTENT_MARKER + """
-
-STEP 2 — Otherwise, extract every word of study content. Return clean, readable text only — no commentary, no explanations.
+VISION_EXTRACT_PROMPT = """You are reading one page of a Nepali Loksewa/banking notes or textbook that is being ingested into a study-knowledge base. Extract every word of study content on the page. Return clean, readable text only — no commentary, no explanations.
 
 Formatting rules:
 - Nepali text → proper Unicode Devanagari (e.g. नेपाल, विकास, बैंकिङ). Never return Romanised transliteration or ASCII encodings.
@@ -347,22 +322,12 @@ def _docx_to_pdf_bytes(data: bytes) -> bytes:
             return fh.read()
 
 
-def _is_non_content(text: str) -> bool:
-    """True only when the WHOLE vision response is the non-content marker (tolerating
-    surrounding whitespace / quotes / backticks / markdown emphasis) — never when the
-    marker merely appears as a substring inside a real content page."""
-    t = text.strip().strip("`\"' *").upper()
-    return t == NON_CONTENT_MARKER.upper()
-
-
-async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> tuple[str, dict]:
-    """OCR every page of a PDF (given as bytes) with the typed-vision model and return
-    ``(concatenated_text, stats)``. The SAME per-page vision call also classifies the page:
-    a page the model reports as non-content (cover / TOC / syllabus / preface / decoration
-    via ``NON_CONTENT_MARKER``) is dropped (``rejected``); a page that cannot be read is
-    SKIPPED (``failed``) — never backfilled with the raw text layer / a Preeti decode (that
-    content is garbage for this corpus). ``stats`` = ``{total, extracted, rejected, failed}``
-    so the caller can tell "all pages were non-content" from "OCR failed".
+async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> str:
+    """OCR every page of a PDF (given as bytes) with the typed-vision model and return the
+    concatenated text. A page that cannot be read is SKIPPED — never backfilled with the raw
+    text layer / a Preeti decode (that content is garbage for this corpus). The vision model's
+    only manipulation of a real page is stripping running headers/footers/watermarks; it never
+    rejects, rewords, or summarises content.
 
     `step_cb(progress:int, msg:str)` is an async progress callback. Shared by direct-PDF
     uploads and by Preeti/scanned DOCX after the DOCX → PDF conversion.
@@ -387,7 +352,6 @@ async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> tuple[str, dict]:
     ocr_sem = asyncio.Semaphore(6)
     VISION_OCR_ATTEMPTS = 3
 
-    rejected_pages: list[int] = []   # classified NON-CONTENT (front-matter/decoration) — dropped
     failed_pages: list[int] = []     # unreadable after retries / 404 — skipped
 
     async def _process_one_page(i: int, cls: str) -> tuple[int, str]:
@@ -399,16 +363,6 @@ async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> tuple[str, dict]:
                         VISION_EXTRACT_PROMPT, jpeg_map[i], schema=None
                     )
                     ocr_text = (vision_result.get("text") or "").strip()
-                    # Non-content page (cover/TOC/syllabus/preface/decoration): the model
-                    # returns the marker instead of text → deliberate skip, NOT a failure,
-                    # do NOT retry. Must be checked BEFORE the empty-text retry branch.
-                    if _is_non_content(ocr_text):
-                        logger.info(
-                            "Vision OCR page %d (%s): classified NON-CONTENT — rejected/skipped",
-                            i + 1, cls,
-                        )
-                        rejected_pages.append(i)
-                        return (i, "")
                     if ocr_text:
                         logger.info("Vision OCR page %d (%s): %d chars", i + 1, cls, len(ocr_text))
                         return (i, ocr_text)
@@ -447,17 +401,11 @@ async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> tuple[str, dict]:
     page_results = sorted(page_results, key=lambda x: x[0])
     text = "\n\n".join(t for _, t in page_results if t)
 
-    extracted = total_pages - len(rejected_pages) - len(failed_pages)
-    stats = {
-        "total": total_pages,
-        "extracted": extracted,
-        "rejected": len(rejected_pages),
-        "failed": len(failed_pages),
-    }
-    summary = f"OCR complete — {extracted} extracted, {len(rejected_pages)} rejected as non-content, {len(failed_pages)} unreadable (of {total_pages} pages)."
+    extracted = total_pages - len(failed_pages)
+    summary = f"OCR complete — {extracted} extracted, {len(failed_pages)} unreadable (of {total_pages} pages)."
     logger.info(summary)
     await step_cb(24, summary)
-    return text, stats
+    return text
 
 
 def _split_into_sections(text: str, max_chars: int = 8000) -> list[str]:
@@ -604,13 +552,10 @@ class KnowledgeProcessingAgent:
             async def _ocr_step(progress: int, msg: str) -> None:
                 await _step(JobStatus.processing, progress, msg)
 
-            # OCR stats (total/extracted/rejected/failed); None when the DOCX text layer
-            # was used directly (no per-page vision, so no page-level classification).
-            ocr_stats: dict | None = None
             if "pdf" in mime:
                 # OCR every page (FORCE_OCR_ALL_PAGES) — this corpus is all scanned or
                 # Preeti-font, so the text layer is unusable. See `_ocr_pdf_bytes`.
-                raw_text, ocr_stats = await _ocr_pdf_bytes(file_bytes, _ocr_step)
+                raw_text = await _ocr_pdf_bytes(file_bytes, _ocr_step)
 
             elif "word" in mime or "docx" in mime or "msword" in mime:
                 # A Word document may be real Unicode OR legacy Preeti-encoded. Extract the
@@ -630,20 +575,11 @@ class KnowledgeProcessingAgent:
                     )
                     await _step(JobStatus.processing, 18, "Converting Word document to PDF for OCR…")
                     pdf_bytes = await asyncio.to_thread(_docx_to_pdf_bytes, file_bytes)
-                    raw_text, ocr_stats = await _ocr_pdf_bytes(pdf_bytes, _ocr_step)
+                    raw_text = await _ocr_pdf_bytes(pdf_bytes, _ocr_step)
             else:
                 raise RuntimeError(f"Unsupported file type for text extraction: {mime}")
 
             if not raw_text.strip():
-                # Distinguish "every page was non-content" from "OCR could not read the file"
-                # so the failed job carries an honest, actionable message.
-                if ocr_stats and ocr_stats["rejected"] and not ocr_stats["extracted"] and not ocr_stats["failed"]:
-                    raise RuntimeError(
-                        f"Every page ({ocr_stats['rejected']}/{ocr_stats['total']}) was classified as "
-                        "non-content (cover, table of contents, syllabus, preface or decoration), so "
-                        "there is no study material to ingest. Upload a document that contains actual "
-                        "topic content."
-                    )
                 raise RuntimeError(
                     "No text could be extracted from the document. "
                     "Check that the PDF is readable and not password-protected, "

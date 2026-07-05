@@ -239,7 +239,7 @@ already have explanations).
 
 **Pipeline:** Upload → store R2 → extract text (**OCR-ONLY: every PDF page is re-OCR'd by parallel
 Azure gpt-5 typed-vision** — NOT Gemini, which is handwriting-only; the SAME per-page call also
-**strips headers/footers/watermarks** and **rejects non-content pages**, see below) → semantic chunking (parallel,
+**strips headers/footers/watermarks**, see below) → semantic chunking (parallel,
 `get_provider("chunking")`, tier set by `CHUNKING_MODEL_TIER` .env — **default gpt-5**, or gpt-5-mini
 when `fast`) → embed (`text-embedding-3-large`, 3072d) → upsert Pinecone
 → metadata to PG. Chunking = meaningful semantic units (concepts, definitions, exam points), not blind
@@ -256,25 +256,18 @@ OCR is RETRIED (`VISION_OCR_ATTEMPTS=3`) and then SKIPPED (empty) — the pipeli
 the raw text layer or an LLM "Preeti decode" (both removed), because that would only poison the vector
 store. If every page fails (e.g. the deployment can't accept images → 404), the job fails honestly
 rather than ingesting nothing/garbage.
-**In-call decoration stripping + page rejection (NO extra AI cost — same single per-page vision call).**
-`VISION_EXTRACT_PROMPT` instructs the typed-vision model to (a) **remove running headers/footers, page
+**In-call decoration stripping (NO extra AI cost — same single per-page vision call).**
+`VISION_EXTRACT_PROMPT` instructs the typed-vision model to **remove running headers/footers, page
 numbers, watermarks and printed institute/website names** — the ONLY manipulation allowed; it never
-rewords/summarises/reorders/drops actual content — and (b) **first classify the page**: a page that is
-entirely front/back-matter or decoration (cover/title, copyright, dedication, preface/foreword/writer's
-or publisher's message, table of contents/index/विषय सूची, syllabus/exam-pattern/marking-scheme,
-blank/decorative, ads/about-the-author) is returned as the exact marker `NON_CONTENT_MARKER`
-(`[[NOT_KNOWLEDGE_CONTENT]]`) instead of text. The prompt biases STRONGLY toward keeping — it rejects
-only when the WHOLE page is non-content, keeps any page with real study content (including
-chapter-divider pages that also carry content and **in-book practice questions/model answers**), and
-draws the key line that a TOC/syllabus page LISTS topic names whereas a study page EXPLAINS them.
-`_is_non_content()` detects the marker (tolerant of surrounding whitespace/quotes/backticks/emphasis,
-whole-response match only) and the page is dropped BEFORE chunking — a deliberate **reject** (no retry),
-distinct from an OCR **failure** (retried). `_ocr_pdf_bytes` returns `(text, stats)` with
-`{total, extracted, rejected, failed}`, logs+emits a one-line summary to the Processing Logs, and the
-empty-document guard uses it to distinguish **"every page was non-content"** (upload has no study
-material) from **"OCR could not read the file"** — both fail the job honestly with an accurate message.
-(The valid-Unicode DOCX branch uses its text layer directly and is NOT page-classified — acceptable
-since the corpus is overwhelmingly scanned/Preeti.)
+rewords/summarises/reorders/drops actual content, and it **never rejects/classifies a page**. Page
+selection is left to the admin: to exclude non-content front-matter (cover, table of contents,
+syllabus, preface/writer's message, etc.), the admin simply splits/removes those initial pages from the
+PDF before uploading. This keeps ingestion **predictable** — every page the admin uploads is
+transcribed verbatim (minus decoration); the OCR agent was deliberately NOT given page-rejection power,
+because that judgement is error-prone (it wrongly dropped real content pages) and non-deterministic. A
+page that OCR cannot read after `VISION_OCR_ATTEMPTS=3` is SKIPPED (empty), never backfilled with the
+raw text layer / a Preeti decode. `_ocr_pdf_bytes` returns the concatenated text and logs+emits a
+one-line `N extracted, F unreadable (of T pages)` summary to the Processing Logs.
 **DOCX handling (both Unicode and Preeti):** the `.docx` text is extracted and classified the same way
 — `valid_unicode` → used directly; anything else (Preeti/legacy/empty/broken) → the DOCX is converted
 to PDF via **headless LibreOffice** (`_docx_to_pdf_bytes`, `soffice --headless --convert-to pdf`,
@@ -1014,8 +1007,11 @@ Both **read-only aggregation** (no new tables/migration) — query existing MCQ/
 tables. All endpoints `require_admin`.
 - **Dashboard** (`dashboard/service.py` + `router.py`): `GET /api/admin/dashboard/stats` returns
   headline counts (students, **active students**, knowledge docs, approved MCQs, active MCQ sets,
-  subjective tests, videos, pending/failed jobs) **plus** a `recent_activity` feed from the latest
-  `processing_jobs` (job type → friendly `{type, title, status, created_at}`). Counts guarded
+  subjective tests, videos, pending jobs) **plus** a `recent_activity` feed from the latest
+  `processing_jobs` (job type → friendly `{type, title, status, created_at}`). **Failed-job state is
+  intentionally NOT surfaced on the dashboard** — there is no failed-jobs count, and the
+  `recent_activity` feed excludes `failed` jobs (a failed job listed without its status would read as
+  a success). Job-log rows can be wiped with `python -m scripts.wipe_jobs` (see §26). Counts guarded
   (`_safe_scalar`) so a partial migration degrades to 0, not 500. (Endpoint moved here from
   `users/router.py`; old copy had a stale `video_tutor.models` import that zeroed the video count —
   now uses `app.modules.video.models`.)
@@ -1052,7 +1048,8 @@ exam's content + external files/vectors — see §7). **Students** page = create
 exam enrollment** per student.
 
 **Dashboard cards:** Total Students, Active Students, Knowledge Documents, Total MCQs, Active MCQ Sets,
-Subjective Tests, Videos, Pending Jobs, Failed Jobs. Recent activity feed.
+Subjective Tests, Videos, Pending Jobs. Recent activity feed. (No failed-jobs card — failed-job state
+is intentionally not shown on the dashboard, §15.)
 
 **Syllabus:** tabs Objective + Subjective. Fully editable — add/rename/delete chapters/topics/subtopics inline.
 **Knowledge Layer tabs:** Upload Knowledge | Processed Knowledge | Processing Logs
@@ -1174,6 +1171,19 @@ actively running them, and a fresh worker can't tell "my orphan" from "someone e
 by the heartbeat. A crash-orphaned job whose heartbeat is still recent is left for the reaper to catch
 once it goes stale. `_already_terminal` in `run_task` skips any redelivered task whose job is now
 `completed`/`failed`/`cancelled` (Celery *retries* stay in `retrying`, unaffected).
+
+### Admin manual job delete (`DELETE /api/admin/jobs/{job_id}`)
+The task timeout is deliberately a hard ceiling, not an auto-retry loop — a job that will never recover
+should not be retried forever. So beyond the automatic reaper, the admin has a **manual override**:
+`jobs/router.delete_job` → `jobs/service.delete_job` best-effort **revokes** the Celery task
+(`terminate=True`; on the Windows solo pool a running task can't be signal-killed, but a not-yet-started
+queued task is prevented from running), **deletes the job-log row** (every `*_job_id` FK is `ON DELETE
+SET NULL`, so no real content is removed — same guarantee as `scripts.wipe_jobs`), then inline-calls
+`jobs/service.reconcile_orphaned_entities` (the SAME reconcilers the reaper runs —
+`fail_orphaned_sheets_and_tests` + `fail_orphaned_videos` + `fail_orphaned_knowledge_documents` +
+`fail_orphaned_mcq_documents`) so the now-orphaned document/sheet/test/video flips out of its in-progress
+status to `failed` immediately (retry/re-upload offered) instead of waiting up to ~2 min for the next
+beat tick. Surfaced in the admin **Knowledge → Processing Logs** tab as a per-row Delete button.
 
 ### Retry idempotency (per-task)
 A Celery `self.retry` re-runs `work()` from the top, so insert-only pipelines must replace prior partial
@@ -1424,6 +1434,7 @@ POST   /api/admin/skills/chat/start
 POST   /api/admin/skills/chat/{id}/message
 POST   /api/admin/skills/chat/{id}/approve
 GET    /api/jobs/{job_id}
+DELETE /api/admin/jobs/{job_id}          → admin force-delete a stuck job (revoke + reconcile dependents)
 GET    /api/admin/dashboard/stats
 GET    /api/admin/analytics/mcq/overview
 GET    /api/admin/analytics/subjective/overview
@@ -1594,7 +1605,7 @@ GEMINI_REQUEST_TIMEOUT_SECONDS=180    # per Gemini vision call
 AI_MAX_RETRIES=3                      # transient-error retries per AI call
 GEMINI_RATE_LIMIT_RETRY_SECONDS=60    # free-tier limit is per-minute → wait a full minute on 429
 GEMINI_RATE_LIMIT_MAX_RETRIES=3       # how many 60s waits before giving up
-TASK_TIMEOUT_SECONDS=1800             # hard ceiling for a single Celery job
+TASK_TIMEOUT_SECONDS=7200             # hard ceiling for a single Celery job (2h; large 1000-page books)
 
 # ── URLs ───────────────────────────────────────────────────────────────────
 FRONTEND_URL=http://localhost:5173
@@ -1679,4 +1690,10 @@ celery -A workers.celery_app.celery_app beat -l info
 uvicorn app.main:app --reload --port 8000
 alembic upgrade head
 pip install -r requirements.txt
+
+# Wipe processing-job log rows (failed noise + stuck pending). Run from backend/.
+# Tables referencing a job use ON DELETE SET NULL, so no real content is removed.
+python -m scripts.wipe_jobs            # failed + stuck (everything NOT completed)
+python -m scripts.wipe_jobs --all      # ALL jobs, including completed history
+python -m scripts.wipe_jobs --failed   # only failed jobs
 ```

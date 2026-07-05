@@ -406,15 +406,36 @@ function LogsTab() {
     error_message: string | null; created_at: string;
   }>>([]);
   const [loading, setLoading] = useState(true);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  useEffect(() => {
+  const load = () => {
     import("../../services/api").then(({ default: api }) => {
       api.get("/api/admin/jobs/knowledge")
         .then((r) => setJobs(r.data))
         .catch(() => {})
         .finally(() => setLoading(false));
     });
-  }, []);
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const handleDelete = async (id: string) => {
+    if (!confirm(
+      "Delete this job? Use this only for a job you believe is stuck. The worker task " +
+      "is cancelled and the job removed; if content was mid-processing it will be marked " +
+      "failed so you can retry it. No finished content is lost."
+    )) return;
+    setDeletingId(id);
+    try {
+      const { default: api } = await import("../../services/api");
+      await api.delete(`/api/admin/jobs/${id}`);
+      load();
+    } catch {
+      alert("Could not delete the job. Please try again.");
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   if (loading) return <p className="text-sm text-gray-400">Loading…</p>;
 
@@ -435,6 +456,7 @@ function LogsTab() {
             <th className="px-4 py-3 text-left">Progress</th>
             <th className="px-4 py-3 text-left">Step</th>
             <th className="px-4 py-3 text-left">Created</th>
+            <th className="px-4 py-3 text-right">Actions</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-gray-50">
@@ -449,6 +471,15 @@ function LogsTab() {
               <td className="px-4 py-3 text-gray-700">{job.progress_percent}%</td>
               <td className="px-4 py-3 text-gray-500 max-w-xs truncate">{job.current_step ?? "—"}</td>
               <td className="px-4 py-3 text-gray-400">{new Date(job.created_at).toLocaleString()}</td>
+              <td className="px-4 py-3 text-right">
+                <button
+                  onClick={() => handleDelete(job.id)}
+                  disabled={deletingId === job.id}
+                  className="rounded-lg px-2 py-1 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50"
+                >
+                  {deletingId === job.id ? "Deleting…" : "Delete"}
+                </button>
+              </td>
             </tr>
           ))}
         </tbody>

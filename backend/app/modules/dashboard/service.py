@@ -62,12 +62,6 @@ async def get_stats(db: AsyncSession) -> dict:
             ProcessingJob.status.in_([JobStatus.queued, JobStatus.processing, JobStatus.retrying])
         ),
     )
-    failed_jobs = await _safe_scalar(
-        db,
-        select(func.count()).select_from(ProcessingJob).where(
-            ProcessingJob.status == JobStatus.failed
-        ),
-    )
     knowledge = await _safe_scalar(db, select(func.count()).select_from(KnowledgeDocument))
     approved_mcqs = await _safe_scalar(
         db, select(func.count()).select_from(MCQQuestion).where(MCQQuestion.status == "approved")
@@ -87,16 +81,19 @@ async def get_stats(db: AsyncSession) -> dict:
         "total_subjective_tests": subjective,
         "total_videos": videos,
         "pending_jobs": pending_jobs,
-        "failed_jobs": failed_jobs,
         "recent_activity": await _recent_activity(db),
     }
 
 
 async def _recent_activity(db: AsyncSession, limit: int = 12) -> list[dict]:
-    """Most recent processing jobs as a friendly activity feed."""
+    """Most recent processing jobs as a friendly activity feed.
+
+    Failed jobs are excluded — the dashboard never surfaces failed-job state (a failed
+    job listed here without its status would read as a successful activity)."""
     try:
         r = await db.execute(
             select(ProcessingJob.job_type, ProcessingJob.status, ProcessingJob.created_at)
+            .where(ProcessingJob.status != JobStatus.failed)
             .order_by(ProcessingJob.created_at.desc())
             .limit(limit)
         )

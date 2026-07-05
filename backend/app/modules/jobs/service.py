@@ -155,6 +155,48 @@ async def reap_stale_jobs(db: AsyncSession, *, task_timeout_seconds: int) -> int
     return len(stale)
 
 
+async def delete_job(db: AsyncSession, job: ProcessingJob) -> None:
+    """Admin force-delete of a single job the admin considers stuck.
+
+    Best-effort revokes the Celery task first (terminate=True) so a worker that is
+    still churning on a genuinely wedged task stops wasting resources — on the Windows
+    solo pool a terminate can't interrupt a running task (no signals), but it still
+    prevents a not-yet-started queued task from running. Then the job row is deleted.
+    Tables that point at a job (`*_job_id`) use ON DELETE SET NULL, so no real content
+    is removed — only the job-log row (same guarantee as `scripts.wipe_jobs`). The
+    caller reconciles the now-orphaned dependent entities so their UI leaves the
+    spinner (see `reconcile_orphaned_entities`)."""
+    if job.celery_task_id:
+        try:
+            from app.core.celery_client import get_celery
+
+            get_celery().control.revoke(job.celery_task_id, terminate=True, signal="SIGTERM")
+        except Exception:
+            # Revoke is best-effort; the delete + 2h wait_for + reaper still bound the task.
+            pass
+    await db.delete(job)
+    await db.commit()
+
+
+async def reconcile_orphaned_entities(db: AsyncSession) -> int:
+    """Flip any in-progress entity whose job is now gone/dead to `failed` (or, for a
+    `feedback_ready` sheet, `checked`) so its UI stops spinning — the same reconcile the
+    periodic reaper runs, invoked inline right after a manual `delete_job` so the effect
+    is immediate instead of waiting up to ~2 min for the next beat tick. Best-effort:
+    a failure here never blocks the delete. Returns the number reconciled."""
+    from app.modules.knowledge.service import fail_orphaned_knowledge_documents
+    from app.modules.mcq.service import fail_orphaned_mcq_documents
+    from app.modules.subjective.service import fail_orphaned_sheets_and_tests
+    from app.modules.video.service import fail_orphaned_videos
+
+    return (
+        await fail_orphaned_sheets_and_tests(db)
+        + await fail_orphaned_videos(db)
+        + await fail_orphaned_knowledge_documents(db)
+        + await fail_orphaned_mcq_documents(db)
+    )
+
+
 async def has_live_job_for_document(db: AsyncSession, document_id: uuid.UUID) -> bool:
     """True if a still-live job (queued/processing/retrying) references this document.
 

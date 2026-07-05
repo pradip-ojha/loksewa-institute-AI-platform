@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     # full minute before retrying (a short exponential backoff would just hit it again).
     GEMINI_RATE_LIMIT_RETRY_SECONDS: int = 60
     GEMINI_RATE_LIMIT_MAX_RETRIES: int = 3
-    TASK_TIMEOUT_SECONDS: int = 1800         # hard ceiling for a single Celery job
+    TASK_TIMEOUT_SECONDS: int = 7200         # hard ceiling for a single Celery job (2h; large 1000-page books can take a while)
 
     # URLs
     FRONTEND_URL: str = "http://localhost:5173"

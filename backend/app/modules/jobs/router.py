@@ -9,7 +9,11 @@ from app.core.database import get_db
 from app.core.exceptions import AppException
 from app.modules.jobs.models import ProcessingJob
 from app.modules.jobs.schemas import JobOut
-from app.modules.jobs.service import create_job
+from app.modules.jobs.service import (
+    create_job,
+    delete_job as delete_job_service,
+    reconcile_orphaned_entities,
+)
 from app.modules.users.models import User, UserRole
 
 router = APIRouter(tags=["jobs"])
@@ -30,6 +34,32 @@ async def get_job(
     if current_user.role != UserRole.institute_admin and job.created_by != current_user.id:
         raise AppException(404, "not_found", "Job not found.")
     return JobOut.model_validate(job)
+
+
+@router.delete("/admin/jobs/{job_id}", status_code=200)
+async def delete_job(
+    job_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Admin force-delete of a job the admin considers stuck.
+
+    Best-effort revokes the Celery task, deletes the job-log row (FKs are ON DELETE
+    SET NULL, so no real content is removed), then reconciles any now-orphaned
+    dependent entity (knowledge/MCQ document, answer sheet, subjective test, video)
+    to `failed` so its UI leaves the spinner and offers retry/re-upload."""
+    result = await db.execute(select(ProcessingJob).where(ProcessingJob.id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise AppException(404, "not_found", "Job not found.")
+
+    await delete_job_service(db, job)
+    try:
+        reconciled = await reconcile_orphaned_entities(db)
+    except Exception:
+        # Reconcile is best-effort; the periodic reaper will catch anything missed.
+        reconciled = 0
+    return {"deleted": True, "reconciled": reconciled}
 
 
 @router.post("/admin/jobs/test", response_model=JobOut, status_code=202)

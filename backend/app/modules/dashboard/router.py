@@ -28,7 +28,6 @@ class DashboardStats(BaseModel):
     total_subjective_tests: int
     total_videos: int
     pending_jobs: int
-    failed_jobs: int
     recent_activity: list[ActivityItem]
 
 
