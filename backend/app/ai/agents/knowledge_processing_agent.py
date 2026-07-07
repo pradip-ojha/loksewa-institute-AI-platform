@@ -140,38 +140,56 @@ Context:
 - Custom instruction: {custom_instruction}
 
 OFFICIAL SYLLABUS TREE (chapter → topic → subtopic) — the ONLY valid labels. The source material may
-use different chapter/topic names or a different ordering than the official syllabus; you MUST map
-each chunk to the OFFICIAL strings below, copied EXACTLY — never the book's own chapter/topic names:
+use different chapter/topic names or a different ordering than the official syllabus; use its own
+headings/numbering as EVIDENCE together with the content, but always OUTPUT exact official strings from
+the tree below — never the source's own names as the output label:
 {syllabus_tree}
 
 {mapping_block}
 
-Return a JSON object with a single key "chunks" whose value is an array. Each item must have:
-  "content"      : the chunk text (string)
-  "content_type" : one of [concept_explanation, definition, example, exam_point, procedure, comparison, list_items, summary]
-  "chapter"      : exact CHAPTER string from the tree above, or null
-  "topic"        : exact TOPIC string from the tree above, or null
-  "subtopic"     : exact SUBTOPIC string from the tree above, or null
-  "language"     : "english" | "nepali" | "nepali_english_mixed"
+Return a JSON object with these keys, in this order:
+  "section_analysis" : {{"form": "detailed" | "mixed", "chapters_involved": [exact CHAPTER strings from the tree]}}
+  "chunks"           : an array where each item has:
+    "content"      : the chunk text (string)
+    "content_type" : one of [concept_explanation, definition, example, exam_point, procedure, comparison, list_items, summary]
+    "chapter"      : exact CHAPTER string from the tree above, or null
+    "topic"        : exact TOPIC string from the tree above, or null
+    "subtopic"     : exact SUBTOPIC string from the tree above, or null
+    "language"     : "english" | "nepali" | "nepali_english_mixed"
 
 Example format:
-{{"chunks": [{{"content": "...", "content_type": "definition", "chapter": "...", "topic": "...", "subtopic": null, "language": "nepali"}}]}}
+{{"section_analysis": {{"form": "detailed", "chapters_involved": ["..."]}}, "chunks": [{{"content": "...", "content_type": "definition", "chapter": "...", "topic": "...", "subtopic": null, "language": "nepali"}}]}}
 
 TEXT TO CHUNK:
 {text}
 """
 
 # The mapping-rules block injected into CHUNK_PROMPT differs by ingest mode (CLAUDE.md §8):
-# whole-book (no admin chapter) → the model classifies each chunk's chapter from the full tree;
+# whole-book (no admin chapter) → the model analyses the whole section first (form + chapters
+# involved), then maps each chunk top-down (detailed) or bounded-independent (mixed);
 # single-chapter (admin picked a chapter) → the chapter is fixed and only topic/subtopic vary.
-MAPPING_BLOCK_WHOLE_BOOK = """MAPPING RULES (this document spans MULTIPLE chapters — classify EACH chunk independently):
-- For every chunk pick, in order, the CHAPTER, then a TOPIC within that chapter, then a SUBTOPIC
-  within that topic — using ONLY exact strings from the tree above.
-- A chunk's real subject decides its official chapter, NOT where it sat in the source book.
-- If a chunk fits no official chapter/topic, set chapter, topic AND subtopic all to null.
-- Never invent labels that are not in the tree above."""
+MAPPING_BLOCK_WHOLE_BOOK = """MAPPING RULES — analyse the whole section FIRST, then map each chunk:
+
+STEP 1 — SECTION ANALYSIS (decide this before any chunk, and output it first):
+- "chapters_involved": the OFFICIAL chapter(s) this section covers — usually ONE, at most a few. Use BOTH
+  the section's own headings/numbering AND its content as evidence, but list only exact CHAPTER strings
+  from the tree above.
+- "form":
+    "detailed" = it explains a few subjects in depth (long paragraphs/answers) — one section cannot hold a
+                 whole chapter, so it is 1–2 chapters.
+    "mixed"    = it is a list of many short items spanning different subjects.
+
+STEP 2 — PER-CHUNK MAPPING:
+- If form is "detailed": give EVERY chunk one of the chapters from chapters_involved (default to the main
+  one; switch only where a chunk clearly starts another identified chapter). Then pick a TOPIC (and its
+  SUBTOPIC) within that chapter. If no topic fits, KEEP the chapter and set topic/subtopic null.
+- If form is "mixed": classify each chunk on its own, but ONLY among the chapters in chapters_involved;
+  then pick TOPIC/SUBTOPIC within it. If a chunk fits none of them, set chapter/topic/subtopic null.
+- Always copy exact strings from the tree; never invent labels."""
 
 MAPPING_BLOCK_LOCKED = """MAPPING RULES (this whole document belongs to CHAPTER: {chapter}):
+- SECTION ANALYSIS (output it first): set "chapters_involved" to exactly ["{chapter}"] and "form" to
+  "detailed" or "mixed" as best describes the section.
 - The chapter is FIXED — set every chunk's "chapter" to exactly "{chapter}".
 - Choose only the TOPIC (and its SUBTOPIC) within that chapter, using exact strings from the tree.
 - If a chunk matches no listed topic, set topic and subtopic to null (chapter stays "{chapter}").
@@ -205,22 +223,25 @@ Context:
 - Custom instruction: {custom_instruction}
 
 OFFICIAL SYLLABUS TREE (chapter → topic → subtopic) — the ONLY valid labels. The paper may use
-different chapter/topic names or ordering than the official syllabus; you MUST map each pair to the
-OFFICIAL strings below, copied EXACTLY — never the paper's own names:
+different chapter/topic names or ordering than the official syllabus; use its own headings/numbering as
+EVIDENCE together with the content, but always OUTPUT exact official strings from the tree below —
+never the paper's own names as the output label:
 {syllabus_tree}
 
 {mapping_block}
 
-Return a JSON object with a single key "pairs" whose value is an array. Each item must have:
-  "question"  : the question text (string)
-  "answer"    : the full model answer text (string)
-  "chapter"   : exact CHAPTER string from the tree above, or null
-  "topic"     : exact TOPIC string from the tree above, or null
-  "subtopic"  : exact SUBTOPIC string from the tree above, or null
-  "language"  : "english" | "nepali" | "nepali_english_mixed"
+Return a JSON object with these keys, in this order:
+  "section_analysis" : {{"form": "detailed" | "mixed", "chapters_involved": [exact CHAPTER strings from the tree]}}
+  "pairs"            : an array where each item has:
+    "question"  : the question text (string)
+    "answer"    : the full model answer text (string)
+    "chapter"   : exact CHAPTER string from the tree above, or null
+    "topic"     : exact TOPIC string from the tree above, or null
+    "subtopic"  : exact SUBTOPIC string from the tree above, or null
+    "language"  : "english" | "nepali" | "nepali_english_mixed"
 
 Example format:
-{{"pairs": [{{"question": "...", "answer": "...", "chapter": "...", "topic": "...", "subtopic": null, "language": "nepali"}}]}}
+{{"section_analysis": {{"form": "detailed", "chapters_involved": ["..."]}}, "pairs": [{{"question": "...", "answer": "...", "chapter": "...", "topic": "...", "subtopic": null, "language": "nepali"}}]}}
 
 TEXT TO EXTRACT PAIRS FROM:
 {text}
@@ -802,7 +823,7 @@ class KnowledgeProcessingAgent:
                         text=section,
                     )
                     try:
-                        result_json = await provider.generate_text(prompt, schema={"type": "array"})
+                        result_json = await provider.generate_text(prompt, schema={"type": "object"})
                     except Exception as exc:
                         logger.warning("AI chunking failed for section %d: %s", i, exc)
                         # Keep the section as one un-mapped chunk; the validation pass below
@@ -815,12 +836,27 @@ class KnowledgeProcessingAgent:
                             "subtopic": doc_subtopic or None,
                             "language": "nepali_english_mixed",
                         }]
-                    if isinstance(result_json, list):
-                        return result_json
+                    # [DEBUG] Stage 4 — raw model output for THIS section (includes the
+                    # leading `section_analysis` with `form`/`chapters_involved` and every
+                    # chunk's assigned chapter/topic before syllabus validation).
+                    _debug_dump(
+                        document_id,
+                        f"03_extract_section_{i:02d}_raw.json",
+                        json.dumps(result_json, ensure_ascii=False, indent=2),
+                    )
+                    # Preferred shape: {"section_analysis": {...}, "chunks": [...]}. Fall back to
+                    # a bare array or any dict-with-list-value so a model that omits the wrapper
+                    # (or emits the old shape) still works.
                     if isinstance(result_json, dict):
+                        chunks = result_json.get("chunks")
+                        if isinstance(chunks, list):
+                            return chunks
                         for val in result_json.values():
                             if isinstance(val, list):
                                 return val
+                        return []
+                    if isinstance(result_json, list):
+                        return result_json
                     return []
 
             # `model_qa` documents (question papers with model answers) are extracted as

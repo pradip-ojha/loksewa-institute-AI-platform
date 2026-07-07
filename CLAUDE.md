@@ -301,25 +301,35 @@ LibreOffice or re-upload as PDF" message (Unicode DOCX still works without it). 
 is `_ocr_pdf_bytes(file_bytes, step_cb)`, used by both the PDF path and the converted-DOCX path.
 
 **CHAPTER IS THE PRIMARY RETRIEVAL DIMENSION (topic/subtopic are secondary within it), and is mapped
-PER CHUNK to the OFFICIAL syllabus — not taken from the book's own chapter/topic names.** Admins upload
-whole books / full note sets spanning many chapters, and a book's own layout often differs from the
-official syllabus (the same topic can sit in a different chapter). So every chunk is classified to the
-exact official `chapter → topic → subtopic` strings for the exam. **Two ingest modes** (LOAD phase
-calls `video.service.get_chapter_tree(exam_id, chapter=doc_chapter or None)`):
-- **Whole-book (no admin chapter):** the chunker is fed the FULL exam tree and maps EACH chunk to a
-  chapter+topic+subtopic independently (a multi-chapter book is filed across its real chapters, never
-  all under one/blank chapter).
+PER CHUNK to the OFFICIAL syllabus — the source's own headings/numbering are used as EVIDENCE, but the
+OUTPUT label is always an exact official-tree string.** Admins upload whole books / full note sets
+spanning many chapters, and a book's own layout often differs from the official syllabus (the same topic
+can sit in a different chapter). So every chunk is classified to the exact official
+`chapter → topic → subtopic` strings for the exam. **Two ingest modes** (LOAD phase calls
+`video.service.get_chapter_tree(exam_id, chapter=doc_chapter or None)`):
+- **Whole-book (no admin chapter) — SECTION-ANALYSIS-FIRST, adaptive:** each section's extraction call
+  emits a `section_analysis` object FIRST (`{form, chapters_involved}`), THEN the chunks — so every chunk
+  is generated already conditioned on the committed chapter decision (≈ two-call reliability at one-call
+  cost; no separate agent). The model self-detects the section's **form**: `detailed` (a few subjects in
+  depth → a section is only 1–2 chapters → **top-down**: every chunk inherits one of the section's
+  chapters, switching only where a chunk clearly opens another; chapter is KEPT even when no topic fits)
+  vs `mixed` (many short items across subjects → **bounded-independent**: each chunk classified on its
+  own but ONLY among the `chapters_involved`, never the whole tree). This replaces the old blind
+  per-chunk-over-the-full-tree mapping (which keyword-jumped across chapters and nulled chapter+topic
+  together on a miss).
 - **Single-chapter (admin picked a chapter):** the tree is scoped to that chapter, the chapter is
-  LOCKED onto every chunk, and only topic/subtopic vary within it (no cross-chapter leakage).
+  LOCKED onto every chunk, and only topic/subtopic vary within it (no cross-chapter leakage). The call
+  still emits `section_analysis` (chapters_involved = the locked chapter) for a uniform output shape.
 
 After chunking, each chunk's `(chapter, topic, subtopic)` is validated by the shared
 `video.service.resolve_syllabus_labels` (mirrors `tutor/service.py::_validate`): topic/subtopic must be
 exact tree strings, and **chapter is resolved deterministically from the validated topic via
-`topic_to_chapter`** — never trusted raw from the model (locked mode forces `doc_chapter`). A chunk that
-matches no official chapter/topic keeps **null** chapter/topic (still embedded + retrievable in broad
-queries, never mis-filed). Retrieval (`_fetch_knowledge_by_type` for MCQ gen/regeneration) filters by
-`chapter` FIRST — topic/subtopic only narrow within it, and with no topic match the chapter's chunks
-still return.
+`topic_to_chapter`; if no topic resolves, a model-given chapter that is a valid tree chapter STILL
+stands** (so a top-down section chapter survives a null-topic chunk) — never invented raw (locked mode
+forces `doc_chapter`). A chunk that matches no official chapter/topic at all keeps **null** chapter/topic
+(still embedded + retrievable in broad queries, never mis-filed). Retrieval (`_fetch_knowledge_by_type`
+for MCQ gen/regeneration) filters by `chapter` FIRST — topic/subtopic only narrow within it, and with no
+topic match the chapter's chunks still return.
 
 **Chunk metadata:**
 ```json
