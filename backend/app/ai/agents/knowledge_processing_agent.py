@@ -26,6 +26,30 @@ from app.modules.exams.models import Exam
 
 logger = logging.getLogger(__name__)
 
+# ── TEMPORARY DEBUG INSTRUMENTATION ────────────────────────────────────────
+# Dumps each stage of knowledge ingestion (raw OCR text, section boundaries,
+# raw AI extraction JSON, final chunks) to files so a bad model_qa run can be
+# inspected step-by-step. Enable by setting KNOWLEDGE_DEBUG_DUMP=1 in backend/.env
+# (read via Settings, since pydantic-settings loads .env into the config object,
+# NOT into os.environ); files land under backend/debug_dumps/<document_id>/.
+# REMOVE THIS BLOCK (and its call sites) once the model_qa issue is diagnosed.
+_DEBUG_DIR = Path(__file__).resolve().parents[3] / "debug_dumps"
+
+
+def _debug_dump(document_id: str, filename: str, content: str) -> None:
+    """Best-effort write of a pipeline-stage artifact for debugging. Never raises."""
+    from app.core.config import get_settings
+
+    if not get_settings().KNOWLEDGE_DEBUG_DUMP:
+        return
+    try:
+        out_dir = _DEBUG_DIR / str(document_id)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / filename).write_text(content, encoding="utf-8")
+        logger.info("[DEBUG DUMP] wrote %s", out_dir / filename)
+    except Exception as exc:  # pragma: no cover - debug only
+        logger.warning("[DEBUG DUMP] failed to write %s: %s", filename, exc)
+
 # Connection-level errors that mean "the DB connection died" rather than "the SQL
 # was wrong". On a flaky network a pooled asyncpg connection can be dropped by the
 # server (Neon) *mid-query* — pool_pre_ping only validates on checkout, so it
@@ -82,21 +106,16 @@ async def _db_op_with_retry(op, *, attempts: int = 4, label: str = "db op"):
 # the vector store. The pipeline is now OCR-only: Preeti/scanned content is read from the
 # rendered image (PDFs directly; DOCX after a LibreOffice DOCX→PDF conversion).
 
-VISION_EXTRACT_PROMPT = """You are reading one page of a Nepali Loksewa/banking notes or textbook that is being ingested into a study-knowledge base. Extract every word of study content on the page. Return clean, readable text only — no commentary, no explanations.
+VISION_EXTRACT_PROMPT = """You are a text-transcription (OCR) engine. Transcribe the text in this image EXACTLY as printed.
 
-Formatting rules:
-- Nepali text → proper Unicode Devanagari (e.g. नेपाल, विकास, बैंकिङ). Never return Romanised transliteration or ASCII encodings.
-- English text → exactly as shown on the page.
-- Mixed Nepali-English → preserve both scripts as they appear.
-- Headings → output on their own line, followed by a blank line.
-- Numbered lists → preserve numbers exactly (1. 2. 3. or १. २. ३.).
-- Bullet lists → preserve bullets (•, -, or ▪).
-- Paragraphs → separate with a blank line.
-- Tables → output row by row, columns separated by |.
-- DECORATION — remove running headers and footers (the book title or chapter title repeated across the top or bottom of the page), page numbers, watermarks, and printed institute or website names. This decoration removal is the ONLY change you may make: never reword, summarise, translate, reorder, or drop any actual content.
-- If a word is partially illegible → write your best guess, do not skip.
+- Output the exact text, character for character, in natural reading order (top to bottom).
+- Do NOT interpret, explain, summarise, rephrase, translate, reorder, correct, or complete anything. Do NOT add any word that is not printed and do NOT drop any word that is printed. Use only what you can see — never your own knowledge.
+- Nepali → Unicode Devanagari exactly as written (never Romanised). English → exactly as written. Keep all numbers, symbols and English terms exactly as shown (e.g. १/२/३ or 1/2/3 as printed).
+- Preserve the printed line breaks, paragraphs, headings, numbering and bullets as they appear.
+- If a character or word is genuinely unreadable, write [?] in its place — never guess it from meaning.
+- The ONLY thing you may leave out: running page headers/footers, page numbers and watermarks. Transcribe everything else verbatim.
 
-Return only the extracted text."""
+Output only the transcribed text, nothing else."""
 
 CHUNK_PROMPT = EXAM_CONTEXT + """
 
@@ -279,28 +298,114 @@ def _extract_pdf_pages_text(data: bytes) -> list[str]:
     return texts
 
 
-def _render_page_jpeg(data: bytes, page_index: int, dpi: int = 250) -> bytes:
-    """Render a single PDF page to JPEG bytes at the given DPI."""
-    import fitz
-    doc = fitz.open(stream=data, filetype="pdf")
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    pix = doc[page_index].get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-    jpeg = pix.tobytes("jpeg")
-    doc.close()
-    return jpeg
+# ── Column-aware page rendering (OCR fidelity) ──────────────────────────────────
+# Vision OCR reads a full page at a fixed resolution budget (~768px on the short side),
+# so a dense two-column Nepali page leaves too few pixels per glyph and the model starts
+# guessing. We therefore split each page at its central whitespace gutter and OCR each
+# column separately (≈2× pixels/glyph, and correct left→right reading order). Single-column
+# pages have no gutter → rendered whole (never split mid-line).
+
+# Fraction of page width searched for the gutter (a two-column layout gutters near centre).
+_GUTTER_BAND = (0.40, 0.60)
+# A column x is a gutter only if it is ink-free over at least this fraction of the page
+# height (below 1.0 so a full-width running header/footer band does not disqualify it)…
+_GUTTER_MIN_CLEAR_ROWS = 0.85
+# …and each side must carry at least this fraction of the page's total ink (real content
+# on BOTH sides — guards against splitting an off-centre single column).
+_GUTTER_MIN_SIDE_INK = 0.15
 
 
-def _render_pages_jpeg(data: bytes, page_indices: list[int], dpi: int = 250) -> dict[int, bytes]:
-    """Open PDF once and render all requested pages. Returns {page_index: jpeg_bytes}."""
+def _detect_column_gutter(page, analysis_dpi: int = 120) -> float | None:
+    """Return the x of a clean vertical column gutter as a fraction of page width, or None.
+
+    Renders the page to a cheap grayscale raster, thresholds it to an ink mask, and looks in
+    the central band for a column that is ink-free down (almost) the whole height with real
+    content on both sides. Deterministic; works for vector and scanned pages alike.
+    """
+    import fitz
+    import cv2
+    import numpy as np
+
+    try:
+        mat = fitz.Matrix(analysis_dpi / 72, analysis_dpi / 72)
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+        # Ink = dark pixels. Otsu picks the page-specific text/background split.
+        _, ink = cv2.threshold(img, 0, 1, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+        h, w = ink.shape
+        if w < 40 or h < 40:
+            return None
+
+        total_ink = int(ink.sum())
+        if total_ink <= 0:
+            return None
+
+        col_ink = ink.sum(axis=0)                       # ink pixels per column x
+        clear_rows_frac = 1.0 - (col_ink / float(h))    # fraction of rows empty at each x
+
+        x0 = int(w * _GUTTER_BAND[0])
+        x1 = int(w * _GUTTER_BAND[1])
+        if x1 <= x0:
+            return None
+        band = clear_rows_frac[x0:x1]
+        best_local = int(band.argmax())
+        best_x = x0 + best_local
+        if clear_rows_frac[best_x] < _GUTTER_MIN_CLEAR_ROWS:
+            return None
+
+        left_ink = int(ink[:, :best_x].sum())
+        right_ink = int(ink[:, best_x:].sum())
+        if left_ink < total_ink * _GUTTER_MIN_SIDE_INK:
+            return None
+        if right_ink < total_ink * _GUTTER_MIN_SIDE_INK:
+            return None
+
+        return best_x / float(w)
+    except Exception as exc:  # never let detection break ingestion — fall back to whole page
+        logger.warning("column-gutter detection failed (using whole page): %s", exc)
+        return None
+
+
+def _render_page_regions(data: bytes, page_index: int, dpi: int = 300) -> list[bytes]:
+    """Render one PDF page to high-fidelity PNG region(s) in reading order.
+
+    Two-column page → [left_png, right_png] split exactly on the empty gutter (no glyph cut,
+    no overlap, no duplication). Single-column page → [whole_page_png]. PNG is lossless so
+    thin Devanagari strokes are not smeared by JPEG compression.
+    """
     import fitz
     doc = fitz.open(stream=data, filetype="pdf")
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    out: dict[int, bytes] = {}
+    try:
+        page = doc[page_index]
+        rect = page.rect
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        gutter = _detect_column_gutter(page)
+        if gutter is None:
+            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+            return [pix.tobytes("png")]
+        gx = rect.width * gutter
+        clips = [
+            fitz.Rect(rect.x0, rect.y0, rect.x0 + gx, rect.y1),   # left column
+            fitz.Rect(rect.x0 + gx, rect.y0, rect.x1, rect.y1),   # right column
+        ]
+        out: list[bytes] = []
+        for clip in clips:
+            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, clip=clip)
+            out.append(pix.tobytes("png"))
+        return out
+    finally:
+        doc.close()
+
+
+def _render_all_regions(data: bytes, page_indices: list[int], dpi: int = 300) -> list[tuple[int, int, bytes]]:
+    """Render every requested page into its column region(s). Returns work-units
+    (page_index, region_index, png_bytes) in reading order."""
+    units: list[tuple[int, int, bytes]] = []
     for i in page_indices:
-        pix = doc[i].get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-        out[i] = pix.tobytes("jpeg")
-    doc.close()
-    return out
+        regions = _render_page_regions(data, i, dpi)
+        for r_idx, png in enumerate(regions):
+            units.append((i, r_idx, png))
+    return units
 
 
 def _extract_text_from_docx(data: bytes) -> str:
@@ -392,66 +497,90 @@ async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> str:
     classifications: list[str] = [_classify_page_text(t) for t in page_texts_raw]
     vision_pages: list[int] = [i for i, cls in enumerate(classifications) if _needs_vision(cls)]
 
-    jpeg_map: dict[int, bytes] = {}
+    # Render each page into high-fidelity PNG region(s): dense two-column pages are split at
+    # their whitespace gutter (≈2× pixels/glyph + correct left→right order); single-column pages
+    # stay whole. One work-unit per region: (page_index, region_index, png_bytes).
+    units: list[tuple[int, int, bytes]] = []
     if vision_pages:
         summary = ", ".join(f"p{i+1}={classifications[i]}" for i in vision_pages)
         await step_cb(22, f"Vision OCR — rendering {len(vision_pages)}/{total_pages} pages ({summary[:80]})…")
-        jpeg_map = await asyncio.to_thread(_render_pages_jpeg, file_bytes, vision_pages, 250)
+        units = await asyncio.to_thread(_render_all_regions, file_bytes, vision_pages, 300)
+        split_pages = sorted({p for p, r, _ in units if r > 0})
+        if split_pages:
+            logger.info(
+                "Column-split fired on %d page(s): %s",
+                len(split_pages), ", ".join(f"p{p+1}" for p in split_pages),
+            )
 
+    total_regions = len(units)
     ocr_sem = asyncio.Semaphore(6)
     VISION_OCR_ATTEMPTS = 3
 
-    failed_pages: list[int] = []     # unreadable after retries / 404 — skipped
+    failed_regions: list[tuple[int, int]] = []   # unreadable after retries / 404 — skipped
 
-    async def _process_one_page(i: int, cls: str) -> tuple[int, str]:
+    async def _process_one_region(page_i: int, region_i: int, png: bytes) -> tuple[int, int, str]:
+        tag = f"page {page_i + 1} region {region_i + 1}"
         async with ocr_sem:
             last_err: str | None = None
             for attempt in range(1, VISION_OCR_ATTEMPTS + 1):
                 try:
                     vision_result = await provider.generate_with_image(
-                        VISION_EXTRACT_PROMPT, jpeg_map[i], schema=None
+                        VISION_EXTRACT_PROMPT, png, schema=None
                     )
                     ocr_text = (vision_result.get("text") or "").strip()
                     if ocr_text:
-                        logger.info("Vision OCR page %d (%s): %d chars", i + 1, cls, len(ocr_text))
-                        return (i, ocr_text)
+                        logger.info("Vision OCR %s: %d chars", tag, len(ocr_text))
+                        return (page_i, region_i, ocr_text)
                     last_err = "empty text"
                     logger.warning(
-                        "Vision OCR page %d returned empty text (attempt %d/%d)",
-                        i + 1, attempt, VISION_OCR_ATTEMPTS,
+                        "Vision OCR %s returned empty text (attempt %d/%d)",
+                        tag, attempt, VISION_OCR_ATTEMPTS,
                     )
                 except Exception as exc:
                     last_err = str(exc)
                     if "404" in last_err:
                         # The deployment cannot accept images at all — retrying is pointless.
-                        # Skip the page; if every page 404s the job fails loudly below.
+                        # Skip the region; if every region 404s the job fails loudly below.
                         logger.error(
-                            "Vision not supported by this deployment (404 on page %d) — "
-                            "cannot OCR; page skipped", i + 1,
+                            "Vision not supported by this deployment (404 on %s) — "
+                            "cannot OCR; region skipped", tag,
                         )
-                        failed_pages.append(i)
-                        return (i, "")
+                        failed_regions.append((page_i, region_i))
+                        return (page_i, region_i, "")
                     logger.warning(
-                        "Vision OCR failed page %d (attempt %d/%d): %s",
-                        i + 1, attempt, VISION_OCR_ATTEMPTS, exc,
+                        "Vision OCR failed %s (attempt %d/%d): %s",
+                        tag, attempt, VISION_OCR_ATTEMPTS, exc,
                     )
             logger.error(
-                "Vision OCR exhausted %d attempts on page %d (%s) — page skipped "
+                "Vision OCR exhausted %d attempts on %s (%s) — region skipped "
                 "(NOT ingesting raw/garbage text)",
-                VISION_OCR_ATTEMPTS, i + 1, last_err,
+                VISION_OCR_ATTEMPTS, tag, last_err,
             )
-            failed_pages.append(i)
-            return (i, "")
+            failed_regions.append((page_i, region_i))
+            return (page_i, region_i, "")
 
-    await step_cb(23, f"Vision OCR — processing {len(vision_pages)}/{total_pages} pages in parallel…")
-    page_results = await asyncio.gather(
-        *[_process_one_page(i, cls) for i, cls in enumerate(classifications)]
+    await step_cb(23, f"Vision OCR — processing {total_regions} region(s) of {len(vision_pages)} page(s) in parallel…")
+    region_results = await asyncio.gather(
+        *[_process_one_region(p, r, png) for p, r, png in units]
     )
-    page_results = sorted(page_results, key=lambda x: x[0])
-    text = "\n\n".join(t for _, t in page_results if t)
+    # Regions left→right within a page, pages in order.
+    region_results = sorted(region_results, key=lambda x: (x[0], x[1]))
+    text = "\n\n".join(t for _, _, t in region_results if t)
 
-    extracted = total_pages - len(failed_pages)
-    summary = f"OCR complete — {extracted} extracted, {len(failed_pages)} unreadable (of {total_pages} pages)."
+    # A page is unreadable only if ALL its regions failed.
+    regions_by_page: dict[int, list[int]] = {}
+    for p, r, _ in units:
+        regions_by_page.setdefault(p, []).append(r)
+    failed_by_page: dict[int, set[int]] = {}
+    for p, r in failed_regions:
+        failed_by_page.setdefault(p, set()).add(r)
+    unreadable_pages = [p for p, regs in regions_by_page.items() if failed_by_page.get(p, set()) >= set(regs)]
+
+    extracted_regions = total_regions - len(failed_regions)
+    summary = (
+        f"OCR complete — {extracted_regions}/{total_regions} region(s) extracted, "
+        f"{len(unreadable_pages)} unreadable page(s) of {total_pages}."
+    )
     logger.info(summary)
     await step_cb(24, summary)
     return text
@@ -635,7 +764,23 @@ class KnowledgeProcessingAgent:
                     "and that the vision model deployment supports image inputs."
                 )
 
+            # [DEBUG] Stage 2 — full transcribed text as it leaves OCR (before any
+            # sectioning/extraction). Compare against the source PDF to spot rephrasing.
+            _debug_dump(document_id, "01_raw_ocr.txt", raw_text)
+
             sections = _split_into_sections(raw_text, max_chars=8000)
+
+            # [DEBUG] Stage 3 — how the raw text was split into overlapping sections.
+            # A model_qa pair straddling a boundary here is where "incomplete question"
+            # chunks come from. Each section is delimited with its index + char count.
+            _debug_dump(
+                document_id,
+                "02_sections.txt",
+                "\n".join(
+                    f"\n{'=' * 70}\n=== SECTION {i} ({len(s)} chars) ===\n{'=' * 70}\n{s}"
+                    for i, s in enumerate(sections)
+                ),
+            )
             # Semantic chunking tier is configurable via settings.CHUNKING_MODEL_TIER
             # (.env): default gpt-5 ("thinking") for best Nepali segmentation/verbatim
             # fidelity since chunking is a one-time per-document cost, or gpt-5-mini
@@ -697,7 +842,16 @@ class KnowledgeProcessingAgent:
                         result_json = await provider.generate_text(prompt, schema={"type": "object"})
                     except Exception as exc:
                         logger.warning("AI Q&A extraction failed for section %d: %s", i, exc)
+                        _debug_dump(document_id, f"03_extract_section_{i:02d}_ERROR.txt", str(exc))
                         return []
+                    # [DEBUG] Stage 4 — raw model output for THIS section, before any
+                    # filtering. Shows exactly what the extractor returned (rephrased text,
+                    # dropped/partial pairs, missing question fields) per section.
+                    _debug_dump(
+                        document_id,
+                        f"03_extract_section_{i:02d}_raw.json",
+                        json.dumps(result_json, ensure_ascii=False, indent=2),
+                    )
                     pairs = result_json.get("pairs") if isinstance(result_json, dict) else None
                     if not isinstance(pairs, list):
                         return []
@@ -750,6 +904,16 @@ class KnowledgeProcessingAgent:
                 _c["topic"] = _t
                 _c["subtopic"] = _sub
                 _c["chapter"] = _ch
+
+            # [DEBUG] Stage 5 — the final chunk set after syllabus validation, exactly as it
+            # will be embedded/saved. For model_qa: `question` + `embed_text` (what gets
+            # embedded) + `content` (the answer stored in knowledge_chunks). This is where you
+            # confirm whether each chunk is a COMPLETE question with its question preserved.
+            _debug_dump(
+                document_id,
+                "04_final_chunks.json",
+                json.dumps(all_chunks, ensure_ascii=False, indent=2),
+            )
 
             # For model_qa chunks embed question+answer (embed_text) so retrieval matches on the
             # question; prose chunks have no embed_text and embed their content as before.

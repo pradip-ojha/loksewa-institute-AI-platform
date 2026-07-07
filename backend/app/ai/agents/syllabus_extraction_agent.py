@@ -24,7 +24,7 @@ from app.ai.agents.knowledge_processing_agent import (
     _docx_to_pdf_bytes,
     _extract_pdf_pages_text,
     _extract_text_from_docx,
-    _render_pages_jpeg,
+    _render_all_regions,
 )
 from app.ai.model_router import get_provider
 from app.ai.prompts.shared import EXAM_CONTEXT
@@ -41,17 +41,15 @@ logger = logging.getLogger(__name__)
 # Per-page OCR prompt for syllabus documents. Unlike the knowledge OCR prompt this NEVER rejects
 # a page — a syllabus/course-outline page IS the content we want. Transcribe verbatim so the
 # structuring pass sees the real chapter/topic/subtopic wording.
-SYLLABUS_OCR_PROMPT = """You are reading one page of a Loksewa / banking exam SYLLABUS or course outline (Nepali, English, or mixed). Transcribe EVERYTHING on the page exactly as written — this is a list of exam chapters, topics and sub-topics and every line matters.
+SYLLABUS_OCR_PROMPT = """You are a text-transcription (OCR) engine reading one page (or one column of a page) of a Loksewa / banking exam SYLLABUS or course outline (Nepali, English, or mixed). Transcribe EVERYTHING EXACTLY as printed — this is a list of exam chapters, topics and sub-topics and every line matters.
 
-Rules:
-- Nepali text → proper Unicode Devanagari (e.g. बैंकिङ, अर्थतन्त्र). Never Romanise or return legacy ASCII encodings.
-- English text → exactly as shown. Mixed → preserve both scripts.
-- Preserve the outline structure: section/chapter headings on their own line, and every numbered or bulleted item (1. 2. / १. २. / (a) (b) / •, -) with its numbering intact and its indentation reflected by keeping sub-items after their parent.
-- Preserve tables row by row, columns separated by |.
-- Remove ONLY running headers/footers, page numbers, watermarks and printed institute/website names. Never reword, translate, summarise, reorder, or drop any actual outline item.
-- If a word is partially illegible, write your best guess; do not skip a line.
+- Transcribe the text character for character, in natural reading order (top to bottom). Do NOT interpret, rephrase, translate, summarise, reorder, correct, add or drop anything, and never use your own knowledge — transcribe only what you can see.
+- Nepali → Unicode Devanagari exactly as written (never Romanised or legacy ASCII). English → exactly as shown. Mixed → preserve both scripts. Keep all numbering exactly (1. 2. / १. २. / (a) (b) / •, -).
+- Preserve the outline structure: headings on their own line, and every numbered/bulleted item kept under its parent (reflect indentation by keeping sub-items after their parent). Tables row by row, columns separated by |.
+- If a word is genuinely unreadable, write [?] in its place — never guess it from meaning.
+- Leave out ONLY running headers/footers, page numbers and watermarks.
 
-Return only the transcribed text."""
+Output only the transcribed text, nothing else."""
 
 SYLLABUS_STRUCTURE_PROMPT = EXAM_CONTEXT + """
 
@@ -195,33 +193,36 @@ class SyllabusExtractionAgent:
         total = len(page_texts)
         await step_cb(35, f"Vision OCR — reading {total} page(s)…")
         provider = get_provider("vision_typed")
-        jpeg_map = await asyncio.to_thread(_render_pages_jpeg, file_bytes, list(range(total)), 250)
+        # High-fidelity 300-DPI PNG, auto column-split (same helper as the Knowledge Layer):
+        # dense two-column syllabus pages are read one column at a time in reading order.
+        units = await asyncio.to_thread(_render_all_regions, file_bytes, list(range(total)), 300)
 
         sem = asyncio.Semaphore(6)
         ATTEMPTS = 3
 
-        async def _ocr_page(i: int) -> tuple[int, str]:
+        async def _ocr_region(page_i: int, region_i: int, png: bytes) -> tuple[int, int, str]:
+            tag = f"page {page_i + 1} region {region_i + 1}"
             async with sem:
                 for attempt in range(1, ATTEMPTS + 1):
                     try:
                         result = await provider.generate_with_image(
-                            SYLLABUS_OCR_PROMPT, jpeg_map[i], schema=None
+                            SYLLABUS_OCR_PROMPT, png, schema=None
                         )
                         text = (result.get("text") or "").strip()
                         if text:
-                            return (i, text)
+                            return (page_i, region_i, text)
                     except Exception as exc:
                         if "404" in str(exc):
-                            logger.error("Vision not supported by this deployment (404) — page %d", i + 1)
-                            return (i, "")
-                        logger.warning("Syllabus OCR failed page %d (attempt %d/%d): %s",
-                                       i + 1, attempt, ATTEMPTS, exc)
-                logger.error("Syllabus OCR exhausted attempts on page %d — page skipped", i + 1)
-                return (i, "")
+                            logger.error("Vision not supported by this deployment (404) — %s", tag)
+                            return (page_i, region_i, "")
+                        logger.warning("Syllabus OCR failed %s (attempt %d/%d): %s",
+                                       tag, attempt, ATTEMPTS, exc)
+                logger.error("Syllabus OCR exhausted attempts on %s — region skipped", tag)
+                return (page_i, region_i, "")
 
-        results = await asyncio.gather(*[_ocr_page(i) for i in range(total)])
-        results.sort(key=lambda x: x[0])
-        return "\n\n".join(t for _, t in results if t)
+        results = await asyncio.gather(*[_ocr_region(p, r, png) for p, r, png in units])
+        results.sort(key=lambda x: (x[0], x[1]))
+        return "\n\n".join(t for _, _, t in results if t)
 
     # ── structuring ───────────────────────────────────────────────────────────────
 

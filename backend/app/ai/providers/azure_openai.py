@@ -305,13 +305,16 @@ class AzureOpenAIProvider(AIModelProvider):
     async def generate_with_image(self, prompt: str, image_bytes: bytes, schema: dict | None = None, audit_ctx: dict | None = None) -> dict:
         client = _get_client(self.api_version)
         b64 = base64.b64encode(image_bytes).decode()
+        # Label the data URL by the actual bytes — PNG (lossless, used for OCR page/column
+        # images) vs JPEG — so the API never mis-decodes a PNG sent under a jpeg label.
+        mime = "image/png" if image_bytes[:8].startswith(b"\x89PNG\r\n\x1a\n") else "image/jpeg"
         kwargs: dict = {}
         if schema is not None:
             kwargs["response_format"] = {"type": "json_object"}
 
         content = [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"}},
         ]
 
         t0 = time.monotonic()

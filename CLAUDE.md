@@ -250,37 +250,48 @@ free `VARCHAR(50)`, no DB enum):
   reranking). Partial pairs cut off at a section boundary are skipped (they recur in the 20%-overlapping
   next section). Same OCR path, syllabus validation, `Semaphore(6)` fan-out, embed/upsert/save as prose.
 
-**Pipeline (prose):** Upload → store R2 → extract text (**OCR-ONLY: every PDF page is re-OCR'd by
-parallel Azure gpt-5 typed-vision** — NOT Gemini, which is handwriting-only; the SAME per-page call also
-**strips headers/footers/watermarks**, see below) → semantic chunking (parallel,
-`get_provider("chunking")`, tier set by `CHUNKING_MODEL_TIER` .env — **default gpt-5**, or gpt-5-mini
-when `fast`) → embed (`text-embedding-3-large`, 3072d) → upsert Pinecone
+**Pipeline (prose):** Upload → store R2 → extract text (**OCR-ONLY: every PDF page is rendered to
+300-DPI PNG, auto column-split, and re-OCR'd by parallel Azure gpt-5 typed-vision** — NOT Gemini, which
+is handwriting-only; the SAME vision call also **strips headers/footers/watermarks**, see below) →
+semantic chunking (parallel, `get_provider("chunking")`, tier set by `CHUNKING_MODEL_TIER` .env —
+**default gpt-5**, or gpt-5-mini when `fast`) → embed (`text-embedding-3-large`, 3072d) → upsert Pinecone
 → metadata to PG. Chunking = meaningful semantic units (concepts, definitions, exam points), not blind
 token splits. (`model_qa` runs the SAME pipeline but with pair-extraction in place of chunking.)
-Vision OCR parallel across pages (`asyncio.Semaphore(6)`); chunking parallel across sections
+Vision OCR parallel across page-regions (`asyncio.Semaphore(6)`); chunking parallel across sections
 (`asyncio.Semaphore(6)`). (All AI-fan-out semaphores across the platform are 6.)
 
 **OCR-only ingestion (the corpus is entirely scanned or legacy Preeti/Kantipur-font, whose PDF text
 layer is unusable ASCII garbage).** `FORCE_OCR_ALL_PAGES=True` in
-`ai/agents/knowledge_processing_agent.py` → `_needs_vision()` is true for EVERY page, so all pages are
-rendered to 250-DPI JPEG and read by the typed-vision model. Per-page classification
-(`_classify_page_text`) still runs but only annotates logs. **No garbage fallback:** a page that fails
-OCR is RETRIED (`VISION_OCR_ATTEMPTS=3`) and then SKIPPED (empty) — the pipeline NEVER backfills with
-the raw text layer or an LLM "Preeti decode" (both removed), because that would only poison the vector
-store. If every page fails (e.g. the deployment can't accept images → 404), the job fails honestly
-rather than ingesting nothing/garbage.
-**In-call decoration stripping (NO extra AI cost — same single per-page vision call).**
-`VISION_EXTRACT_PROMPT` instructs the typed-vision model to **remove running headers/footers, page
-numbers, watermarks and printed institute/website names** — the ONLY manipulation allowed; it never
-rewords/summarises/reorders/drops actual content, and it **never rejects/classifies a page**. Page
-selection is left to the admin: to exclude non-content front-matter (cover, table of contents,
-syllabus, preface/writer's message, etc.), the admin simply splits/removes those initial pages from the
-PDF before uploading. This keeps ingestion **predictable** — every page the admin uploads is
-transcribed verbatim (minus decoration); the OCR agent was deliberately NOT given page-rejection power,
-because that judgement is error-prone (it wrongly dropped real content pages) and non-deterministic. A
-page that OCR cannot read after `VISION_OCR_ATTEMPTS=3` is SKIPPED (empty), never backfilled with the
-raw text layer / a Preeti decode. `_ocr_pdf_bytes` returns the concatenated text and logs+emits a
-one-line `N extracted, F unreadable (of T pages)` summary to the Processing Logs.
+`ai/agents/knowledge_processing_agent.py` → `_needs_vision()` is true for EVERY page, so every page is
+rendered to **high-fidelity 300-DPI PNG** (lossless — JPEG compression smears thin Devanagari strokes)
+and read by the typed-vision model. Per-page classification (`_classify_page_text`) still runs but only
+annotates logs. **No garbage fallback:** a region that fails OCR is RETRIED (`VISION_OCR_ATTEMPTS=3`)
+and then SKIPPED (empty) — the pipeline NEVER backfills with the raw text layer or an LLM "Preeti decode"
+(both removed), because that would only poison the vector store. If every region fails (e.g. the
+deployment can't accept images → 404) the OCR text is empty and the job fails honestly rather than
+ingesting nothing/garbage.
+**Column-split rendering (OCR fidelity, spec — dense two-column Nepali).** A vision model reads a full
+page at a fixed resolution budget (~768 px on the short side), so a dense two-column page leaves too few
+pixels per glyph and the model starts guessing/confabulating. Each page is therefore rendered as one or
+more **column regions**: `_detect_column_gutter` (deterministic cv2/numpy — a central vertical
+whitespace band that is ink-free over ≥85% of the height with real content on BOTH sides) finds the
+gutter; `_render_page_regions` then splits exactly on that empty gutter into **left then right** PNG
+crops (no glyph cut, no overlap, correct reading order — this is what fixed the two-column reading-order
+scramble) — each column now fills the model's budget (~2× pixels/glyph). A page with **no** clean gutter
+(single-column notes/books) is rendered whole, so single-column docs are never split mid-line. Cost:
+~2× typed-vision calls on two-column pages (quality-first). Regions are OCR'd in parallel
+(`asyncio.Semaphore(6)`) and reassembled in `(page, region)` order.
+**Strict transcription prompt (the ONE thing that stopped the rewriting).** `VISION_EXTRACT_PROMPT` is a
+pure **OCR-transcription** prompt: transcribe EXACTLY as printed, character for character; never
+interpret/summarise/rephrase/translate/reorder/correct/complete; never use the model's own knowledge;
+`[?]` for a genuinely unreadable glyph (never guessed from meaning). The framing is deliberately plain —
+an earlier "clean, readable study-knowledge-base" framing put the reasoning-tier model into author mode
+and it **rewrote answers, changed facts, and fabricated whole questions**. The ONLY omission allowed is
+running headers/footers, page numbers and watermarks; it never rejects/classifies a page. Page selection
+stays with the admin (split/remove non-content front-matter before uploading) — the OCR agent was
+deliberately NOT given page-rejection power (error-prone, non-deterministic). `_ocr_pdf_bytes` returns
+the concatenated text and logs+emits a one-line `N/T region(s) extracted, U unreadable page(s)` summary
+to the Processing Logs.
 **DOCX handling (both Unicode and Preeti):** the `.docx` text is extracted and classified the same way
 — `valid_unicode` → used directly; anything else (Preeti/legacy/empty/broken) → the DOCX is converted
 to PDF via **headless LibreOffice** (`_docx_to_pdf_bytes`, `soffice --headless --convert-to pdf`,
