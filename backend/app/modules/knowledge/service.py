@@ -30,10 +30,16 @@ async def fail_orphaned_knowledge_documents(db: AsyncSession) -> int:
     return reconciled
 
 
-async def list_documents(db: AsyncSession, skip: int = 0, limit: int = 50) -> list[KnowledgeDocument]:
-    result = await db.execute(
-        select(KnowledgeDocument).order_by(KnowledgeDocument.created_at.desc()).offset(skip).limit(limit)
-    )
+async def list_documents(
+    db: AsyncSession,
+    skip: int = 0,
+    limit: int = 50,
+    exam_id: uuid.UUID | None = None,
+) -> list[KnowledgeDocument]:
+    stmt = select(KnowledgeDocument).order_by(KnowledgeDocument.created_at.desc())
+    if exam_id is not None:
+        stmt = stmt.where(KnowledgeDocument.exam_id == exam_id)
+    result = await db.execute(stmt.offset(skip).limit(limit))
     return list(result.scalars().all())
 
 

@@ -97,10 +97,11 @@ async def upload_knowledge_document(
 async def get_documents(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
+    exam_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
 ) -> list[KnowledgeDocumentOut]:
-    docs = await list_documents(db, skip=skip, limit=limit)
+    docs = await list_documents(db, skip=skip, limit=limit, exam_id=exam_id)
     return [KnowledgeDocumentOut.model_validate(d) for d in docs]
 
 

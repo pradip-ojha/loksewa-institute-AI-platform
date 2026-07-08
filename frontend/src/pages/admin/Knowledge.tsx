@@ -55,7 +55,10 @@ export function AdminKnowledge() {
 // ── Upload Tab ───────────────────────────────────────────────────────────────
 
 function UploadTab() {
-  const { selectedExamId, selectedExam } = useExam();
+  // Choosing an exam here has PRIORITY: it updates the global selection (the top-bar
+  // selector), so what you pick while uploading also becomes the scope for the Processed /
+  // Logs tabs. This avoids uploading against a stale top-bar exam.
+  const { exams, selectedExamId, setSelectedExamId } = useExam();
   const fileRef = useRef<HTMLInputElement>(null);
   const [form, setForm] = useState({
     display_name: "",
@@ -141,6 +144,23 @@ function UploadTab() {
 
       <div className="grid gap-4 sm:grid-cols-2">
         <div className="sm:col-span-2">
+          <Label>Exam *</Label>
+          <Select
+            value={selectedExamId ?? ""}
+            onChange={(e) => { if (e.target.value) setSelectedExamId(e.target.value); }}
+          >
+            {!selectedExamId && <option value="">— Select an exam —</option>}
+            {exams.map((ex) => (
+              <option key={ex.id} value={ex.id}>{ex.name} ({ex.exam_type})</option>
+            ))}
+          </Select>
+          <p className="mt-1 text-xs text-gray-400">
+            Changing this also updates the exam selected in the top bar (used across the admin
+            workspace, including the Processed Knowledge and Logs tabs).
+          </p>
+        </div>
+
+        <div className="sm:col-span-2">
           <Label>Document Display Name *</Label>
           <Input
             value={form.display_name}
@@ -173,9 +193,6 @@ function UploadTab() {
           <p className="mt-1 text-xs text-gray-400">
             Leave blank for a whole book or note set spanning multiple chapters — each chunk is
             auto-mapped to the syllabus. Pick a chapter only for single-chapter material.
-          </p>
-          <p className="mt-1 text-xs text-gray-400">
-            Exam: <span className="font-medium text-gray-600">{selectedExam?.name ?? "none selected"}</span>
           </p>
         </div>
 
@@ -250,6 +267,13 @@ function UploadTab() {
 // ── Processed Knowledge Tab ──────────────────────────────────────────────────
 
 function ProcessedTab() {
+  const { exams, selectedExamId } = useExam();
+  // Filter documents by exam. Defaults to the exam selected in the top bar; re-syncs when that
+  // changes. "" = All exams. A local state so the admin can widen to "All exams" without
+  // disturbing the global selection used by uploads and the other workspaces.
+  const [filterExamId, setFilterExamId] = useState<string>(selectedExamId ?? "");
+  useEffect(() => { setFilterExamId(selectedExamId ?? ""); }, [selectedExamId]);
+
   const [docs, setDocs] = useState<KnowledgeDocument[]>([]);
   const [loading, setLoading] = useState(true);
   const [chunks, setChunks] = useState<KnowledgeChunk[] | null>(null);
@@ -260,10 +284,10 @@ function ProcessedTab() {
 
   const load = async () => {
     setLoading(true);
-    try { setDocs(await knowledgeService.list()); } finally { setLoading(false); }
+    try { setDocs(await knowledgeService.list(filterExamId || undefined)); } finally { setLoading(false); }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [filterExamId]);
 
   const handleViewChunks = async (doc: KnowledgeDocument) => {
     setChunksLoading(true);
@@ -289,17 +313,34 @@ function ProcessedTab() {
     setReprocessJobId(job.id);
   };
 
-  if (loading) return <p className="text-sm text-gray-400">Loading…</p>;
-
-  if (docs.length === 0)
-    return (
-      <div className="rounded-xl bg-white p-8 text-center shadow-sm ring-1 ring-gray-100">
-        <p className="text-sm text-gray-400">No documents yet. Upload one from the Upload tab.</p>
+  const filterBar = (
+    <div className="flex items-center gap-2">
+      <label className="text-sm font-medium text-gray-600">Exam:</label>
+      <div className="w-72">
+        <Select value={filterExamId} onChange={(e) => setFilterExamId(e.target.value)}>
+          <option value="">All exams</option>
+          {exams.map((ex) => (
+            <option key={ex.id} value={ex.id}>{ex.name} ({ex.exam_type})</option>
+          ))}
+        </Select>
       </div>
-    );
+    </div>
+  );
 
   return (
     <div className="space-y-4">
+      {filterBar}
+
+      {loading ? (
+        <p className="text-sm text-gray-400">Loading…</p>
+      ) : docs.length === 0 ? (
+        <div className="rounded-xl bg-white p-8 text-center shadow-sm ring-1 ring-gray-100">
+          <p className="text-sm text-gray-400">
+            {filterExamId ? "No documents for this exam." : "No documents yet. Upload one from the Upload tab."}
+          </p>
+        </div>
+      ) : (
+      <>
       {reprocessJobId && (
         <div className="rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-100">
           <p className="mb-2 text-sm font-medium text-gray-700">Reprocessing…</p>
@@ -399,6 +440,8 @@ function ProcessedTab() {
             </div>
           )}
         </div>
+      )}
+      </>
       )}
     </div>
   );

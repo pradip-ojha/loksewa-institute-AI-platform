@@ -52,10 +52,10 @@ export const knowledgeService = {
     return data;
   },
 
-  async list(skip = 0, limit = 50): Promise<KnowledgeDocument[]> {
-    const { data } = await api.get<KnowledgeDocument[]>("/api/admin/knowledge/documents", {
-      params: { skip, limit },
-    });
+  async list(examId?: string | null, skip = 0, limit = 50): Promise<KnowledgeDocument[]> {
+    const params: Record<string, unknown> = { skip, limit };
+    if (examId) params.exam_id = examId;
+    const { data } = await api.get<KnowledgeDocument[]>("/api/admin/knowledge/documents", { params });
     return data;
   },
 
