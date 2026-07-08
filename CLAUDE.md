@@ -247,8 +247,19 @@ free `VARCHAR(50)`, no DB enum):
   chunk: `content` = the ANSWER, `content_type="model_qa"`, and a **`question`** field in metadata
   (Pinecone + the `knowledge_chunks.metadata` JSONB — no dedicated column). The embedding is built from
   **`question + "\n" + answer`** so retrieval matches on the question (Option 1 — trust the vector, no
-  reranking). Partial pairs cut off at a section boundary are skipped (they recur in the 20%-overlapping
-  next section). Same OCR path, syllabus validation, `Semaphore(6)` fan-out, embed/upsert/save as prose.
+  reranking). **Sectioning is STRUCTURE-AWARE (`_split_model_qa_sections`): sections are cut BETWEEN
+  whole Q&A pairs on the question-number markers, with ZERO overlap** — so no pair straddles a boundary
+  (this removes both boundary-loss and the overlap-duplication that the prose 20%-overlap split caused
+  for pairs). Boundaries are found deterministically in Python (no LLM): a line-start numeral
+  (`१६.`/`16)`/`प्रश्न नं. १८`, ASCII+Devanagari) is a real question when it continues the ascending
+  sequence (`num > last_q`); an in-answer sub-point or a numbering **reset** (new chapter → back to `१`)
+  is disambiguated by the char-gap to the next marker (`gap_min=600` → long answer ⇒ real question, else
+  ⇒ sub-point). Whole pairs are then packed greedily into ≈8k sections (an oversize pair stays whole). If
+  <2 markers are found (unnumbered/garbled OCR) it **falls back** to the prose `_split_into_sections`
+  overlap path so a detection miss degrades, never loses data. Partial pairs (only possible on the
+  fallback path) are still skipped by `QA_EXTRACT_PROMPT` (they recur in the overlap). Same OCR path,
+  syllabus validation, `Semaphore(6)` fan-out, embed/upsert/save as prose. **Prose is unchanged** —
+  `_split_into_sections` paragraph split with ~20% overlap.
 
 **Pipeline (prose):** Upload → store R2 → extract text (**OCR-ONLY: every PDF page is rendered to
 300-DPI PNG, auto column-split, and re-OCR'd by parallel Azure gpt-5 typed-vision** — NOT Gemini, which

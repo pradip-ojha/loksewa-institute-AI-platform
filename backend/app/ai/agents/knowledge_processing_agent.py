@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -628,6 +629,97 @@ def _split_into_sections(text: str, max_chars: int = 8000) -> list[str]:
     return sections or [text]
 
 
+# Candidate question-number marker at the START of a line: an optional "प्रश्न / प्रश्न नं. /
+# प्र.सं." prefix, then a 1–3 digit number (ASCII or Devanagari), then a separator. This only
+# PROPOSES candidates — in-answer sub-points (१. २. …) match too; the sequence/gap logic in
+# _split_model_qa_sections decides which candidates are real question boundaries.
+_QNUM_RE = re.compile(
+    r"^[ \t]*(?:प्रश्न(?:\s*(?:नं\.?|संख्या|सं\.?))?\s*)?([0-9०-९]{1,3})\s*[.)।:\-]"
+)
+_DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+
+
+def _devanagari_to_int(s: str) -> int | None:
+    """Parse an ASCII/Devanagari (or mixed) numeral string to int; None if not clean digits."""
+    ascii_digits = s.translate(_DEVANAGARI_DIGITS)
+    return int(ascii_digits) if ascii_digits.isdigit() else None
+
+
+def _split_model_qa_sections(
+    text: str, target_chars: int = 8000, gap_min: int = 600
+) -> list[str]:
+    """Split a model_qa document into sections cut BETWEEN question+answer pairs.
+
+    Question numbers are detected deterministically (no LLM). Because every break falls on a
+    question boundary, no pair straddles a section edge — so there is NO overlap (unlike the
+    prose `_split_into_sections`), which removes both boundary-loss and overlap-duplication.
+
+    Falls back to the paragraph-split+overlap path when too few markers are found (unnumbered or
+    OCR-garbled doc) so a detection miss degrades gracefully instead of losing data.
+    """
+    # 1. Collect candidate markers: (char_offset_of_line, number).
+    candidates: list[tuple[int, int]] = []
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        m = _QNUM_RE.match(line)
+        if m:
+            num = _devanagari_to_int(m.group(1))
+            if num is not None:
+                candidates.append((offset, num))
+        offset += len(line)
+
+    # 2. Decide REAL question boundaries via ascending-sequence + gap tiebreaker.
+    boundaries: list[int] = []
+    last_q: int | None = None
+    for idx, (off, num) in enumerate(candidates):
+        if last_q is None:
+            # First question of the document — accept the first plausible candidate.
+            boundaries.append(off)
+            last_q = num
+        elif num > last_q:
+            # Ascending: the normal case (num == last_q + 1), plus tolerate an OCR-dropped
+            # number (num > last_q + 1). Threshold-free, so a short answer never causes a miss.
+            boundaries.append(off)
+            last_q = num
+        else:
+            # num <= last_q: either a reset-to-1 (new chapter/topic) or an in-answer sub-point.
+            # Disambiguate by the gap to the next candidate: a real question is followed by a
+            # long answer; a sub-point is followed closely by the next sub-point.
+            next_off = candidates[idx + 1][0] if idx + 1 < len(candidates) else len(text)
+            if next_off - off >= gap_min:
+                boundaries.append(off)
+                last_q = num
+            # else: sub-point — ignore.
+
+    # 3. Fallback: too few boundaries to trust structural splitting.
+    if len(boundaries) < 2:
+        return _split_into_sections(text, max_chars=target_chars)
+
+    # 4. Build pairs = spans between consecutive boundaries (preamble folded into the first pair).
+    starts = [0] + boundaries[1:]  # first pair starts at text[0] so no leading text is dropped
+    pairs: list[str] = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        piece = text[start:end].strip()
+        if piece:
+            pairs.append(piece)
+
+    # 5. Pack whole pairs greedily into ~target_chars sections, NO overlap. A single oversize
+    # pair becomes its own section (never split a pair).
+    sections: list[str] = []
+    current = ""
+    for pair in pairs:
+        if current and len(current) + len(pair) + 2 > target_chars:
+            sections.append(current)
+            current = pair
+        else:
+            current = (current + "\n\n" + pair) if current else pair
+    if current:
+        sections.append(current)
+
+    return sections or [text]
+
+
 class KnowledgeProcessingAgent:
     async def process(
         self,
@@ -789,11 +881,20 @@ class KnowledgeProcessingAgent:
             # sectioning/extraction). Compare against the source PDF to spot rephrasing.
             _debug_dump(document_id, "01_raw_ocr.txt", raw_text)
 
-            sections = _split_into_sections(raw_text, max_chars=8000)
+            # `model_qa` documents (question papers with model answers) are split STRUCTURALLY on
+            # question-number markers — cut between whole Q&A pairs, zero overlap (no pair straddles
+            # a boundary → no lost/duplicated pairs). Prose keeps the paragraph-split + ~20% overlap.
+            is_model_qa = document_type == "model_qa"
+            sections = (
+                _split_model_qa_sections(raw_text)
+                if is_model_qa
+                else _split_into_sections(raw_text, max_chars=8000)
+            )
 
-            # [DEBUG] Stage 3 — how the raw text was split into overlapping sections.
-            # A model_qa pair straddling a boundary here is where "incomplete question"
-            # chunks come from. Each section is delimited with its index + char count.
+            # [DEBUG] Stage 3 — how the raw text was split into sections. For model_qa these are
+            # NON-overlapping, cut on question boundaries; for prose they overlap by ~20% (a prose
+            # concept straddling a boundary is recovered from the next section's overlap). Each
+            # section is delimited with its index + char count.
             _debug_dump(
                 document_id,
                 "02_sections.txt",
@@ -863,7 +964,7 @@ class KnowledgeProcessingAgent:
             # QUESTION↔ANSWER pairs — one pair per chunk (content = answer, plus "question") —
             # instead of semantic prose chunks. Everything downstream (syllabus validation,
             # embedding, save) is shared; only the per-section extractor differs.
-            is_model_qa = document_type == "model_qa"
+            # (`is_model_qa` was computed above where the splitter was selected.)
 
             async def _extract_qa_pairs_section(i: int, section: str) -> list[dict]:
                 async with chunk_sem:
