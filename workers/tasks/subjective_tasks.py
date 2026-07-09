@@ -36,6 +36,13 @@ LOCATOR_CONCURRENCY = 6
 ANNOTATION_BUDGET_SECONDS = 600
 
 
+class MarksReconciliationError(Exception):
+    """The extracted per-question marks could not be reconciled to the admin-configured
+    Total Marks after every attempt. Terminal + NON-transient: a Celery retry would only
+    re-read the same paper, so `generate_test_skills` fails the job cleanly (with a clear
+    admin message) instead of retrying."""
+
+
 # ── Test setup: question extraction + multi-agent skill generation ───────────────
 
 @celery_app.task(
@@ -83,19 +90,62 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
             model_answer_file_id = test.model_answer_file_id
             model_answer_is_handwritten = test.model_answer_is_handwritten
             rubric_file_id = test.rubric_file_id
+            # Admin-configured Total Marks: authoritative AND the reconciliation checksum
+            # (0/blank ⇒ admin left it out ⇒ no checksum, fall back to the extracted sum).
+            admin_total = test.total_marks or 0
             await update_job(db, jid, status=JobStatus.processing, progress=8, step="Reading question paper")
 
-        # Read the question paper (own session for any vision-OCR audit) ──────────
+        # Resolve the paper source ONCE: a usable embedded text layer → text extraction;
+        # else render pages to images for DIRECT vision extraction (no lossy OCR→text→extract
+        # double pass — wording stays verbatim, marks read from the printed digit). ────
         async with AsyncSessionLocal() as db:
-            paper_text = await _resolve_text(db, question_paper_file_id)
-        if not paper_text.strip():
+            source_kind, source = await _resolve_paper_source(db, question_paper_file_id)
+        if source_kind == "text" and not source.strip():
             raise ValueError("Could not read any text from the question paper")
+        if source_kind == "images" and not source:
+            raise ValueError("Could not render the question paper for reading")
 
-        # Extract questions + marks (one AI call, own session) ───────────────────
+        # Extract questions + marks, RECONCILED against the admin Total Marks. Admin's total
+        # is authoritative and is the checksum: if the extracted per-question marks don't sum
+        # to it, re-read the paper (a fresh vision read can fix a misread digit or a missed
+        # question). After MAX attempts still off ⇒ fail with a clear message rather than ship
+        # a test whose per-question hard-caps are wrong. admin_total<=0 ⇒ no checksum. ──
         await _job(progress=18, step="Extracting questions and marks")
-        async with AsyncSessionLocal() as db:
-            questions = await QuestionPaperAgent(db).extract(
-                paper_text=paper_text, custom_instruction=custom_instruction, test_id=test_uuid,
+        MAX_EXTRACT_ATTEMPTS = 3
+        questions: list[dict] | None = None
+        best: list[dict] | None = None
+        best_sum = 0
+        for attempt in range(1, MAX_EXTRACT_ATTEMPTS + 1):
+            async with AsyncSessionLocal() as db:
+                agent = QuestionPaperAgent(db)
+                if source_kind == "text":
+                    cand = await agent.extract(
+                        paper_text=source, custom_instruction=custom_instruction,
+                        test_id=test_uuid, expected_total_marks=admin_total or None,
+                    )
+                else:
+                    cand = await agent.extract_from_images(
+                        source, custom_instruction=custom_instruction,
+                        test_id=test_uuid, expected_total_marks=admin_total or None,
+                    )
+            cand_sum = sum(q["marks"] for q in cand)
+            if admin_total <= 0 or cand_sum == admin_total:
+                questions = cand  # no checksum, or reconciled exactly
+                break
+            if best is None or abs(cand_sum - admin_total) < abs(best_sum - admin_total):
+                best, best_sum = cand, cand_sum
+            logger.warning(
+                "marks reconciliation attempt %d/%d: extracted sum %d != configured total %d",
+                attempt, MAX_EXTRACT_ATTEMPTS, cand_sum, admin_total,
+            )
+
+        if questions is None:
+            # admin_total>0 and never reconciled → terminal, NON-transient failure. run_task
+            # records the job failed with this message; the outer handler does NOT celery-retry.
+            raise MarksReconciliationError(
+                f"Extracted per-question marks sum to {best_sum} but the configured Total Marks is "
+                f"{admin_total}. Re-read the paper {MAX_EXTRACT_ATTEMPTS} times. Please verify the "
+                f"question paper's marks or the Total Marks you entered, then regenerate."
             )
 
         # SAVE: replace any prior questions (cascades old skills), insert new rows ─
@@ -115,7 +165,12 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
                 question_rows.append(row)
             t = (await db.execute(select(SubjectiveTest).where(SubjectiveTest.id == test_uuid))).scalar_one()
             t.num_questions = len(question_rows)
-            if marks_sum > 0:
+            # Admin's Total Marks is authoritative when set; only fall back to the extracted
+            # sum when the admin left it blank (0). Reconciliation above guarantees the
+            # per-question marks sum to admin_total when it is set.
+            if admin_total > 0:
+                t.total_marks = admin_total
+            elif marks_sum > 0:
                 t.total_marks = marks_sum
             total_marks = t.total_marks
             await db.commit()
@@ -270,6 +325,12 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
 
     try:
         run_task(work, job_id=job_id, task=self, manage_session=False)
+    except MarksReconciliationError as exc:
+        # Terminal + non-transient: run_task already recorded the job as failed with this
+        # message. Just flip the test's status and STOP — retrying would re-read the same
+        # paper to the same mismatch. The admin fixes the marks / paper and regenerates.
+        logger.error("generate_test_skills marks reconciliation failed: %s", exc)
+        _mark_skill_failed(test_id)
     except Exception as exc:
         logger.exception("generate_test_skills failed: %s", exc)
         _mark_skill_failed(test_id)
@@ -923,6 +984,46 @@ def _fmt(v) -> str:
 
 # ── text-resolution + failure helpers ────────────────────────────────────────────
 
+async def _resolve_paper_source(db, file_id) -> tuple[str, object]:
+    """Decide how the question paper should be READ and return the source for it:
+      • ("text", paper_text)   — the paper has a usable embedded text layer (≥30 chars).
+      • ("images", [png, ...]) — scanned / no-text-layer PDF or image → page PNGs @300 DPI
+        for DIRECT vision extraction (one faithful pass, marks read from the printed digit),
+        instead of the old lossy OCR→text→extract chain.
+    Mirrors `_resolve_text`'s text-vs-vision decision. (Preeti/scanned .docx has no image
+    render path here, same as before — upload such papers as PDF.)"""
+    if not file_id:
+        return "text", ""
+    from sqlalchemy import select
+    from app.integrations.r2_client import get_r2
+    from app.modules.files.models import File
+    from app.processing.document_text import extract_text_from_bytes
+    from app.processing import pdf_tools
+
+    f = (await db.execute(select(File).where(File.id == file_id))).scalar_one_or_none()
+    if not f:
+        return "text", ""
+    data = await asyncio.to_thread(get_r2().download_fileobj, f.r2_key)
+
+    text = ""
+    if f.mime_type in (
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
+    ):
+        try:
+            text = extract_text_from_bytes(data, f.mime_type)
+        except Exception:
+            text = ""
+    if len(text.strip()) >= 30:
+        return "text", text
+    try:
+        pages = pdf_tools.render_to_page_images(data, f.mime_type, dpi=300)
+    except Exception:
+        return "images", []
+    return "images", [p.png_bytes for p in pages[:15]]
+
+
 async def _resolve_text(db, file_id, handwritten: bool = False) -> str:
     """Best-effort text for a stored file: direct text extraction, with a vision OCR
     fallback for scanned PDFs / images that carry no embedded text. `handwritten` routes
@@ -956,30 +1057,50 @@ async def _resolve_text(db, file_id, handwritten: bool = False) -> str:
 
 
 async def _vision_ocr(db, data: bytes, mime_type: str, entity_id, handwritten: bool = False) -> str:
+    """Vision OCR fallback for scanned / no-text-layer papers, model answers and rubrics.
+
+    Uses the hardened "you are an OCR engine — transcribe EXACTLY, never interpret /
+    summarise / refuse" transcription prompt shared with the Knowledge layer
+    (`VISION_EXTRACT_PROMPT`), at 300 DPI, with per-page retries. The previous one-line
+    prompt + JSON wrapper let gpt-5 (a reasoning model) INTERMITTENTLY REFUSE — it would
+    return a short "image resolution is insufficient, please resend a clearer scan"
+    message instead of the text. That refusal passed the non-empty guard in `_resolve_text`
+    and fed the extractor no questions, so skill generation failed with "no questions could
+    be extracted" on some runs and succeeded on others (pure model luck). The strict
+    OCR-engine prompt transcribes this same page reliably. Typed text → Azure gpt-5 typed
+    vision; handwritten Nepali/Devanagari → Gemini (CLAUDE.md §4 governing principle)."""
     from app.ai.model_router import get_provider
+    from app.ai.agents.knowledge_processing_agent import VISION_EXTRACT_PROMPT
     from app.processing import pdf_tools
 
     try:
-        pages = pdf_tools.render_to_page_images(data, mime_type)
+        # 300 DPI matches the Knowledge OCR path — enough pixels/glyph for dense Devanagari.
+        pages = pdf_tools.render_to_page_images(data, mime_type, dpi=300)
     except Exception:
         return ""
-    # Typed text (printed question papers / model answers) → Azure gpt-5 typed vision;
-    # handwritten Nepali/Devanagari → Gemini (CLAUDE.md §4 governing principle).
     provider = get_provider("vision" if handwritten else "vision_typed")
+    OCR_ATTEMPTS = 3
     parts: list[str] = []
     for page in pages[:15]:
-        try:
-            res = await provider.generate_with_image(
-                "Transcribe ALL printed/handwritten text on this page exactly, preserving Devanagari. "
-                "Return JSON: {\"text\": \"...\"}.",
-                page.png_bytes, schema={},
-                audit_ctx={"db": db, "agent_type": "QuestionPaperAgent", "task_type": "paper_vision_ocr",
-                           "entity_type": "file", "entity_id": entity_id},
-            )
-            if isinstance(res, dict) and res.get("text"):
-                parts.append(str(res["text"]))
-        except Exception as exc:
-            logger.warning("vision OCR failed on a page: %s", exc)
+        page_text = ""
+        for attempt in range(1, OCR_ATTEMPTS + 1):
+            try:
+                # schema=None → plain-text transcription (the strict prompt says "output
+                # only the transcribed text"); both Azure and Gemini return {"text": ...}.
+                res = await provider.generate_with_image(
+                    VISION_EXTRACT_PROMPT, page.png_bytes, schema=None,
+                    audit_ctx={"db": db, "agent_type": "QuestionPaperAgent", "task_type": "paper_vision_ocr",
+                               "entity_type": "file", "entity_id": entity_id},
+                )
+                text = str(res.get("text") or "").strip() if isinstance(res, dict) else ""
+                if text:
+                    page_text = text
+                    break
+            except Exception as exc:
+                logger.warning("vision OCR failed on a page (attempt %d/%d): %s",
+                               attempt, OCR_ATTEMPTS, exc)
+        if page_text:
+            parts.append(page_text)
     return "\n".join(parts)
 
 

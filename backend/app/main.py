@@ -102,12 +102,29 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     sniffing / clickjacking / referrer leakage. HSTS is sent so browsers pin HTTPS once
     the app is served over TLS (harmless over plain HTTP during local dev)."""
 
+    # Swagger UI / ReDoc load their bundle + inline init from a CDN, so the strict
+    # JSON-API CSP (default-src 'none') would render the interactive docs blank. These
+    # HTML doc routes get a docs-friendly CSP instead; every other (JSON) response keeps
+    # the strict policy.
+    _DOCS_PATHS = ("/docs", "/redoc")
+    _DOCS_CSP = (
+        "default-src 'none'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "img-src 'self' data: https://cdn.jsdelivr.net https://fastapi.tiangolo.com; "
+        "font-src 'self' https://cdn.jsdelivr.net; "
+        "connect-src 'self'; frame-ancestors 'none'"
+    )
+
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
-        response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+        if request.url.path in self._DOCS_PATHS:
+            response.headers["Content-Security-Policy"] = self._DOCS_CSP
+        else:
+            response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         return response
 

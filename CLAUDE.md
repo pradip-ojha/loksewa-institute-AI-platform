@@ -504,6 +504,15 @@ Ideal/Model Answer, Sample Marked Answer (**optional**), Marking Rubric file (**
 Checking Instruction (**optional**). Status: draft/active/archived.
 - **Question-wise marks = source of truth for max marks.** AI may award partial but NEVER exceed the
   configured full marks per question (or the configured total).
+- **The admin-entered Total Marks is AUTHORITATIVE and is a reconciliation CHECKSUM on extraction.**
+  At test creation the pipeline extracts each question's marks; if the extracted per-question marks do
+  NOT sum to the admin's configured Total Marks, extraction is RE-RUN (up to 3 attempts — a fresh read
+  can fix a misread digit or a missed question), keeping the closest result. If it still can't
+  reconcile, the job FAILS with a clear message (extracted-sum vs configured-total) rather than shipping
+  a test whose per-question hard-caps are wrong — the admin verifies the paper/marks and regenerates
+  (`MarksReconciliationError` in `subjective_tasks.py` is terminal + non-transient, so it is NOT
+  Celery-retried). The admin's total is NEVER overwritten by the extracted sum (the old behavior); the
+  extracted sum is used ONLY when the admin left Total Marks blank (0).
 - **Marking Rubric** is an optional per-test file (`rubric_file_id`); no central rubric library. None
   selected → default general rubric (§11.5).
 - **Custom Checking Instruction** optional, test-specific guidance.
@@ -718,7 +727,13 @@ evaluation_notes/iterations`, `pdf_annotations.locator_plan`. Two orchestrated C
 kvi_ai_subjective`):
 - **`generate_test_skills`** (`subjective_test_processing`) — from `POST /admin/subjective/tests` and
   `POST .../{id}/regenerate-skills` (regenerate replaces questions + skills). Extract questions+marks
-  (`QuestionPaperAgent`, vision-OCR fallback via `_resolve_text`), persist `subjective_questions`
+  (`QuestionPaperAgent`): a paper with a usable embedded **text layer** → `extract(paper_text)` (gpt-5
+  typed text); a **scanned / no-text-layer** paper → `_resolve_paper_source` renders page PNGs @300 DPI
+  and `extract_from_images` reads the questions+marks **straight from the page image in one vision pass**
+  (Azure gpt-5 typed vision, per-page parallel, verbatim + NEVER-REFUSE prompt) — this replaced the old
+  lossy OCR→text→extract double pass so wording stays verbatim and marks are read from the printed digit.
+  The extraction is **reconciled against the admin Total Marks** (see §11.1 — retry-up-to-3 then fail
+  clearly on mismatch; admin total never overwritten). Persist `subjective_questions`
   (`marks` = full-marks source of truth), detect per-question topic/subtopic
   (`SubjectiveTopicRouterAgent`, validated vs the test's exam tree via `video.service.get_chapter_tree(exam_id)`),
   fetch supporting knowledge best-effort (`service.fetch_question_resources`, Pinecone filtered by the

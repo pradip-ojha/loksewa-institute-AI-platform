@@ -57,9 +57,9 @@ class SubjectiveQuestion(Base):
     # Detected per question against the subjective syllabus tree (best-effort; used to
     # fetch supporting knowledge during skill generation). Null when not matched.
     # Chapter is the PRIMARY retrieval dimension (CLAUDE.md §8) — resolved from the topic.
-    chapter: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    topic: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    subtopic: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    chapter: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    topic: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    subtopic: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
 
 class QuestionSpecificCheckingSkill(Base):
