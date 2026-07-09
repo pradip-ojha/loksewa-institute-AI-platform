@@ -13,7 +13,7 @@ import asyncio
 import logging
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AppException
@@ -55,6 +55,58 @@ async def get_test(db: AsyncSession, test_id: uuid.UUID) -> SubjectiveTest | Non
     return r.scalar_one_or_none()
 
 
+# Every `files` row this test owns (its own config files + each answer sheet's uploaded
+# file + each checked-PDF). All `file_id` FKs are ON DELETE SET NULL, so a DB cascade would
+# orphan these rows (and their R2 objects) — they must be collected and removed explicitly.
+_TEST_FILE_IDS_SQL = text("""
+    SELECT f.id AS id, f.r2_key AS r2_key FROM files f WHERE f.id IN (
+        SELECT question_paper_file_id FROM subjective_tests WHERE id = :tid
+        UNION SELECT model_answer_file_id FROM subjective_tests WHERE id = :tid
+        UNION SELECT sample_marked_file_id FROM subjective_tests WHERE id = :tid
+        UNION SELECT rubric_file_id FROM subjective_tests WHERE id = :tid
+        UNION SELECT file_id FROM student_answer_sheets WHERE test_id = :tid
+        UNION SELECT pa.checked_file_id FROM pdf_annotations pa
+               JOIN student_answer_sheets s ON pa.sheet_id = s.id WHERE s.test_id = :tid
+    )
+""")
+
+
+async def delete_test(db: AsyncSession, test_id: uuid.UUID) -> bool:
+    """Hard-delete one subjective test and ALL of its content. Returns False if not found.
+
+    Deleting the `subjective_tests` row cascades every child in the DB: its questions +
+    per-question checking skills, and every student answer sheet with its quality checks,
+    extractions, evaluations, PDF annotations and feedback chats/messages (all
+    `ON DELETE CASCADE`). This additionally removes what a DB cascade cannot reach — the
+    now-orphaned `files` rows (their FKs are SET NULL) and the matching R2 objects. Job-log
+    rows (`skill_generation_job_id` / `checking_job_id`) are SET NULL and left as harmless
+    history. External R2 cleanup is best-effort and never blocks/rolls back the DB delete.
+    (Subjective tests hold no Pinecone vectors — only the Knowledge layer does.)"""
+    test = await get_test(db, test_id)
+    if not test:
+        return False
+
+    # 1. Collect the owned files BEFORE the rows disappear.
+    file_rows = (await db.execute(_TEST_FILE_IDS_SQL, {"tid": test_id})).mappings().all()
+    file_ids = [r["id"] for r in file_rows]
+    r2_keys = [r["r2_key"] for r in file_rows if r["r2_key"]]
+
+    # 2. Delete the test (DB cascade wipes all its content), then the orphaned files rows.
+    await db.delete(test)
+    if file_ids:
+        await db.execute(text("DELETE FROM files WHERE id = ANY(:ids)"), {"ids": file_ids})
+    await db.commit()
+
+    # 3. Best-effort R2 cleanup AFTER the DB delete is committed.
+    if r2_keys:
+        try:
+            await asyncio.to_thread(get_r2().delete_objects, r2_keys)
+        except Exception as exc:
+            logger.warning("Subjective test %s deleted, but R2 cleanup failed for %d objects: %s",
+                           test_id, len(r2_keys), exc)
+    return True
+
+
 async def list_tests(db: AsyncSession, *, page: int = 1, per_page: int = 20):
     total = (await db.execute(select(func.count()).select_from(SubjectiveTest))).scalar_one()
     r = await db.execute(
@@ -81,15 +133,6 @@ async def set_status(db: AsyncSession, test_id: uuid.UUID, status: str) -> Subje
     await db.commit()
     await db.refresh(t)
     return t
-
-
-async def delete_test(db: AsyncSession, test_id: uuid.UUID) -> bool:
-    t = await get_test(db, test_id)
-    if not t:
-        return False
-    await db.delete(t)
-    await db.commit()
-    return True
 
 
 def test_out_fields(t: SubjectiveTest) -> dict:

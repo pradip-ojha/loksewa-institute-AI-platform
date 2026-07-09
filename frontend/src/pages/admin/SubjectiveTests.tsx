@@ -241,6 +241,14 @@ function TestListTab() {
     try { await subjectiveTestsService.regenerateSkills(id); await refresh(); }
     catch (err) { setError(getErrorMessage(err, "Could not regenerate skills.")); }
   }
+  async function remove(t: SubjectiveTest) {
+    if (!window.confirm(
+      `Permanently delete "${t.display_name}"?\n\nThis removes the test, its questions, checking skills, ` +
+      `every student submission + checked PDF, and its files. This cannot be undone.`
+    )) return;
+    try { await subjectiveTestsService.deleteTest(t.id); await refresh(); }
+    catch (err) { setError(getErrorMessage(err, "Could not delete the test.")); }
+  }
 
   if (loading) return <p className="text-sm text-gray-500">Loading…</p>;
 
@@ -285,8 +293,9 @@ function TestListTab() {
                       <button onClick={() => regenerate(t.id)} className="mr-3 text-amber-700 hover:underline">Regenerate skills</button>
                     )}
                     {t.status === "active" && (
-                      <button onClick={() => archive(t.id)} className="text-gray-500 hover:underline">Archive</button>
+                      <button onClick={() => archive(t.id)} className="mr-3 text-gray-500 hover:underline">Archive</button>
                     )}
+                    <button onClick={() => remove(t)} className="text-red-600 hover:underline">Delete</button>
                   </td>
                 </tr>
               ))}
