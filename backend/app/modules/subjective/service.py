@@ -643,13 +643,58 @@ async def fetch_question_resources(
 
 # ── Question-wise assembly + marks clamp (AI-free, used by the task) ──────────────
 
-def assemble_questionwise(page_outputs: list[dict], questions: list[SubjectiveQuestion]) -> dict:
+def validate_structure_map(structure_map: dict, valid_numbers: list[str]) -> dict:
+    """Normalize the structure pass's question labels to EXACT known question numbers
+    (script/format tolerant via `_match_question_number`) and drop labels matching no
+    known question — garbage labels must never flow into extraction hints or assembly
+    tie-breaking. Returns a new dict; never raises."""
+    if not isinstance(structure_map, dict):
+        return {"questions": [], "pages": [], "uncertainty_notes": ""}
+    out: dict = {
+        "questions": [], "pages": [],
+        "uncertainty_notes": structure_map.get("uncertainty_notes") or "",
+    }
+    dropped: list[str] = []
+    for q in structure_map.get("questions") or []:
+        if not isinstance(q, dict):
+            continue
+        m = _match_question_number(str(q.get("question_number") or ""), valid_numbers)
+        if not m:
+            dropped.append(str(q.get("question_number")))
+            continue
+        q2 = dict(q)
+        q2["question_number"] = m
+        out["questions"].append(q2)
+    for p in structure_map.get("pages") or []:
+        if not isinstance(p, dict):
+            continue
+        nums: list[str] = []
+        for qn in p.get("question_numbers") or []:
+            m = _match_question_number(str(qn or ""), valid_numbers)
+            if m:
+                if m not in nums:
+                    nums.append(m)
+            else:
+                dropped.append(str(qn))
+        p2 = dict(p)
+        p2["question_numbers"] = nums
+        out["pages"].append(p2)
+    if dropped:
+        logger.warning("structure map: dropped unknown question label(s): %s", sorted(set(dropped)))
+    return out
+
+
+def assemble_questionwise(page_outputs: list[dict], questions: list[SubjectiveQuestion],
+                          structure_map: dict | None = None) -> dict:
     """Assemble per-page question-level extractor outputs into whole-question answers.
 
     `page_outputs` is a list of extractor results, each {page, page_size:[w,h],
     answers:[{question_number, answer_text, question_bbox, continues}]}. Groups by
-    question number (digit-tolerant), carrying an unlabeled continuation onto the last
-    known question. Returns the stored extraction shape:
+    question number (digit-tolerant). An UNLABELED answer is attributed using, in order:
+    the pending continuation when the structure map lists it on this page (or there is
+    no map for the page), the single structure-listed question for the page, then the
+    last known question. The structure map is a tie-breaker only — a visible label
+    always wins. Returns the stored extraction shape:
       {"pages": [{page, width, height}],
        "questions": [{qid, question_text, marks, answer_text, page_numbers,
                       page_regions: [{page, question_bbox, answer_text}]}]}
@@ -658,6 +703,24 @@ def assemble_questionwise(page_outputs: list[dict], questions: list[SubjectiveQu
     buckets: dict[str, dict] = {
         n: {"texts": [], "pages": set(), "regions": []} for n in valid_numbers
     }
+    # Structure map: page number → the exact question numbers expected on it.
+    struct_by_page: dict[int, list[str]] = {}
+    if isinstance(structure_map, dict):
+        for p in structure_map.get("pages") or []:
+            if not isinstance(p, dict):
+                continue
+            try:
+                pno = int(p.get("page") or 0)
+            except (TypeError, ValueError):
+                continue
+            nums = []
+            for qn in p.get("question_numbers") or []:
+                m = _match_question_number(str(qn or ""), valid_numbers)
+                if m and m not in nums:
+                    nums.append(m)
+            if pno:
+                struct_by_page[pno] = nums
+
     last_known: str | None = valid_numbers[0] if valid_numbers else None
     # When an answer is flagged as continuing onto the next page, an unlabeled answer
     # at the start of the next page belongs to it (it was the last thing written).
@@ -667,13 +730,25 @@ def assemble_questionwise(page_outputs: list[dict], questions: list[SubjectiveQu
     for po in page_outputs:
         size = po.get("page_size") or [0, 0]
         pages_meta.append({"page": po.get("page"), "width": size[0], "height": size[1]})
+        try:
+            struct_qs = struct_by_page.get(int(po.get("page") or 0))
+        except (TypeError, ValueError):
+            struct_qs = None
         for a in po.get("answers", []) or []:
             qid = _match_question_number(str(a.get("question_number") or ""), valid_numbers)
             if qid:
                 last_known = qid
                 target = qid
             else:
-                target = pending_continuation or last_known
+                # Unlabeled: structure map as tie-breaker (never overrides a label).
+                target = None
+                if struct_qs is not None:
+                    if pending_continuation and pending_continuation in struct_qs:
+                        target = pending_continuation
+                    elif len(struct_qs) == 1:
+                        target = struct_qs[0]
+                if target is None:
+                    target = pending_continuation or last_known
             pending_continuation = target if a.get("continues") else None
             if not target or target not in buckets:
                 continue
@@ -700,18 +775,28 @@ def assemble_questionwise(page_outputs: list[dict], questions: list[SubjectiveQu
     return {"pages": pages_meta, "questions": out_questions}
 
 
+def _ascii_digits(s: str) -> str:
+    """The digit characters of `s` normalized to ASCII regardless of script — "१" and
+    "1" must compare equal (the extractor reads Devanagari labels while the question
+    paper may store ASCII ones, and vice versa). `unicodedata.digit` maps any script's
+    digit to its numeric value."""
+    import unicodedata
+    return "".join(str(unicodedata.digit(ch)) for ch in (s or "") if ch.isdigit())
+
+
 def _match_question_number(raw: str, valid: list[str]) -> str | None:
     raw = (raw or "").strip()
     if not raw:
         return None
     if raw in valid:
         return raw
-    # Loose match on the trailing digits (handles "Q1" vs "1" vs "Q. 1").
-    raw_digits = "".join(ch for ch in raw if ch.isdigit())
+    # Loose match on the digits, script-normalized (handles "Q1" vs "1" vs "Q. 1" vs
+    # "प्रश्न नं. १" vs "१.").
+    raw_digits = _ascii_digits(raw)
     if not raw_digits:
         return None
     for v in valid:
-        if "".join(ch for ch in v if ch.isdigit()) == raw_digits:
+        if _ascii_digits(v) == raw_digits:
             return v
     return None
 
@@ -720,15 +805,18 @@ def _half(v: float) -> float:
     return round(v * 2) / 2
 
 
-def _clamp_sections(item: dict, question_cap: float) -> None:
+def _clamp_sections(item: dict, question_cap: float) -> float:
     """Make the section breakdown complete and consistent with the question:
     clamp each section's awarded to its max, ensure the section MAXES cover the full
     question marks (add a remainder section if the breakdown is short), and force the
     section AWARDED sum to equal the question's awarded_marks. Mutates in place; the
-    question's awarded_marks stays the source of truth."""
+    question's awarded_marks stays the source of truth. Returns the absolute number of
+    marks REDISTRIBUTED between sections to reconcile the sums — a large value means
+    the student-facing breakdown diverges from the model's own judgment, which
+    `clamp_marks` records as an audit note."""
     sections = item.get("sections")
     if not isinstance(sections, list) or not sections:
-        return
+        return 0.0
 
     q_awarded = _half(max(0.0, min(float(item.get("awarded_marks", 0) or 0), question_cap)))
 
@@ -742,7 +830,7 @@ def _clamp_sections(item: dict, question_cap: float) -> None:
         s["awarded_marks"] = sa
         clean.append(s)
     if not clean:
-        return
+        return 0.0
 
     # 1) Ensure the section maxes cover the full question marks (complete breakdown).
     sum_max = sum(s["max_marks"] for s in clean)
@@ -755,6 +843,7 @@ def _clamp_sections(item: dict, question_cap: float) -> None:
 
     # 2) Force the awarded section sum to equal the question's awarded marks.
     diff = _half(q_awarded - sum(s["awarded_marks"] for s in clean))
+    redistributed = abs(diff)
     if diff > 0:  # need to add marks — give to sections with the most headroom first
         for s in sorted(clean, key=lambda x: x["max_marks"] - x["awarded_marks"], reverse=True):
             room = s["max_marks"] - s["awarded_marks"]
@@ -781,6 +870,7 @@ def _clamp_sections(item: dict, question_cap: float) -> None:
         s["status"] = "correct" if (smax > 0 and sa >= smax) else ("partial" if sa > 0 else "wrong")
 
     item["sections"] = clean
+    return redistributed
 
 
 def clamp_marks(evaluation: dict, questions: list[SubjectiveQuestion]) -> tuple[dict, float, float]:
@@ -791,12 +881,20 @@ def clamp_marks(evaluation: dict, questions: list[SubjectiveQuestion]) -> tuple[
     by_number = {q.question_number: q for q in questions}
     total_possible = float(sum(q.marks for q in questions))
     total_awarded = 0.0
+    clamp_notes: list[str] = []
 
     items = (evaluation or {}).get("question_results", [])
     for item in items:
         qnum = _match_question_number(str(item.get("question_number") or ""), list(by_number.keys()))
         q = by_number.get(qnum) if qnum else None
         cap = float(q.marks) if q else float(item.get("max_marks", 0) or 0)
+        if not qnum:
+            # The AI's own claimed max becomes the cap — that's uncontrolled, so it must
+            # be auditable, never silent.
+            note = (f"AI result question '{item.get('question_number')}' matched no configured "
+                    f"question; its own claimed max ({cap}) was used as the cap")
+            clamp_notes.append(note)
+            logger.warning("clamp_marks: %s", note)
         item["max_marks"] = cap
         if qnum:
             item["question_number"] = qnum
@@ -804,10 +902,20 @@ def clamp_marks(evaluation: dict, questions: list[SubjectiveQuestion]) -> tuple[
         awarded = max(0.0, min(awarded, cap))
         awarded = round(awarded * 2) / 2  # snap to nearest half mark (examiner convention)
         item["awarded_marks"] = awarded
-        _clamp_sections(item, cap)
+        redistributed = _clamp_sections(item, cap)
+        if redistributed > 1.0:
+            # The reconciled section breakdown now diverges materially from the model's
+            # own per-section judgment — record it for the admin debug view.
+            clamp_notes.append(
+                f"Q{item.get('question_number')}: {redistributed} mark(s) redistributed between "
+                "sections to reconcile the breakdown with the question total"
+            )
         total_awarded += awarded
 
     evaluation["question_results"] = items
+    if clamp_notes:
+        prior = evaluation.get("clamp_notes")
+        evaluation["clamp_notes"] = (prior if isinstance(prior, list) else []) + clamp_notes
     total_awarded = round(total_awarded, 2)
     total_possible = round(total_possible, 2)
     evaluation["total_awarded_marks"] = total_awarded

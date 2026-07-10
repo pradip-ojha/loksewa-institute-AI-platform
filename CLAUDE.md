@@ -519,8 +519,10 @@ Checking Instruction (**optional**). Status: draft/active/archived.
 - **Model answer is usually absent** (it doesn't move quality much; the distilled knowledge context is
   the real quality driver). When supplied as an image/scan with no text layer, an admin
   **"Model answer is handwritten" checkbox** (`subjective_tests.model_answer_is_handwritten`) routes the
-  vision read: handwritten → Gemini; typed/printed → Azure gpt-5 typed vision (CLAUDE.md §4). Question
-  paper / rubric are typed and always read by gpt-5 typed vision when they need OCR.
+  vision read: handwritten → Gemini; typed/printed → Azure gpt-5 typed vision (CLAUDE.md §4). The
+  **question paper is read by Gemini 3.5 flash vision** (renderable PDF/image papers are always
+  rasterized and OCR'd by Gemini — it reads printed Nepali/Devanagari more reliably; §12); the rubric is
+  typed and read by gpt-5 typed vision when it needs OCR.
 
 ### 11.2 Question Paper Format
 Must have clear numbering + marks per question. Example: `Q1. ... [8 marks]` or `प्रश्न नं. १ ... [८ अंक]`.
@@ -589,8 +591,8 @@ Student uploads handwritten answer-sheet PDF/image
 → Checker (GPT-5.5): WHAT is wrong + SECTION-WISE breakdown (per criterion: awarded/max/status/evidence + a student-facing `note` that names what was good (keep) vs what to improve) → marks (capped) + feedback + missing points + annotation targets (wrong text) + positive sections (ticks)
 → Reviewer pass (2nd GPT-5.5): fairness, enforce max marks, keep section sums consistent, prune annotation targets
 → **PROGRESSIVE FEEDBACK SPLIT (spec §6.5):** the moment the reviewer pass is persisted the sheet flips to `feedback_ready` — the student sees **marks + section-wise feedback immediately** and the feedback chatbot unlocks, WHILE annotation continues in the background ("PDF is being annotated" indicator)
-→ Per question ONE Gemini vision Locator call per question/page on a CROP of the answer region: underline paths for wrong items + evidence box for each fully-correct section (tick placed beside that line). Positive sections routed to the page their evidence sits on (matched via per-page extraction text)
-→ Validator decides WHETHER geometry is safe (smooth / soft-mark / feedback-only for underlines; ticks are SKIP-ON-MISS — only where evidence confidently located, never margin-dumped)
+→ Per question ONE Gemini vision Locator call per question/page on a CROP of the answer region (one jittered retry per call): underline paths for wrong items + evidence box for each fully-correct section (tick placed beside that line) + a `read_text` echo of what it saw at each spot — all geometry in Gemini's NATIVE normalized-0-1000 [y,x] convention, denormalized in code with a per-item scale-sanity detector. Positive sections routed to the page their evidence sits on (matched via per-page extraction text)
+→ Validator decides WHETHER geometry is safe (smooth / soft-mark / feedback-only for underlines; ticks are SKIP-ON-MISS — only where evidence confidently located, never margin-dumped) + two deterministic ground-truth guards: an INK-PRESENCE check (a mark whose claimed spot is blank paper is demoted) and the read_text echo match (mismatch caps confidence / skips the tick)
 → Human-like renderer draws checked PDF (curved baseline underlines, HarfBuzz-shaped Nepali red-pen comments, teacher-scale ticks, ONE circled question total at the END of each answer, sheet-total banner) → R2; sheet flips to `checked` and the checked-PDF link appears
 → **Annotation is best-effort:** a failure in this background phase NEVER loses the feedback — the sheet still settles to `checked` (results stand, PDF simply unavailable). The stuck-job reaper settles an orphaned `feedback_ready` sheet to `checked`, never `failed`.
 ```
@@ -600,7 +602,21 @@ Noto Sans Devanagari + Noto Sans Latin in `app/processing/fonts/`) and pasted as
 `ImageDraw.text` can't shape Devanagari and is not used for text.
 
 **Coordinate debug:** `GET /api/admin/subjective/sheets/{id}/debug-pdf` re-renders the sheet
-(deterministic, same pixel space) overlaying raw vs. validated locator geometry + page corners.
+(deterministic, same pixel space) overlaying raw vs. validated locator geometry + page corners,
+the **locator crop rectangle** (gray dashed — what the vision model actually saw), per-target
+`coord_mode`/`match_score` labels, and **rejected/feedback_only targets in gray with their
+`reason`** (exactly what to inspect when tuning why a mark wasn't drawn).
+
+**Re-annotation harness (annotation tuning loop):** `POST /api/admin/subjective/sheets/{id}/reannotate`
+(admin; sheet must be `feedback_ready`/`checked`) runs Celery task
+`workers.tasks.subjective_tasks.reannotate_sheet` — re-runs ONLY locator → validator → renderer on
+the STORED extraction + final evaluation (~one Gemini call per question/page; no re-extraction, no
+GPT-5.5 passes; marks never touched) and swaps in a fresh checked PDF + `PDFAnnotation` row only
+after the new one is fully built (a failed run keeps the old PDF). Eval protocol + per-iteration
+score log: `backend/scripts/annotation_eval_notes.md` (target ≥90% correct underline placement
+before relaxing any validator threshold). Each run persists `locator_plan.summary` (locator calls,
+retries, failed calls, targets-by-status, ticks placed, mean `match_score`, `pixel_fallbacks`) —
+the prod trend metric for locator-accuracy regressions (also logged as one INFO line per sheet).
 
 ### Extraction (question-level by default)
 Per question on a page: page number, question number, full transcribed answer text, a question-level
@@ -640,13 +656,30 @@ only transcribe, preserving wording.
 
 ### Annotation Locator + Validator + Renderer
 Checker emits targets **by exact text** (WHAT is wrong), never coordinates. Per reviewed target a
-GPT-5.5 **vision Locator** returns WHERE — a natural underline **path** (multiple ordered baseline
-points, not two bbox endpoints) + a safe comment box. A pure-Python **Validator**
-(`processing/annotation_geometry.py`) decides WHETHER geometry is safe: valid → use; noisy → smooth;
-bad path but good text box → short soft mark on box baseline; both unreliable → no exact mark
-(question-area feedback only); never draw at a random/low-confidence spot. The **Renderer**
+Gemini **vision Locator** returns WHERE — a natural underline **path** (multiple ordered baseline
+points, not two bbox endpoints) + a safe comment box. **Coordinate contract (the accuracy
+root-cause fix): the locator (and the extractor's `question_bbox`) return geometry in Gemini's
+NATIVE convention — `[ymin, xmin, ymax, xmax]` boxes / `[y, x]` points normalized to 0–1000 —
+because vision models are far more reliable in that space than at absolute pixels.** Code
+denormalizes to page pixels (`_yx_box_to_px`/`_yx_point_to_px` in the locator agent;
+`_bbox_to_pixels` in the extraction agent, which keeps the stored `[x, y, w, h]` shape) with a
+per-item `coord_mode` scale-sanity detector: ≤1000 ⇒ normalized; within crop/page bounds ⇒
+`pixel_fallback` (model disobeyed, use as-is); beyond ⇒ geometry zeroed + confidence 0. The locator
+also returns **`read_text`** (what it actually sees inside each returned box) for echo verification.
+A pure-Python **Validator** (`processing/annotation_geometry.py`) decides WHETHER geometry is safe:
+valid → use; noisy → smooth; bad path but good text box → short soft mark on box baseline; both
+unreliable → no exact mark (question-area feedback only); never draw at a random/low-confidence
+spot. Two deterministic **ground-truth guards** on top of the ladder (both cv2/fuzzy, no AI):
+an **ink-presence check** (Otsu mask; an underline/soft-mark/tick whose claimed strip/box holds
+< 1.5% dark pixels is a location miss → demoted with a persisted `reason`) and the **read_text
+echo match** (fuzzy n-gram similarity vs the requested text via `processing/text_match.py`;
+score < 0.35 caps confidence below the exact-underline threshold; ticks skip outright). Ticks are
+placed **BESIDE the evidence line, never on the writing** (the model's `tick_point` when it lands
+plausibly left of the first line, else a computed left-margin spot; tick size `base*1.8`). Comment
+boxes are sized by real HarfBuzz shaping (`text_render.measure_text`) and never silently vanish —
+last resort anchors at the bottom of the question region. The **Renderer**
 (`processing/annotation.py`) draws the validated plan human-like (Catmull-Rom curved underline with
-jitter + slight stroke variation; hand-style rotated comments/marks; uncrowded).
+jitter + slight stroke variation; hand-style comments/marks; uncrowded).
 
 ### Reviewer / Verification Pass
 Second GPT-5.5 pass after evaluation (demo-quality reliability): checks marks fair/consistent across
@@ -727,11 +760,16 @@ evaluation_notes/iterations`, `pdf_annotations.locator_plan`. Two orchestrated C
 kvi_ai_subjective`):
 - **`generate_test_skills`** (`subjective_test_processing`) — from `POST /admin/subjective/tests` and
   `POST .../{id}/regenerate-skills` (regenerate replaces questions + skills). Extract questions+marks
-  (`QuestionPaperAgent`): a paper with a usable embedded **text layer** → `extract(paper_text)` (gpt-5
-  typed text); a **scanned / no-text-layer** paper → `_resolve_paper_source` renders page PNGs @300 DPI
-  and `extract_from_images` reads the questions+marks **straight from the page image in one vision pass**
-  (Azure gpt-5 typed vision, per-page parallel, verbatim + NEVER-REFUSE prompt) — this replaced the old
-  lossy OCR→text→extract double pass so wording stays verbatim and marks are read from the printed digit.
+  (`QuestionPaperAgent`): a **renderable PDF/image** paper (the default) → `_resolve_paper_source`
+  ALWAYS renders page PNGs @300 DPI and `extract_from_images` reads the questions+marks **straight from
+  the page image in one vision pass with Gemini 3.5 flash** (`get_provider("vision")`, per-page parallel,
+  verbatim + NEVER-REFUSE prompt) — Gemini reads printed Nepali/Devanagari question papers more reliably
+  than gpt-5 typed vision, and rasterizing the PDF (never trusting its text layer) means a Preeti/legacy
+  font layer that decodes to ASCII garbage can't poison extraction (cost is negligible — a paper is 1–2
+  pages); a **DOCX/DOC** paper (no image render path) falls back to `extract(paper_text)` (gpt-5 typed
+  text). This replaced the old lossy OCR→text→extract double pass so wording stays verbatim and marks are
+  read from the printed digit. **Only the question-paper reading moved to Gemini; the rest of subjective
+  checking stays on gpt-5/gpt-5.5 as configured.**
   The extraction is **reconciled against the admin Total Marks** (see §11.1 — retry-up-to-3 then fail
   clearly on mismatch; admin total never overwritten). Persist `subjective_questions`
   (`marks` = full-marks source of truth), detect per-question topic/subtopic
@@ -748,46 +786,73 @@ kvi_ai_subjective`):
   **Knowledge read ONLY here**, never during per-sheet checking.
 - **`check_answer_sheet`** (`answer_sheet_checking`) — from
   `POST /student/subjective/tests/{id}/upload-answer` (re-upload increments `upload_attempt_number`,
-  cap 2). One job: render pages → PNG (`processing/pdf_tools`) → quality gate
-  (`processing/image_quality`, OpenCV; **poor + attempt<2 ⇒ `needs_reupload`, no AI spent**) →
-  **whole-sheet structure pass** (`AnswerStructureAgent`, Gemini vision over all pages, stored under
-  `extracted_data["structure_map"]`) → **question-level** extraction, **all pages IN PARALLEL**
+  cap 2). One job: render pages → PNG (`processing/pdf_tools`; `PageImage` keeps the PRE-downscale
+  `orig_width/orig_height`) → quality gate (`processing/image_quality`, OpenCV; resolution judged on
+  the ORIGINAL capture dims, not the capped render; **poor + attempt<2 ⇒ `needs_reupload`, no AI
+  spent**) → **whole-sheet structure pass** (`AnswerStructureAgent`, Gemini vision over all pages,
+  labels normalized to exact known question numbers via `svc.validate_structure_map` — unknown
+  labels dropped — then stored under `extracted_data["structure_map"]`) → **question-level**
+  extraction, **all pages IN PARALLEL**
   (`AnswerExtractionAgent.extract_page`, Gemini vision; `asyncio.gather` + `Semaphore(6)`, each page on
   its OWN short-lived session since audit logging makes one `AsyncSession` not concurrency-safe; the
   structure pass already mapped continuations so pages don't depend on each other; **partial success** —
   a failing page yields an empty page output, never fails the sheet) → assemble whole-question answers
-  (`service.assemble_questionwise`, digit-tolerant
-  qid match + `continues` carry-forward; each region keeps per-page `answer_text` for section→page
-  routing) → **empty-extraction guard** (vision read NO answer text → `needs_reupload` when attempt<2,
-  else fail honestly; never a silent 0-mark "completed") → **checker** using locked skills + live
+  (`service.assemble_questionwise`, **script-normalized** digit-tolerant qid match — Devanagari
+  digits compare equal to ASCII via `_ascii_digits`/`unicodedata.digit`, fixing the "१"≠"1"
+  misattribution — + `continues` carry-forward, with the VALIDATED structure map as a tie-breaker
+  for unlabeled writing (pending continuation if listed on the page → single structure-listed
+  question → last known; a visible label always wins); each region keeps per-page `answer_text` for
+  section→page routing) → **empty-extraction guard** (vision read NO answer text → `needs_reupload`
+  when attempt<2, else fail honestly; never a silent 0-mark "completed") + **partial-loss guard**
+  (structure-expected questions with <20 extracted chars: >30% of questions or mean page confidence
+  <0.35 ⇒ `needs_reupload` naming the affected questions; attempts exhausted ⇒ continue but persist
+  `extraction_warnings` into the evaluation + append them to the student-visible `overall_summary` —
+  a dropped page is never a silent unfair 0) → **checker** using locked skills + live
   config only, no big notes (`AnswerEvaluationAgent`, GPT-5.5; emits `sections[]` + positive sections
-  + annotation targets; default-rubric constant when no rubric file) → **reviewer pass**
-  (`AnswerReviewerAgent`, GPT-5.5; carries `sections`) → **per question** ONE vision **locator** call
-  per question/page on a CROP (`AnnotationLocatorAgent.locate_question`, Gemini; underline paths for
-  wrong items + evidence box per fully-correct section, crop coords mapped back via `crop_origin`).
+  + annotation targets; default-rubric constant when no rubric file; **prompt budgeting — no blind
+  truncation**: each checking guide is compacted by `_compact_skill` (drops whole low-priority
+  FIELDS, always valid JSON; per-question budget shrinks proportionally on big sheets, floor 2.5k)
+  and long answers are capped at 12k chars with an EXPLICIT `[answer truncated…]` marker) →
+  **reviewer pass** (`AnswerReviewerAgent`, GPT-5.5; carries `sections`) → **per question** ONE
+  vision **locator** call per question/page on a CROP (`AnnotationLocatorAgent.locate_question`,
+  Gemini; normalized-0-1000 native coords denormalized in code with a `coord_mode` fallback
+  detector — see the Locator section above; underline paths for wrong items + evidence box +
+  `read_text` echo per fully-correct section; crop coords mapped back via `crop_origin`;
+  `crop_region` pads 10% and falls back to the FULL page on a suspicious bbox — area <4% of page,
+  width <25%, or a starved crop — so a wrong extraction bbox costs precision, never correctness).
   These per-(question,page) locator calls are independent and run **CONCURRENTLY** (`asyncio.gather` +
-  `Semaphore(LOCATOR_CONCURRENCY)`, each on its own short session); a deterministic PLAN pass in question
-  order selects the calls + enforces the per-page cap up front, so parallelism never changes which items
-  are marked or the on-page command order →
-  geometry **validator** (`processing/annotation_geometry.validate_question_plan`; underline safety
-  ladder + ticks skip-on-miss, placed beside located evidence only when confident (`TICK_CONF_MIN`),
-  never margin-dumped) → human-like **renderer** (`processing/annotation`, HarfBuzz Nepali via
-  `processing/text_render`; teacher-scale ticks + ONE circled question total at the answer's END (last
-  page) + sheet-total banner — no per-section fractions on PDF) + assemble checked PDF
-  (`pdf_tools.build_pdf_from_images`) → upload `answer-sheets/checked/`. `service.clamp_marks`
-  hard-caps each question + clamps section sums (`_clamp_sections`) after BOTH passes.
-  `answer_evaluations` stores reviewed `evaluation_data` + `initial_evaluation_data` +
-  `reviewed`/`review_notes`; `pdf_annotations` stores `annotation_instructions` (draw commands) +
-  `locator_plan` (per-question locator/validation audit). Per-question/per-page caps keep PDF uncrowded.
+  `Semaphore(LOCATOR_CONCURRENCY)`, each on its own short session, **one jittered retry** per call so
+  a transient Gemini failure doesn't drop a question's marks); a deterministic PLAN pass in question
+  order selects the calls + enforces the per-page cap up front (**the cap counts planned MARKS —
+  targets + ticks — not locator calls**, wrong-item targets kept over ticks), so parallelism never
+  changes which items are marked or the on-page command order →
+  geometry **validator** (`processing/annotation_geometry.validate_question_plan`, fed the page PNG
+  for the ink-presence checks; underline safety ladder + ink/echo ground-truth guards + ticks
+  skip-on-miss, placed BESIDE located evidence only when confident (`TICK_CONF_MIN`), never
+  margin-dumped) → human-like **renderer** (`processing/annotation`, HarfBuzz Nepali via
+  `processing/text_render`; real-pen-scale ticks (`base*1.8`) + ONE circled question total at the
+  answer's END (last page) + sheet-total banner — no per-section fractions on PDF) + assemble
+  checked PDF (`pdf_tools.build_pdf_from_images`) → upload `answer-sheets/checked/`.
+  `service.clamp_marks` hard-caps each question + clamps section sums (`_clamp_sections`) after
+  BOTH passes, and records **`clamp_notes`** in the evaluation whenever a result question matched no
+  configured question or >1 mark was redistributed between sections (silent mark surgery is now
+  auditable in the admin debug view). `answer_evaluations` stores reviewed `evaluation_data` +
+  `initial_evaluation_data` + `reviewed`/`review_notes`; `pdf_annotations` stores
+  `annotation_instructions` (draw commands) + `locator_plan` (`{targets: per-question validated
+  plans incl. crop/coord_mode/match_score, summary: per-sheet accuracy metrics}`). Per-question/
+  per-page caps keep PDF uncrowded.
 - **Uniform rasterization:** every page (PDF or image) → high-DPI PNG so extraction bboxes, locator
   geometry, and annotation share one pixel space; checked PDF rebuilt from annotated PNGs.
   Re-rendering deterministic, relied on by the coordinate-debug PDF (`service.build_debug_pdf` →
   `processing/annotation_debug`).
 - **Agents** (`backend/app/ai/agents/`): reasoning/GPT-5.5 (`get_provider("reasoning")`):
-  `question_paper_agent`, `subjective_topic_router_agent`, `skill_generator_agent`,
+  `subjective_topic_router_agent`, `skill_generator_agent`,
   `skill_evaluator_agent`, `answer_evaluation_agent`, `answer_reviewer_agent`. Vision/Gemini
   (`get_provider("vision")`): `answer_structure_agent`, `answer_extraction_agent`,
-  `annotation_locator_agent` (+ `_vision_ocr` fallback). All use `audit_ctx` + active skill via
+  `annotation_locator_agent` (+ `_vision_ocr` fallback), plus `question_paper_agent`'s
+  `extract_from_images` (question-paper OCR). `question_paper_agent` is DUAL: its text path
+  (`extract`, DOCX/DOC papers) runs on gpt-5 (`get_provider("thinking")`), its default image path
+  runs on Gemini. All use `audit_ctx` + active skill via
   `get_active_skill_text`. (`checking_skill_agent` replaced by `skill_generator_agent`.)
 - **Result/UX:** `GET /student/subjective/tests/{id}/result` returns total + per-question marks +
   section-wise breakdown + feedback + checked-PDF signed URL, never internal JSON. Admin coordinate
@@ -1267,10 +1332,24 @@ sheet is terminal-for-marks:** once it reaches `feedback_ready`, the best-effort
 under its own `ANNOTATION_BUDGET_SECONDS` and `_mark_sheet_failed` refuses to downgrade a
 `feedback_ready`/`checked` sheet — a slow/failed annotation settles to `checked`, never `failed`.
 
-### Gemini rate-limit retry
-Free tier is rate-limited **per minute**, so `gemini._generate_content_with_retry` waits a full
+### Gemini rate-limit + overload retry / model fallback
+Free tier is rate-limited **per minute**, so `gemini._generate_one_model` waits a full
 `GEMINI_RATE_LIMIT_RETRY_SECONDS` (60 s) on a 429 / `RESOURCE_EXHAUSTED` before retrying (up to
 `GEMINI_RATE_LIMIT_MAX_RETRIES`), instead of the short exponential backoff used for other transient errors.
+A **503 "high demand" overload** is a *capacity* problem on Google's side (NOT quota — billing does not
+fix it, and it is unrelated to the caller's `Semaphore(6)` concurrency, which only produces 429s).
+`_generate_content_with_retry` handles it with a **fast fallback + a process-wide circuit breaker** (the
+key perf fix — a fully-overloaded primary was making a 40-call answer sheet take ~24 min, almost all of it
+in per-call 35 s overload waits): when `MODEL_VISION_FALLBACK` is set (default `gemini-3.1-flash-lite`, a
+lighter model on a much larger capacity pool) the primary gives up on the **first** 503 (`overload_budget=0`,
+no 35 s ladder) and fails over immediately; and once the primary 503s `_OV_TRIP_THRESHOLD` (3) times in a
+row the breaker **opens** and calls skip the primary entirely for `_OV_COOLDOWN_SECONDS` (90 s), going
+straight to the fallback, then probe the primary again (a success closes the breaker). With NO fallback the
+primary keeps its patient escalating-wait budget. Fallback/breaker fire ONLY on 503-overload — 429/quota
+retry normally and never trip the breaker; the audit row records the model that actually answered.
+Malformed Gemini JSON is salvaged best-effort by `_loads_lenient` (retry `strict=False` for raw control
+chars in strings + first-balanced-`{…}` extraction for trailing junk); a genuinely truncated response
+still raises (real data loss, not a formatting quirk).
 
 ### Queue Routing (defined in `TASK_ROUTES`)
 ```
@@ -1492,6 +1571,7 @@ POST   /api/admin/mcq-tests/sets/{id}/activate
 GET    /api/student/mcq-tests             POST   /api/student/mcq-tests/{id}/start
 POST   /api/student/mcq-tests/{id}/submit
 POST   /api/admin/subjective/tests        GET    /api/admin/subjective/tests
+POST   /api/admin/subjective/sheets/{sheet_id}/reannotate   → re-run annotation only (tuning loop)
 POST   /api/student/subjective/tests/{id}/upload-answer
 GET    /api/student/subjective/tests/{id}/result
 GET    /api/student/subjective/sheets/{sheet_id}/feedback-chat
@@ -1669,6 +1749,7 @@ MODEL_TRANSCRIPTION=gpt-4o-transcribe
 # ── Google Gemini (VISION ONLY: handwriting extraction, structure, locator) ──
 GEMINI_API_KEY=<google-ai-studio-api-key>   # AQ.* and AIza* key formats are both valid
 MODEL_VISION=gemini-3.5-flash               # vision model id your key can access
+MODEL_VISION_FALLBACK=gemini-3.1-flash-lite # lighter model used ONLY on persistent 503 overload (empty → no fallback)
 
 # ── AI / worker timeouts (seconds) ─────────────────────────────────────────
 AI_REQUEST_TIMEOUT_SECONDS=180        # per Azure OpenAI call
@@ -1761,6 +1842,11 @@ celery -A workers.celery_app.celery_app beat -l info
 uvicorn app.main:app --reload --port 8000
 alembic upgrade head
 pip install -r requirements.txt
+
+# Unit tests (backend/tests — pure functions only: question matching/assembly/clamping,
+# annotation geometry ladder + ink/echo guards, locator coordinate denorm, crop guards,
+# text matching). No DB/network needed. Run from backend/.
+python -m pytest
 
 # Wipe processing-job log rows (failed noise + stuck pending). Run from backend/.
 # Tables referencing a job use ON DELETE SET NULL, so no real content is removed.

@@ -25,12 +25,23 @@ MAX_PAGE_PIXELS = 2200
 
 @dataclass
 class PageImage:
-    """One rendered answer-sheet page in PNG bytes plus its pixel dimensions."""
+    """One rendered answer-sheet page in PNG bytes plus its pixel dimensions.
+    `orig_width`/`orig_height` are the PRE-downscale dimensions — the quality gate's
+    resolution check must use those (assessing the already-capped PNG made the
+    low-resolution guard nearly dead: MAX_PAGE_PIXELS ≫ the minimum)."""
 
     page_number: int  # 1-based
     png_bytes: bytes
     width: int
     height: int
+    orig_width: int = 0
+    orig_height: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.orig_width:
+            self.orig_width = self.width
+        if not self.orig_height:
+            self.orig_height = self.height
 
 
 def _downscale_if_needed(img: Image.Image) -> Image.Image:
@@ -58,9 +69,11 @@ def _render_pdf(data: bytes, dpi: int) -> list[PageImage]:
         for index, page in enumerate(doc):
             pix = page.get_pixmap(matrix=matrix, alpha=False)
             img = Image.open(io.BytesIO(pix.tobytes("png")))
+            ow, oh = img.size
             img = _downscale_if_needed(img)
             png, w, h = _pil_to_png(img)
-            pages.append(PageImage(page_number=index + 1, png_bytes=png, width=w, height=h))
+            pages.append(PageImage(page_number=index + 1, png_bytes=png, width=w, height=h,
+                                   orig_width=ow, orig_height=oh))
     return pages
 
 
@@ -73,9 +86,11 @@ def _render_image(data: bytes) -> list[PageImage]:
         img = ImageOps.exif_transpose(img)
     except Exception:
         pass
+    ow, oh = img.size
     img = _downscale_if_needed(img)
     png, w, h = _pil_to_png(img)
-    return [PageImage(page_number=1, png_bytes=png, width=w, height=h)]
+    return [PageImage(page_number=1, png_bytes=png, width=w, height=h,
+                      orig_width=ow, orig_height=oh)]
 
 
 def render_to_page_images(file_bytes: bytes, mime_type: str, dpi: int = DEFAULT_DPI) -> list[PageImage]:

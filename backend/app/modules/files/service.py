@@ -36,7 +36,7 @@ FILE_RULES: dict[str, tuple[set[str], int]] = {
     ),
     "answer-sheets": (
         {"application/pdf", "image/jpeg", "image/png", "image/webp"},
-        20 * 1024 * 1024,
+        40 * 1024 * 1024,
     ),
     "videos": (
         {"video/mp4", "video/quicktime", "video/webm", "video/x-msvideo", "audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/ogg"},
@@ -48,7 +48,7 @@ FILE_RULES: dict[str, tuple[set[str], int]] = {
     ),
     "answer_sheet": (
         {"application/pdf", "image/jpeg", "image/png", "image/webp"},
-        20 * 1024 * 1024,
+        40 * 1024 * 1024,
     ),
     "video": (
         {"video/mp4", "video/quicktime", "video/webm", "video/x-msvideo"},

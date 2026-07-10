@@ -178,7 +178,7 @@ def draw_annotations(page_png: bytes, commands: list[dict]) -> bytes:
     base = max(16, int(h * 0.016))
     mark_size = int(base * 1.4)        # circled per-question total (teacher-scale)
     banner_size = int(base * 1.2)
-    tick_size = int(base * 3.2)        # correct-point tick over the line (teacher-scale)
+    tick_size = int(base * 1.8)        # correct-point tick beside the line (real-pen scale)
     rng = random.Random((w * 73856093) ^ (h * 19349663) ^ len(commands or []))
 
     # Underlines + ticks first (on the writing), then text on top so it's never covered.

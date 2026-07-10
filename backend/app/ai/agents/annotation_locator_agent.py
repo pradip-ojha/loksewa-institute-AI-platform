@@ -6,11 +6,15 @@ for each correct/partial section's tick + section mark. Ticks/section marks ther
 cost no extra vision calls.
 
 To improve coordinate accuracy on a new vision model, the locator is given a CROP of
-the question's answer region (higher relative resolution); returned crop-space
-coordinates are mapped back to full-page pixels here via `crop_origin`.
+the question's answer region (higher relative resolution). The model returns geometry
+in its NATIVE convention — [ymin, xmin, ymax, xmax] boxes / [y, x] points normalized
+to 0-1000 (vision models are far more reliable in that space than at absolute pixels);
+`_yx_box_to_px`/`_yx_point_to_px` denormalize to crop pixels (with a per-item
+`coord_mode` scale-sanity detector for disobedient outputs), then `crop_origin` maps
+back to full-page pixels.
 
 The locator decides WHERE only — never what is wrong (checker) or how to draw it
-(renderer). Geometry is in the page's pixel space (origin top-left).
+(renderer). Output geometry is in the page's pixel space (origin top-left).
 """
 import io
 import logging
@@ -30,9 +34,12 @@ ROLE: You are a vision locator. You find WHERE specific handwritten text sits on
 of a scanned answer page so a teacher's red-pen marks can be drawn accurately. You decide WHERE
 only — never whether something is right or wrong (already decided) nor how to draw it.
 
-This cropped image is {width} pixels wide and {height} pixels tall (origin top-left). All
-coordinates you return MUST be in THIS cropped image's pixel space. It shows the answer region for
-question {question_number}.
+This cropped image shows the answer region for question {question_number}.
+
+COORDINATE SYSTEM (critical): return EVERY box as [ymin, xmin, ymax, xmax] and EVERY point as
+[y, x], NORMALIZED to a 0-1000 scale relative to THIS image — [0, 0] is the top-left corner and
+[1000, 1000] is the bottom-right corner. Do NOT return pixel values. Example: a box covering the
+top-left quarter of the image is [0, 0, 500, 500].
 
 ACCURACY OVER COVERAGE: a precise location or nothing. If you cannot confidently find an item,
 return empty geometry and LOW confidence for it — never guess a spot, because a misplaced mark on a
@@ -45,26 +52,106 @@ student's sheet is worse than no mark.
 {sections_block}
 
 RULES:
-- Underline path = MULTIPLE ordered points [x, y] following the real (slanted/curved) baseline UNDER the wrong text, left to right (4–8 points, not just two endpoints). If text wraps to a second line, give multiple paths.
-- "tick_point" = a single [x, y] in blank space just left of the FIRST line of the correct evidence (where a ✓ goes), NOT on top of the writing.
-- "evidence_box" / "target_text_box" = a tight box around the located text.
+- Underline path = MULTIPLE ordered points [y, x] following the real (slanted/curved) baseline UNDER the wrong text, left to right (4–8 points, not just two endpoints). If text wraps to a second line, give multiple paths.
+- "tick_point" = a single [y, x] in blank space just left of the FIRST line of the correct evidence (where a ✓ goes), NOT on top of the writing.
+- "evidence_box" / "target_text_box" = a tight [ymin, xmin, ymax, xmax] box around the located text.
+- "read_text" = the exact handwritten words you actually SEE inside the box you returned (transcribe them as written — this verifies the location; if what you see there differs from the requested text, still transcribe what you see).
 - Put comment boxes in margins or blank space — never over the student's writing.
 - If you cannot confidently find an item, return empty geometry and a LOW confidence for it (do NOT guess a location).
 
 --- ADMIN-TUNABLE GUIDANCE (refines emphasis only; never overrides the RULES above) ---
 {skill_instructions}
 
-Return ONLY valid JSON in exactly this structure:
+Return ONLY valid JSON in exactly this structure (all coordinates normalized 0-1000 as above):
 {{
   "targets": [
-    {{"target_text": "...", "target_text_box": [x1,y1,x2,y2],
-      "underline_paths": [{{"points": [[x,y],[x,y],[x,y]]}}],
-      "comment_box": [x1,y1,x2,y2], "comment_text": "...", "confidence": 0.0}}
+    {{"target_text": "...", "target_text_box": [ymin,xmin,ymax,xmax],
+      "underline_paths": [{{"points": [[y,x],[y,x],[y,x]]}}],
+      "comment_box": [ymin,xmin,ymax,xmax], "comment_text": "...",
+      "read_text": "...", "confidence": 0.0}}
   ],
   "section_marks": [
-    {{"section": "...", "evidence_box": [x1,y1,x2,y2], "tick_point": [x,y], "confidence": 0.0}}
+    {{"section": "...", "evidence_box": [ymin,xmin,ymax,xmax], "tick_point": [y,x],
+      "read_text": "...", "confidence": 0.0}}
   ]
 }}"""
+
+
+# ── Coordinate conversion: model space → crop-pixel space ─────────────────────────
+# The prompt asks for Gemini's NATIVE convention — [ymin,xmin,ymax,xmax] boxes and
+# [y,x] points normalized to 0-1000 — because vision models are far more reliable in
+# it than at absolute pixels. We convert to crop pixels here (the ONLY place the
+# [y,x] ordering is interpreted), then `_shift_box`/`_shift_point` map to page space.
+#
+# `_detect_coord_mode` classifies each item's raw geometry as a belt-and-braces guard:
+#   normalized      — everything ≤ 1000: the requested convention → scale by crop size.
+#   pixel_fallback  — values above 1000 but within the crop bounds: the model disobeyed
+#                     and emitted crop pixels (ordering still per the template) → use as-is.
+#   invalid         — values beyond any plausible range → geometry is zeroed and the
+#                     item's confidence forced to 0 so the validator ladder rejects it.
+# Note: on a crop smaller than 1000px, true pixel output is indistinguishable from
+# normalized and is treated as normalized (the requested convention); the geometry
+# validator + ink checks bound the damage of that rare disobedience.
+
+def _collect_coords(*geoms) -> list[float]:
+    out: list[float] = []
+
+    def walk(v) -> None:
+        if isinstance(v, bool):
+            return
+        if isinstance(v, (int, float)):
+            out.append(float(v))
+        elif isinstance(v, (list, tuple)):
+            for item in v:
+                walk(item)
+        elif isinstance(v, dict):
+            for item in v.values():
+                walk(item)
+
+    for g in geoms:
+        walk(g)
+    return out
+
+
+def _detect_coord_mode(geoms: list, crop_w: int, crop_h: int) -> str:
+    nums = _collect_coords(*geoms)
+    if not nums:
+        return "empty"
+    if min(nums) < -2:
+        return "invalid"
+    mx = max(nums)
+    if mx <= 1001:
+        return "normalized"
+    if mx <= max(crop_w, crop_h) * 1.05:
+        return "pixel_fallback"
+    return "invalid"
+
+
+def _yx_box_to_px(raw, mode: str, cw: int, ch: int):
+    """Model [ymin,xmin,ymax,xmax] → crop-pixel [x1,y1,x2,y2] (the internal ordering)."""
+    if not isinstance(raw, (list, tuple)) or len(raw) < 4:
+        return None
+    try:
+        y1, x1, y2, x2 = (float(v) for v in raw[:4])
+    except (TypeError, ValueError):
+        return None
+    if mode == "normalized":
+        x1, x2 = x1 / 1000.0 * cw, x2 / 1000.0 * cw
+        y1, y2 = y1 / 1000.0 * ch, y2 / 1000.0 * ch
+    return [x1, y1, x2, y2]
+
+
+def _yx_point_to_px(raw, mode: str, cw: int, ch: int):
+    """Model [y, x] → crop-pixel [x, y] (the internal ordering)."""
+    if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+        return None
+    try:
+        y, x = float(raw[0]), float(raw[1])
+    except (TypeError, ValueError):
+        return None
+    if mode == "normalized":
+        x, y = x / 1000.0 * cw, y / 1000.0 * ch
+    return [x, y]
 
 
 def _shift_box(box, ox, oy):
@@ -85,28 +172,38 @@ def _shift_point(pt, ox, oy):
         return pt
 
 
-def crop_region(page_png: bytes, question_bbox, page_w: int, page_h: int, pad_ratio: float = 0.06):
+def crop_region(page_png: bytes, question_bbox, page_w: int, page_h: int, pad_ratio: float = 0.10):
     """Crop the question's answer region (with padding) from the page PNG.
-    Returns (crop_png, crop_origin(ox,oy), crop_w, crop_h). Falls back to the full page
-    when the bbox is missing/unusable."""
+    Returns (crop_png, crop_origin(ox,oy), crop_w, crop_h). Falls back to the FULL page
+    when the bbox is missing/unusable OR looks suspicious (implausibly small/narrow) —
+    a wrong extraction bbox must cost locator precision, never correctness."""
     from PIL import Image
 
     img = Image.open(io.BytesIO(page_png)).convert("RGB")
-    if not (isinstance(question_bbox, (list, tuple)) and len(question_bbox) >= 4):
+
+    def _full_page():
         buf = io.BytesIO(); img.save(buf, format="PNG")
         return buf.getvalue(), (0, 0), img.width, img.height
+
+    if not (isinstance(question_bbox, (list, tuple)) and len(question_bbox) >= 4):
+        return _full_page()
     try:
         x, y, w, h = (float(v) for v in question_bbox[:4])
     except (TypeError, ValueError):
-        buf = io.BytesIO(); img.save(buf, format="PNG")
-        return buf.getvalue(), (0, 0), img.width, img.height
+        return _full_page()
+
+    # Suspicious-bbox guard: a real answer region spans a good share of the page. A
+    # tiny or very narrow bbox is more likely an extraction miss than a real region.
+    if (w * h) < 0.04 * (page_w * page_h) or w < 0.25 * page_w:
+        return _full_page()
 
     padx, pady = w * pad_ratio, h * pad_ratio
     x1 = max(0, int(x - padx)); y1 = max(0, int(y - pady))
     x2 = min(page_w, int(x + w + padx)); y2 = min(page_h, int(y + h + pady))
-    if x2 - x1 < 8 or y2 - y1 < 8:
-        buf = io.BytesIO(); img.save(buf, format="PNG")
-        return buf.getvalue(), (0, 0), img.width, img.height
+    # Width below ~250px starves the model's pixel budget; a legitimate one-line answer
+    # region can be short, so the height floor is only a couple of text lines.
+    if x2 - x1 < 250 or y2 - y1 < 120:
+        return _full_page()
     crop = img.crop((x1, y1, x2, y2))
     buf = io.BytesIO(); crop.save(buf, format="PNG")
     return buf.getvalue(), (x1, y1), crop.width, crop.height
@@ -144,7 +241,7 @@ class AnnotationLocatorAgent:
         ) or "(none)"
 
         prompt = LOCATOR_PROMPT.format(
-            width=crop_w, height=crop_h, question_number=question_number,
+            question_number=question_number,
             targets_block=targets_block, sections_block=sections_block,
             skill_instructions=await self._get_skill(),
         )
@@ -162,39 +259,71 @@ class AnnotationLocatorAgent:
         if not isinstance(result, dict):
             raise AIResponseError("annotation locator did not return an object")
 
-        # Map crop-space coordinates back to full-page pixel space.
+        # Convert model geometry (normalized 0-1000 [y,x], per-item mode detection) to
+        # crop pixels, then map crop-space coordinates back to full-page pixel space.
         out_targets: list[dict] = []
         for t in result.get("targets") or []:
             if not isinstance(t, dict):
                 continue
+            raw_paths = [(p or {}).get("points") for p in t.get("underline_paths") or []]
+            mode = _detect_coord_mode(
+                [t.get("target_text_box"), t.get("comment_box"), raw_paths], crop_w, crop_h,
+            )
             paths = []
-            for p in t.get("underline_paths") or []:
-                pts = [_shift_point(pt, ox, oy) for pt in (p or {}).get("points") or []]
-                pts = [pt for pt in pts if isinstance(pt, list)]
-                if pts:
-                    paths.append({"points": pts})
+            if mode in ("normalized", "pixel_fallback"):
+                for raw_pts in raw_paths:
+                    pts = [_yx_point_to_px(pt, mode, crop_w, crop_h) for pt in raw_pts or []]
+                    pts = [_shift_point(pt, ox, oy) for pt in pts if pt is not None]
+                    if pts:
+                        paths.append({"points": pts})
+                target_box = _shift_box(_yx_box_to_px(t.get("target_text_box"), mode, crop_w, crop_h), ox, oy)
+                comment_box = _shift_box(_yx_box_to_px(t.get("comment_box"), mode, crop_w, crop_h), ox, oy)
+                confidence = t.get("confidence")
+            else:  # "empty" (nothing to convert) or "invalid" (out-of-range garbage)
+                target_box = comment_box = None
+                confidence = 0.0 if mode == "invalid" else t.get("confidence")
             out_targets.append({
                 "page_number": page_number,
                 "question_number": question_number,
                 "target_text": t.get("target_text"),
-                "target_text_box": _shift_box(t.get("target_text_box"), ox, oy),
+                "target_text_box": target_box,
                 "underline_paths": paths,
-                "comment_box": _shift_box(t.get("comment_box"), ox, oy),
+                "comment_box": comment_box,
                 "comment_text": t.get("comment_text"),
                 "annotation_action": "underline_with_comment",
-                "confidence": t.get("confidence"),
+                "confidence": confidence,
+                "coord_mode": mode,
+                "read_text": t.get("read_text"),
             })
 
+        # The model only echoes the section label, so carry the INPUT evidence_text
+        # through by label — the validator matches the model's read_text against it.
+        ev_by_section = {
+            (s.get("section") or "").strip(): (s.get("evidence_text") or "")
+            for s in sections
+        }
         out_sections: list[dict] = []
         for s in result.get("section_marks") or []:
             if not isinstance(s, dict):
                 continue
+            mode = _detect_coord_mode([s.get("evidence_box"), s.get("tick_point")], crop_w, crop_h)
+            if mode in ("normalized", "pixel_fallback"):
+                evidence_box = _shift_box(_yx_box_to_px(s.get("evidence_box"), mode, crop_w, crop_h), ox, oy)
+                tick_point = _shift_point(_yx_point_to_px(s.get("tick_point"), mode, crop_w, crop_h), ox, oy)
+                confidence = s.get("confidence")
+            else:
+                evidence_box = tick_point = None
+                confidence = 0.0 if mode == "invalid" else s.get("confidence")
             out_sections.append({
                 "section": s.get("section"),
-                "evidence_box": _shift_box(s.get("evidence_box"), ox, oy),
-                "tick_point": _shift_point(s.get("tick_point"), ox, oy),
-                "confidence": s.get("confidence"),
+                "evidence_box": evidence_box,
+                "tick_point": tick_point,
+                "confidence": confidence,
+                "coord_mode": mode,
+                "read_text": s.get("read_text"),
+                "evidence_text": ev_by_section.get((s.get("section") or "").strip(), ""),
             })
 
         return {"page_number": page_number, "question_number": question_number,
-                "targets": out_targets, "section_marks": out_sections}
+                "targets": out_targets, "section_marks": out_sections,
+                "crop": {"origin": [ox, oy], "size": [crop_w, crop_h]}}

@@ -5,11 +5,15 @@ the maximum awardable per question (CLAUDE.md §11). Extraction only — it does
 judge or answer anything.
 
 Two read paths (chosen by the caller in `subjective_tasks.py`):
-  • `extract(paper_text=…)`     — the paper has a usable embedded text layer.
-  • `extract_from_images(pngs)` — a scanned / no-text-layer paper, read STRAIGHT from
-    the page image in one vision pass (Azure gpt-5 typed vision). This replaces the old
-    lossy OCR→text→extract double pass, so wording stays verbatim and the marks are read
-    from the printed digit.
+  • `extract(paper_text=…)`     — DOCX/DOC papers that can't be rasterized here: read from
+    the embedded text layer (gpt-5 typed text).
+  • `extract_from_images(pngs)` — any renderable paper (PDF / image), read STRAIGHT from
+    the page image in one vision pass with **Gemini 3.5 flash** (it reads printed
+    Nepali/Devanagari question papers more reliably than gpt-5 typed vision — CLAUDE.md §12).
+    This is now the DEFAULT path for question papers (a PDF is always rendered to page PNGs,
+    never trusted to its text layer), so a Preeti/garbage text layer can't poison extraction;
+    cost is negligible (a question paper is only 1–2 pages). Wording stays verbatim and the
+    marks are read from the printed digit.
 
 Both accept `expected_total_marks`: when the admin configured a Total Marks, it is passed
 in as a checksum hint so the model re-checks its mark reading. The caller additionally
@@ -75,9 +79,9 @@ QUESTION PAPER CONTENT:
 
 VISION_PROMPT = EXAM_CONTEXT + """
 
-ROLE: You parse subjective (written-answer) exam question papers into structured data by READING THE
-ATTACHED PAGE IMAGE. The marks you extract become the SOURCE OF TRUTH for the maximum awardable per
-question, so getting them right is critical.
+ROLE: You are a precise OCR-and-structuring engine that parses subjective (written-answer) exam
+question papers into structured data by READING THE ATTACHED PAGE IMAGE. The marks you extract become
+the SOURCE OF TRUTH for the maximum awardable per question, so getting them right is critical.
 
 TASK: Read the attached question-paper page image and extract EVERY question visible on it — its
 number label, full VERBATIM question text (transcribe the printed Devanagari/English exactly), and
@@ -151,9 +155,18 @@ class QuestionPaperAgent:
         self, page_images: list[bytes], *, custom_instruction: str | None, test_id: uuid.UUID,
         expected_total_marks: int | None = None,
     ) -> list[dict]:
-        """Extract by reading the page images directly (Azure gpt-5 typed vision), one call
-        per page in parallel, merged in page order. Single faithful pass — no OCR→text loss."""
-        provider = get_provider("vision_typed")
+        """Extract by reading the page images directly with Gemini 3.5 flash vision, one call
+        per page in parallel, merged in page order. Single faithful pass — no OCR→text loss.
+        Gemini reads printed Nepali/Devanagari question papers more reliably than gpt-5 typed
+        vision (CLAUDE.md §12), so it is the PRIMARY question-paper reader.
+
+        SAFETY NET: if Gemini fails on a page (e.g. a 503 "high demand" spike that outlasts its
+        own 3 retries, or a rate-limit), that page falls back to the gpt-5.5 reasoning-tier vision
+        provider so a Gemini outage never loses the whole test — and gpt-5.5 is the highest-quality
+        reader, so the fallback page still reads well. The rest of the checking pipeline is
+        unchanged."""
+        provider = get_provider("vision")       # Gemini 3.5 flash — best Nepali/Devanagari OCR
+        fallback = get_provider("reasoning")    # gpt-5.5 — high-quality safety net if Gemini is down
         skill = await self._get_skill()
         prompt = VISION_PROMPT.format(
             skill_instructions=skill,
@@ -167,6 +180,7 @@ class QuestionPaperAgent:
             "entity_type": "subjective_test",
             "entity_id": test_id,
         }
+        fallback_ctx = {**audit_ctx, "task_type": "subjective_question_extraction_vision_fallback"}
         sem = asyncio.Semaphore(6)
 
         async def _page(idx: int, img: bytes):
@@ -175,10 +189,20 @@ class QuestionPaperAgent:
                     res = await provider.generate_with_image(prompt, img, schema={}, audit_ctx=audit_ctx)
                     return idx, res
                 except Exception as exc:
-                    # Per-page fault isolation: a fraction of pages failing on one attempt
-                    # just yields fewer questions → the caller's marks checksum triggers a retry.
-                    logger.warning("vision question extraction failed on page %d: %s", idx + 1, exc)
-                    return idx, None
+                    # Gemini failed for this page (overload/rate-limit/etc.) even after its own
+                    # 3 retries → fall back to gpt-5.5 vision so the paper is still read.
+                    logger.warning(
+                        "Gemini question extraction failed on page %d (%s); falling back to gpt-5.5",
+                        idx + 1, exc,
+                    )
+                    try:
+                        res = await fallback.generate_with_image(prompt, img, schema={}, audit_ctx=fallback_ctx)
+                        return idx, res
+                    except Exception as exc2:
+                        # Both readers failed on this page: yield nothing for it → fewer questions,
+                        # so the caller's marks checksum triggers a retry rather than a silent gap.
+                        logger.warning("gpt-5.5 fallback also failed on page %d: %s", idx + 1, exc2)
+                        return idx, None
 
         results = await asyncio.gather(*[_page(i, img) for i, img in enumerate(page_images[:15])])
         merged: list[dict] = []

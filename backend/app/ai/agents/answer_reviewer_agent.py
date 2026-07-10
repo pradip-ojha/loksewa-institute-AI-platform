@@ -90,9 +90,14 @@ class AnswerReviewerAgent:
         import json
 
         full_marks_block = "\n".join(f"- {qid}: {fm}" for qid, fm in full_marks_by_qid.items()) or "none"
+        evaluation_json = json.dumps(evaluation, ensure_ascii=False)
+        if len(evaluation_json) > 50000:
+            # A mid-JSON cut would hand the reviewer a broken document — flag loudly.
+            logger.warning("reviewer input evaluation JSON truncated (%s chars > 50000)", len(evaluation_json))
+            evaluation_json = evaluation_json[:50000]
         prompt = REVIEW_PROMPT.format(
             full_marks_block=full_marks_block,
-            evaluation_json=json.dumps(evaluation, ensure_ascii=False)[:50000],
+            evaluation_json=evaluation_json,
             skill_instructions=await self._get_skill(),
         )
         audit_ctx = {

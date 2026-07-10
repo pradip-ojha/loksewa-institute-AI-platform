@@ -16,6 +16,7 @@ import asyncio
 import copy
 import io
 import logging
+import random
 import uuid
 
 from workers.celery_app import celery_app
@@ -95,9 +96,10 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
             admin_total = test.total_marks or 0
             await update_job(db, jid, status=JobStatus.processing, progress=8, step="Reading question paper")
 
-        # Resolve the paper source ONCE: a usable embedded text layer → text extraction;
-        # else render pages to images for DIRECT vision extraction (no lossy OCR→text→extract
-        # double pass — wording stays verbatim, marks read from the printed digit). ────
+        # Resolve the paper source ONCE: a renderable PDF/image → page PNGs read by Gemini
+        # vision (default, CLAUDE.md §12); a DOCX/DOC → its embedded text layer (gpt-5 text).
+        # No lossy OCR→text→extract double pass — wording stays verbatim, marks read from the
+        # printed digit. ────
         async with AsyncSessionLocal() as db:
             source_kind, source = await _resolve_paper_source(db, question_paper_file_id)
         if source_kind == "text" and not source.strip():
@@ -467,7 +469,9 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
 
         # 1) Quality gate ────────────────────────────────────────────────────────
         await _job(progress=15, step="Checking image quality")
-        metrics = image_quality.assess(page_pngs)
+        metrics = image_quality.assess(
+            page_pngs, orig_sizes=[(p.orig_width, p.orig_height) for p in pages],
+        )
         async with AsyncSessionLocal() as db:
             db.add(AnswerQualityCheck(
                 sheet_id=sid, blur_score=metrics.blur_score, brightness_score=metrics.brightness_score,
@@ -488,6 +492,9 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
             structure_map = await AnswerStructureAgent(db).detect(
                 page_pngs=page_pngs, valid_numbers=valid_numbers, sheet_id=sid,
             )
+        # Normalize the map's question labels to exact known numbers (drop garbage) so
+        # extraction hints and assembly tie-breaking never see an unknown label.
+        structure_map = svc.validate_structure_map(structure_map, valid_numbers)
 
         # 2b) Question-level extraction — all pages CONCURRENTLY, each on its OWN
         # short-lived session (audit logging writes to the DB; one AsyncSession is
@@ -506,7 +513,6 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
                             width=page.width, height=page.height,
                             valid_numbers=valid_numbers, sheet_id=sid,
                             structure_hint=AnswerStructureAgent.page_hint(structure_map, page.page_number),
-                            prev_page_tail="",
                             next_page_hint=(f"Next page is expected to hold: {nxt}" if nxt else ""),
                         )
                 except Exception as exc:
@@ -517,7 +523,7 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         page_outputs = list(await asyncio.gather(*[_extract_one(p) for p in pages]))
         confidences: list[float] = [po.get("page_confidence", 0.0) for po in page_outputs]
 
-        extraction = svc.assemble_questionwise(page_outputs, questions)
+        extraction = svc.assemble_questionwise(page_outputs, questions, structure_map=structure_map)
         extraction["structure_map"] = structure_map
         overall_conf = round(sum(confidences) / len(confidences), 3) if confidences else None
         async with AsyncSessionLocal() as db:
@@ -544,6 +550,42 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
             # routes through the task's failure path (_mark_sheet_failed → sheet `failed`,
             # run_task → terminal failed); a normal return here would be marked completed.
             raise ValueError(note)
+
+        # PARTIAL-loss guard: the whole-guard above only trips when EVERYTHING is blank,
+        # so a single unreadable/dropped page used to become a silent, unfair 0 for its
+        # questions. Compare what the structure pass EXPECTED (questions it placed on
+        # some page) against what extraction actually produced; too many expected-but-
+        # empty questions (or a very low mean page confidence) → ask for a re-upload
+        # naming the affected questions. Attempts exhausted → continue, but carry the
+        # warnings into the evaluation so the result is never silently unfair.
+        expected_qids = {
+            q.get("question_number") for q in (structure_map.get("questions") or [])
+            if isinstance(q, dict) and q.get("pages")
+        }
+        unreadable = [
+            q["qid"] for q in extraction.get("questions", [])
+            if q["qid"] in expected_qids and len((q.get("answer_text") or "").strip()) < 20
+        ]
+        total_q = max(1, len(extraction.get("questions", [])))
+        low_conf = overall_conf is not None and overall_conf < 0.35
+        extraction_warnings: list[str] = []
+        if unreadable and (len(unreadable) / total_q > 0.30 or low_conf):
+            qlist = ", ".join(unreadable)
+            note = (f"Could not read the answer(s) to question(s) {qlist} from the uploaded "
+                    "sheet — please re-upload a clearer scan of those pages.")
+            if upload_attempt < svc.MAX_UPLOAD_ATTEMPTS:
+                await _set_sheet_status("needs_reupload")
+                await _job(status=JobStatus.completed, progress=100, step="Re-upload requested",
+                           output={"needs_reupload": True, "quality_notes": note})
+                return
+            extraction_warnings.append(
+                f"Question(s) {qlist}: writing was detected on the sheet but no readable answer "
+                "could be extracted — the marks for these questions may be affected."
+            )
+        elif unreadable:
+            extraction_warnings.append(
+                f"Question(s) {', '.join(unreadable)}: little or no readable answer text was extracted."
+            )
 
         # Locked per-question checking skills + optional rubric text (one session) ─
         async with AsyncSessionLocal() as db:
@@ -578,6 +620,14 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
             )
         review_notes = reviewed.get("review_notes")
         final_eval, awarded, possible = svc.clamp_marks(reviewed, questions)
+
+        # Surface partial-extraction loss on the result itself (never a silent unfair 0):
+        # stored structurally AND appended to the student-visible overall summary.
+        if extraction_warnings:
+            final_eval["extraction_warnings"] = extraction_warnings
+            summ = (final_eval.get("overall_summary") or "").strip()
+            warn_text = " ".join(extraction_warnings)
+            final_eval["overall_summary"] = (summ + ("\n\n" if summ else "") + f"⚠ {warn_text}").strip()
 
         # SAVE evaluation + flip to feedback_ready (one atomic burst) ────────────
         # PROGRESSIVE FEEDBACK SPLIT (spec §6.5): marks + feedback are final, expose
@@ -616,7 +666,7 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         async def _annotate() -> None:
             await _job(progress=78, step="Locating annotations")
             regions_by_q = _regions_by_question(extraction)
-            commands_by_page, locator_plans = await _locate_and_build_commands(
+            commands_by_page, locator_plan_doc = await _locate_and_build_commands(
                 final_eval, regions_by_q, page_map, geom, sid,
             )
 
@@ -644,7 +694,7 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
                 db.add(PDFAnnotation(
                     sheet_id=sid,
                     annotation_instructions={"pages": {str(k): v for k, v in commands_by_page.items()}},
-                    locator_plan={"targets": locator_plans},
+                    locator_plan=locator_plan_doc,
                     checked_file_id=checked_file.id, annotation_status="completed",
                 ))
                 s = (await db.execute(select(StudentAnswerSheet).where(StudentAnswerSheet.id == sid))).scalar_one_or_none()
@@ -679,6 +729,125 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         logger.exception("check_answer_sheet failed: %s", exc)
         _mark_sheet_failed(sheet_id)
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
+
+
+@celery_app.task(
+    bind=True,
+    name="workers.tasks.subjective_tasks.reannotate_sheet",
+    max_retries=0,
+)
+def reannotate_sheet(self, job_id: str, sheet_id: str) -> None:
+    """Re-run ONLY the annotation phase (locator → geometry validator → renderer →
+    checked PDF) on a sheet's STORED extraction + final evaluation. Marks/feedback are
+    never touched — this is the cheap iteration harness for tuning annotation placement
+    (~one Gemini locator call per (question, page), no re-extraction, no GPT-5.5 passes).
+    The prior PDFAnnotation + checked-File rows are replaced only AFTER the new checked
+    PDF is fully built, so a failed run leaves the existing checked PDF in place."""
+    async def work() -> None:
+        import asyncio
+        from sqlalchemy import delete, select
+        from app.core.database import AsyncSessionLocal
+        from app.integrations.r2_client import get_r2
+        from app.modules.files.models import File
+        from app.modules.jobs.models import JobStatus
+        from app.modules.jobs.service import update_job
+        from app.modules.subjective.models import (
+            AnswerEvaluation, AnswerExtraction, PDFAnnotation, StudentAnswerSheet, SubjectiveTest,
+        )
+        from app.processing import pdf_tools, annotation as annotate
+        from app.processing import annotation_geometry as geom
+
+        jid = uuid.UUID(job_id)
+        sid = uuid.UUID(sheet_id)
+
+        async def _job(**kw) -> None:
+            async with AsyncSessionLocal() as db:
+                await update_job(db, jid, **kw)
+
+        # ── LOAD: stored extraction + final evaluation as plain data ────────────
+        async with AsyncSessionLocal() as db:
+            sheet = (await db.execute(select(StudentAnswerSheet).where(StudentAnswerSheet.id == sid))).scalar_one_or_none()
+            if not sheet:
+                raise ValueError(f"StudentAnswerSheet {sheet_id} not found")
+            if sheet.current_status not in ("feedback_ready", "checked"):
+                raise ValueError(
+                    f"Sheet has no completed evaluation to re-annotate (status: {sheet.current_status})"
+                )
+            test = (await db.execute(select(SubjectiveTest).where(SubjectiveTest.id == sheet.test_id))).scalar_one()
+            extraction_row = (await db.execute(
+                select(AnswerExtraction).where(AnswerExtraction.sheet_id == sid)
+                .order_by(AnswerExtraction.created_at.desc()).limit(1)
+            )).scalar_one_or_none()
+            evaluation_row = (await db.execute(
+                select(AnswerEvaluation).where(AnswerEvaluation.sheet_id == sid)
+                .order_by(AnswerEvaluation.created_at.desc()).limit(1)
+            )).scalar_one_or_none()
+            file_record = (await db.execute(select(File).where(File.id == sheet.file_id))).scalar_one_or_none()
+            if not extraction_row or not evaluation_row or not file_record:
+                raise ValueError("Stored extraction/evaluation/file missing — run a full check first.")
+            extraction = extraction_row.extracted_data or {}
+            final_eval = evaluation_row.evaluation_data or {}
+            awarded = evaluation_row.total_marks_awarded
+            possible = evaluation_row.total_marks_possible
+            student_id = sheet.student_id
+            display_name = test.display_name
+            r2_key = file_record.r2_key
+            mime_type = file_record.mime_type
+            await update_job(db, jid, status=JobStatus.processing, progress=10, step="Rendering pages")
+
+        # Re-render pages — deterministic (same DPI/size cap as checking ⇒ same pixel
+        # space as the stored extraction bboxes).
+        file_bytes = await asyncio.to_thread(get_r2().download_fileobj, r2_key)
+        pages = pdf_tools.render_to_page_images(file_bytes, mime_type)
+        page_map = {p.page_number: p for p in pages}
+
+        await _job(progress=25, step="Locating annotations")
+        regions_by_q = _regions_by_question(extraction)
+        commands_by_page, locator_plan_doc = await _locate_and_build_commands(
+            final_eval, regions_by_q, page_map, geom, sid,
+        )
+
+        await _job(progress=80, step="Drawing checked PDF")
+        _add_marks_and_banner(commands_by_page, final_eval, regions_by_q, page_map, awarded, possible)
+        annotated_pngs = [
+            annotate.draw_annotations(page.png_bytes, commands_by_page.get(page.page_number, []))
+            for page in pages
+        ]
+        checked_pdf = pdf_tools.build_pdf_from_images(annotated_pngs)
+
+        checked_key = f"answer-sheets/checked/{sid}/checked.pdf"
+        await asyncio.to_thread(
+            get_r2().upload_fileobj, checked_key, io.BytesIO(checked_pdf), "application/pdf"
+        )
+
+        # ── SAVE: swap in the new annotation only now (failure above keeps the old) ─
+        async with AsyncSessionLocal() as db:
+            await db.execute(delete(PDFAnnotation).where(PDFAnnotation.sheet_id == sid))
+            await db.execute(delete(File).where(File.r2_key == checked_key))
+            checked_file = File(
+                original_filename="checked.pdf", display_name=f"{display_name} — Checked",
+                mime_type="application/pdf", file_size=len(checked_pdf), r2_key=checked_key,
+                uploaded_by=student_id,
+            )
+            db.add(checked_file)
+            await db.flush()
+            db.add(PDFAnnotation(
+                sheet_id=sid,
+                annotation_instructions={"pages": {str(k): v for k, v in commands_by_page.items()}},
+                locator_plan=locator_plan_doc,
+                checked_file_id=checked_file.id, annotation_status="completed",
+            ))
+            s = (await db.execute(select(StudentAnswerSheet).where(StudentAnswerSheet.id == sid))).scalar_one_or_none()
+            if s and s.current_status == "feedback_ready":
+                s.current_status = "checked"
+            await db.commit()
+
+        await _job(status=JobStatus.completed, progress=100, step="Re-annotated",
+                   output={"reannotated": True, "pages": len(pages)})
+
+    # No retry and no _mark_sheet_failed: a failed re-annotation leaves the sheet's
+    # existing checked state + PDF untouched (run_task records the failed job).
+    run_task(work, job_id=job_id, task=self, manage_session=False)
 
 
 # ── personalization hook ───────────────────────────────────────────────────────
@@ -720,29 +889,6 @@ async def _log_subjective_activity(db, *, student_id, sheet_id, exam_id, display
         pass
 
 
-# ── extraction helpers ───────────────────────────────────────────────────────────
-
-def _prev_page_tail(page_outputs: list[dict]) -> str:
-    """A short carry-forward hint from the previous page: its last question and whether
-    that answer was flagged as continuing, so the extractor can attribute unlabeled
-    writing at the top of this page."""
-    if not page_outputs:
-        return ""
-    last = page_outputs[-1]
-    answers = last.get("answers") or []
-    if not answers:
-        return ""
-    a = answers[-1]
-    qn = a.get("question_number")
-    tail = (a.get("answer_text") or "").strip().replace("\n", " ")
-    tail = tail[-160:]
-    cont = " (this answer was marked as continuing)" if a.get("continues") else ""
-    if not qn and not tail:
-        return ""
-    return (f"Previous page ended with question {qn}{cont}. Its last words were: "
-            f"\"...{tail}\". If this page starts with unlabeled writing, it likely continues question {qn}.")
-
-
 # ── annotation helpers ───────────────────────────────────────────────────────────
 
 def _regions_by_question(extraction: dict) -> dict[str, list[dict]]:
@@ -768,19 +914,11 @@ def _positive_sections(qres: dict) -> list[dict]:
     return out[:MAX_TARGETS_PER_QUESTION]
 
 
-def _norm_text(s: str) -> str:
-    """Lowercased alphanumeric-only form (keeps Devanagari letters) for fuzzy matching."""
-    return "".join(ch.lower() for ch in (s or "") if ch.isalnum())
-
-
-def _ngrams(s: str, n: int = 4) -> set[str]:
-    return {s[i:i + n] for i in range(len(s) - n + 1)} if len(s) >= n else ({s} if s else set())
-
-
 def _section_page(evidence_text: str, regions: list[dict]) -> int | None:
     """Pick the page whose extracted answer text contains / best matches this section's
     evidence, so its tick is located on the RIGHT page of a multi-page answer. Returns
     None when no page matches confidently (caller then skips the tick)."""
+    from app.processing.text_match import ngrams as _ngrams, norm_text as _norm_text
     ev = _norm_text(evidence_text)
     if not ev:
         return None
@@ -804,7 +942,9 @@ def _section_page(evidence_text: str, regions: list[dict]) -> int | None:
 async def _locate_and_build_commands(final_eval, regions_by_q, page_map, geom, sheet_id):
     """One vision locator call per (question, page): finds underline paths for wrong
     items AND placement for positive ticks/section marks, validates geometry, and emits
-    draw commands. Returns (commands_by_page, locator_plans). Section ticks/marks always
+    draw commands. Returns (commands_by_page, locator_plan_doc) where the doc =
+    {"targets": per-question validated plans, "summary": per-sheet accuracy metrics}
+    (persisted as pdf_annotations.locator_plan). Section ticks/marks always
     appear (region fallback in the validator); underlines use the safety ladder. Stays
     uncrowded via per-page/per-question caps.
 
@@ -848,36 +988,56 @@ async def _locate_and_build_commands(final_eval, regions_by_q, page_map, geom, s
                 sections_by_page.setdefault(spage, []).append(s)
 
         # Sorted for determinism (set iteration order is otherwise arbitrary).
+        # The per-page cap counts planned MARKS (underline targets + ticks), not locator
+        # calls — a call can carry several marks, so counting calls under-limited crowding.
         for page_no in sorted(set(targets_by_page) | set(sections_by_page)):
             page = page_map.get(page_no)
-            if not page or page_plan_count.get(page_no, 0) >= MAX_TARGETS_PER_PAGE:
+            if not page:
                 continue
-            page_targets = targets_by_page.get(page_no, [])
-            page_sections = sections_by_page.get(page_no, [])
+            allowance = MAX_TARGETS_PER_PAGE - page_plan_count.get(page_no, 0)
+            if allowance <= 0:
+                continue
+            # Wrong-item targets first (negatives matter more than ticks), then ticks.
+            page_targets = targets_by_page.get(page_no, [])[:allowance]
+            page_sections = sections_by_page.get(page_no, [])[:max(0, allowance - len(page_targets))]
             if not page_targets and not page_sections:
                 continue
             qbbox = next((r.get("question_bbox") for r in regions if r.get("page") == page_no), None)
             jobs.append({"qnum": qnum, "page_no": page_no, "page": page, "qbbox": qbbox,
                          "page_targets": page_targets, "page_sections": page_sections})
-            page_plan_count[page_no] = page_plan_count.get(page_no, 0) + 1
+            page_plan_count[page_no] = page_plan_count.get(page_no, 0) + len(page_targets) + len(page_sections)
 
     # ── LOCATE (parallel): one vision call per planned job, capped concurrency. ──────
     sem = asyncio.Semaphore(LOCATOR_CONCURRENCY)
+    retry_count = 0
+    failed_calls = 0
 
     async def _locate(job: dict) -> dict:
+        nonlocal retry_count, failed_calls
         page, page_no, qnum, qbbox = job["page"], job["page_no"], job["qnum"], job["qbbox"]
         crop_png, crop_origin, cw, ch = crop_region(page.png_bytes, qbbox, page.width, page.height)
         async with sem:
-            try:
-                async with AsyncSessionLocal() as ldb:
-                    return await AnnotationLocatorAgent(ldb).locate_question(
-                        crop_png=crop_png, crop_origin=crop_origin, crop_w=cw, crop_h=ch,
-                        page_number=page_no, question_number=qnum,
-                        targets=job["page_targets"], sections=job["page_sections"], sheet_id=sheet_id,
-                    )
-            except Exception as exc:
-                logger.warning("locator failed for Q%s p%s (continuing): %s", qnum, page_no, exc)
-                return {"page_number": page_no, "question_number": qnum, "targets": [], "section_marks": []}
+            # One retry (fresh session, jittered wait — Gemini free tier is per-minute
+            # rate-limited) so a single transient failure doesn't silently drop every
+            # mark for this (question, page). Kept inside the semaphore so concurrency
+            # stays bounded; ANNOTATION_BUDGET_SECONDS covers the added worst case.
+            for attempt in (1, 2):
+                try:
+                    async with AsyncSessionLocal() as ldb:
+                        return await AnnotationLocatorAgent(ldb).locate_question(
+                            crop_png=crop_png, crop_origin=crop_origin, crop_w=cw, crop_h=ch,
+                            page_number=page_no, question_number=qnum,
+                            targets=job["page_targets"], sections=job["page_sections"], sheet_id=sheet_id,
+                        )
+                except Exception as exc:
+                    if attempt == 1:
+                        retry_count += 1
+                        logger.warning("locator attempt 1 failed for Q%s p%s (retrying): %s", qnum, page_no, exc)
+                        await asyncio.sleep(4 + random.uniform(0, 3))
+                    else:
+                        failed_calls += 1
+                        logger.warning("locator failed for Q%s p%s (continuing): %s", qnum, page_no, exc)
+            return {"page_number": page_no, "question_number": qnum, "targets": [], "section_marks": []}
 
     locations = await asyncio.gather(*[_locate(j) for j in jobs])
 
@@ -890,7 +1050,10 @@ async def _locate_and_build_commands(final_eval, regions_by_q, page_map, geom, s
 
     for job, loc in zip(jobs, locations):
         page, page_no, qbbox = job["page"], job["page_no"], job["qbbox"]
-        plan = geom.validate_question_plan(loc, (page.width, page.height), qbbox)
+        plan = geom.validate_question_plan(
+            loc, (page.width, page.height), qbbox, page_png=page.png_bytes,
+        )
+        plan["crop"] = loc.get("crop")
         locator_plans.append(plan)
 
         for tp in plan.get("targets", []):
@@ -904,7 +1067,31 @@ async def _locate_and_build_commands(final_eval, regions_by_q, page_map, geom, s
             tpoint = sm.get("tick_point")
             if isinstance(tpoint, (list, tuple)) and len(tpoint) >= 2:
                 add(page_no, {"type": "tick", "x": int(tpoint[0]), "y": int(tpoint[1])})
-    return commands_by_page, locator_plans
+
+    # ── SUMMARY: the per-sheet trend metric for locator accuracy regressions. ────────
+    status_counts: dict[str, int] = {}
+    match_scores: list[float] = []
+    pixel_fallbacks = 0
+    ticks = 0
+    for plan in locator_plans:
+        for tp in plan.get("targets", []):
+            status_counts[tp.get("status") or "unknown"] = status_counts.get(tp.get("status") or "unknown", 0) + 1
+            if isinstance(tp.get("match_score"), (int, float)):
+                match_scores.append(float(tp["match_score"]))
+            if (tp.get("original") or {}).get("coord_mode") == "pixel_fallback":
+                pixel_fallbacks += 1
+        ticks += len(plan.get("section_marks") or [])
+    summary = {
+        "locator_calls": len(jobs),
+        "retries": retry_count,
+        "failed_calls": failed_calls,
+        "targets_by_status": status_counts,
+        "ticks_placed": ticks,
+        "mean_match_score": (round(sum(match_scores) / len(match_scores), 3) if match_scores else None),
+        "pixel_fallbacks": pixel_fallbacks,
+    }
+    logger.info("annotation summary for sheet %s: %s", sheet_id, summary)
+    return commands_by_page, {"targets": locator_plans, "summary": summary}
 
 
 def _bbox_area(bbox) -> float:
@@ -986,12 +1173,17 @@ def _fmt(v) -> str:
 
 async def _resolve_paper_source(db, file_id) -> tuple[str, object]:
     """Decide how the question paper should be READ and return the source for it:
-      • ("text", paper_text)   — the paper has a usable embedded text layer (≥30 chars).
-      • ("images", [png, ...]) — scanned / no-text-layer PDF or image → page PNGs @300 DPI
-        for DIRECT vision extraction (one faithful pass, marks read from the printed digit),
-        instead of the old lossy OCR→text→extract chain.
-    Mirrors `_resolve_text`'s text-vs-vision decision. (Preeti/scanned .docx has no image
-    render path here, same as before — upload such papers as PDF.)"""
+      • ("images", [png, ...]) — ANY renderable paper (PDF or image) → page PNGs @300 DPI for
+        DIRECT vision extraction with Gemini 3.5 flash (CLAUDE.md §12). This is now the DEFAULT
+        for question papers: a PDF is ALWAYS rasterized and read from the page image, never
+        trusted to its embedded text layer — so a Preeti/legacy-font text layer that decodes to
+        ASCII garbage can no longer poison extraction, and Gemini reads the printed
+        Nepali/Devanagari far more reliably than gpt-5 typed vision. A question paper is only
+        1–2 pages, so the extra vision cost is negligible.
+      • ("text", paper_text)   — DOCX/DOC papers, which have no image render path here: fall back
+        to the embedded text layer (gpt-5 typed text). Upload scanned papers as PDF/image to get
+        the Gemini vision path.
+    (`extract_from_images` runs on Gemini; `extract` on gpt-5 text.)"""
     if not file_id:
         return "text", ""
     from sqlalchemy import select
@@ -1005,23 +1197,21 @@ async def _resolve_paper_source(db, file_id) -> tuple[str, object]:
         return "text", ""
     data = await asyncio.to_thread(get_r2().download_fileobj, f.r2_key)
 
-    text = ""
-    if f.mime_type in (
-        "application/pdf",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "application/msword",
-    ):
+    # Renderable formats (PDF / image) → ALWAYS Gemini vision on the page images.
+    if f.mime_type == "application/pdf" or f.mime_type.startswith("image/"):
         try:
-            text = extract_text_from_bytes(data, f.mime_type)
+            pages = pdf_tools.render_to_page_images(data, f.mime_type, dpi=300)
+            return "images", [p.png_bytes for p in pages[:15]]
         except Exception:
-            text = ""
-    if len(text.strip()) >= 30:
-        return "text", text
+            return "images", []
+
+    # DOCX / DOC — cannot rasterize here; read the embedded text layer instead.
+    text = ""
     try:
-        pages = pdf_tools.render_to_page_images(data, f.mime_type, dpi=300)
+        text = extract_text_from_bytes(data, f.mime_type)
     except Exception:
-        return "images", []
-    return "images", [p.png_bytes for p in pages[:15]]
+        text = ""
+    return "text", text
 
 
 async def _resolve_text(db, file_id, handwritten: bool = False) -> str:

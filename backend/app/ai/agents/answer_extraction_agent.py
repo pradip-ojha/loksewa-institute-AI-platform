@@ -7,7 +7,11 @@ annotation geometry is found later, on demand, by the vision locator only for th
 few wrong items that get marked.
 
 The extractor ONLY transcribes — it does not check, correct, rewrite, translate, or
-summarize. Coordinates are in the rendered page's pixel space (origin top-left).
+summarize. The model returns `question_bbox` in Gemini's native convention —
+[ymin, xmin, ymax, xmax] normalized to 0-1000 (vision models are far more reliable in
+that space than at absolute pixels); `_bbox_to_pixels` denormalizes to the stored
+page-pixel [x, y, w, h] shape (with a scale-sanity fallback for disobedient outputs),
+so everything downstream (assembly, cropping, annotation) is unchanged.
 """
 import logging
 import uuid
@@ -26,17 +30,16 @@ ROLE: You are a precise handwriting OCR system for scanned Loksewa exam answer s
 write fast, in Nepali (Devanagari), English, or a mix, with corrections and varied handwriting.
 Your transcription is the only text the checker will see, so capture it faithfully and completely.
 
-This is page {page_number} of a student's answer sheet. The image is {width} pixels wide and {height} pixels tall (origin at top-left).
+This is page {page_number} of a student's answer sheet.
 
 STRUCTURE GUIDANCE (from a whole-sheet pass — use it to resolve unclear question numbers and continuations, but TRUST THE VISIBLE PAGE: correct this guidance if the page clearly contradicts it):
 {structure_hint}
-{prev_page_tail}
 {next_page_hint}
 
 Group the handwriting by QUESTION. For each question that has writing on THIS page return:
 - "question_number": the question this answer belongs to. Use one of the known labels when a question number is visible ("Q1", "1.", "प्रश्न नं. १"); if writing continues from the previous page with no new label, use the question it continues.
 - "answer_text": the exact full transcribed answer for that question on this page (preserve Devanagari; transcribe formulas, numbers, and table contents as written; keep line breaks with \\n).
-- "question_bbox": [x, y, w, h] integer pixel rectangle enclosing that question's answer region on this page.
+- "question_bbox": [ymin, xmin, ymax, xmax] — the rectangle enclosing that question's answer region on this page, NORMALIZED to a 0-1000 scale ([0, 0] = top-left corner of the page, [1000, 1000] = bottom-right corner). Do NOT return pixel values.
 - "continues": true if this question's answer clearly runs onto the next page, else false.
 
 Known question numbers for this test: {valid_numbers}
@@ -54,10 +57,44 @@ Return ONLY valid JSON in exactly this structure:
   "page": {page_number},
   "page_size": [{width}, {height}],
   "answers": [
-    {{"question_number": "Q1", "answer_text": "...", "question_bbox": [80, 120, 1000, 640], "continues": false}}
+    {{"question_number": "Q1", "answer_text": "...", "question_bbox": [55, 40, 430, 960], "continues": false}}
   ],
   "page_confidence": 0.0
 }}"""
+
+
+def _bbox_to_pixels(raw, width: int, height: int) -> list[int] | None:
+    """Model `question_bbox` → stored page-pixel [x, y, w, h].
+
+    The prompt asks for [ymin, xmin, ymax, xmax] normalized to 0-1000 (Gemini's native
+    convention). Belt-and-braces scale detection: values ≤ 1000 are normalized (the
+    requested convention); values above 1000 but within the page bounds mean the model
+    disobeyed and emitted page pixels (ordering still per the template) — used as-is;
+    anything beyond the page is garbage → None (region falls back to full-page crop)."""
+    if not isinstance(raw, (list, tuple)) or len(raw) < 4:
+        return None
+    try:
+        y1, x1, y2, x2 = (float(v) for v in raw[:4])
+    except (TypeError, ValueError):
+        return None
+    vals = [y1, x1, y2, x2]
+    if min(vals) < -2:
+        return None
+    mx = max(vals)
+    if mx <= 1001:  # normalized 0-1000
+        x1, x2 = x1 / 1000.0 * width, x2 / 1000.0 * width
+        y1, y2 = y1 / 1000.0 * height, y2 / 1000.0 * height
+    elif mx > max(width, height) * 1.05:  # out of any plausible range
+        return None
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    x1 = max(0.0, min(x1, float(width))); x2 = max(0.0, min(x2, float(width)))
+    y1 = max(0.0, min(y1, float(height))); y2 = max(0.0, min(y2, float(height)))
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    return [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
 
 
 class AnswerExtractionAgent:
@@ -75,13 +112,12 @@ class AnswerExtractionAgent:
     async def extract_page(
         self, *, page_png: bytes, page_number: int, width: int, height: int,
         valid_numbers: list[str], sheet_id: uuid.UUID,
-        structure_hint: str = "", prev_page_tail: str = "", next_page_hint: str = "",
+        structure_hint: str = "", next_page_hint: str = "",
     ) -> dict:
         prompt = EXTRACTION_PROMPT.format(
             page_number=page_number, width=width, height=height,
             valid_numbers=", ".join(valid_numbers) if valid_numbers else "unknown",
             structure_hint=structure_hint or "(none)",
-            prev_page_tail=prev_page_tail or "",
             next_page_hint=next_page_hint or "",
             skill_instructions=await self._get_skill(),
         )
@@ -106,14 +142,7 @@ class AnswerExtractionAgent:
         for a in result["answers"]:
             if not isinstance(a, dict):
                 continue
-            bbox = a.get("question_bbox")
-            if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-                try:
-                    bbox = [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
-                except (TypeError, ValueError):
-                    bbox = None
-            else:
-                bbox = None
+            bbox = _bbox_to_pixels(a.get("question_bbox"), width, height)
             qnum = a.get("question_number")
             answers.append({
                 "question_number": (str(qnum).strip() if qnum else None),

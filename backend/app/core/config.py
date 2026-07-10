@@ -99,6 +99,11 @@ class Settings(BaseSettings):
     # annotation locator). Reasoning/embeddings/transcription stay on Azure OpenAI.
     GEMINI_API_KEY: str = ""
     MODEL_VISION: str = ""
+    # Fallback vision model used ONLY when MODEL_VISION keeps returning 503 "high demand"
+    # (capacity overload) past its retry budget. A "lite" model sits on a much larger
+    # capacity pool, so it answers when the primary is saturated — degrading quality
+    # slightly instead of failing the whole answer sheet. Empty → no fallback (raise).
+    MODEL_VISION_FALLBACK: str = ""
 
     # AI / worker timeouts (seconds)
     AI_REQUEST_TIMEOUT_SECONDS: int = 180   # per Azure OpenAI call

@@ -264,6 +264,39 @@ async def answer_sheet_debug(
     return debug
 
 
+@router.post("/admin/subjective/sheets/{sheet_id}/reannotate", response_model=JobOut, status_code=201)
+async def reannotate_sheet(
+    sheet_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Re-run ONLY the annotation phase (vision locator → geometry validator → renderer)
+    on the sheet's stored extraction + final evaluation, producing a fresh checked PDF.
+    Marks/feedback are never touched — this is the cheap iteration loop for tuning
+    annotation placement (no re-extraction, no checker/reviewer passes)."""
+    sheet = await svc.get_sheet(db, sheet_id)
+    if not sheet:
+        raise AppException(404, "not_found", "Answer sheet not found.")
+    if sheet.current_status not in ("feedback_ready", "checked"):
+        raise AppException(409, "not_checked", "The sheet has no completed evaluation to re-annotate.")
+
+    job = await create_job(
+        db, job_type="pdf_annotation",
+        created_by=current_user.id,
+        input_reference={"sheet_id": str(sheet_id), "reannotate": True},
+    )
+    await db.commit()
+
+    from app.core.celery_client import get_celery
+    task = get_celery().send_task(
+        "workers.tasks.subjective_tasks.reannotate_sheet",
+        args=[str(job.id), str(sheet_id)],
+        queue="kvi_ai_subjective",
+    )
+    await update_job(db, job.id, status=JobStatus.processing, celery_task_id=task.id)
+    return await _job_out(db, job.id)
+
+
 @router.get("/admin/subjective/sheets/{sheet_id}/debug-pdf")
 async def answer_sheet_debug_pdf(
     sheet_id: uuid.UUID,

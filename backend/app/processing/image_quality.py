@@ -59,14 +59,18 @@ def _estimate_tilt(gray: np.ndarray) -> float:
         return 0.0
 
 
-def _assess_page(png_bytes: bytes) -> dict:
+def _assess_page(png_bytes: bytes, orig_size: tuple[int, int] | None = None) -> dict:
     gray = _to_gray(png_bytes)
     h, w = gray.shape[:2]
 
     blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     brightness = float(gray.mean())
     tilt = abs(_estimate_tilt(gray))
-    resolution_ok = min(h, w) >= RESOLUTION_MIN_PIXELS
+    # Resolution must be judged on the PRE-downscale dimensions when known — the
+    # rendered PNG is capped at MAX_PAGE_PIXELS, so its own size says nothing about
+    # how small the original photo/scan was.
+    res_w, res_h = orig_size if orig_size else (w, h)
+    resolution_ok = min(res_h, res_w) >= RESOLUTION_MIN_PIXELS
 
     notes: list[str] = []
     if blur < BLUR_MIN:
@@ -97,8 +101,10 @@ def _assess_page(png_bytes: bytes) -> dict:
     }
 
 
-def assess(page_pngs: list[bytes]) -> QualityMetrics:
+def assess(page_pngs: list[bytes], orig_sizes: list[tuple[int, int]] | None = None) -> QualityMetrics:
     """Assess one or more rendered pages; aggregate to a single verdict.
+    `orig_sizes` = the pages' PRE-downscale (width, height) so the resolution check
+    judges the original capture, not the capped render.
 
     overall_status:
       • "poor" if any page is clearly unreadable (very blurry / very dark / low res)
@@ -108,7 +114,10 @@ def assess(page_pngs: list[bytes]) -> QualityMetrics:
     if not page_pngs:
         return QualityMetrics(0, 0, 0, False, 0, "poor", "No pages could be read from the upload.", [])
 
-    pages = [_assess_page(p) for p in page_pngs]
+    pages = [
+        _assess_page(p, orig_sizes[i] if orig_sizes and i < len(orig_sizes) else None)
+        for i, p in enumerate(page_pngs)
+    ]
 
     worst_blur = min(p["blur_score"] for p in pages)
     worst_read = min(p["readability_score"] for p in pages)

@@ -121,18 +121,86 @@ Return ONLY valid JSON in exactly this structure (one entry per question):
 }}"""
 
 
-def _format_questions_block(questions: list[dict], skills_by_qid: dict[str, dict]) -> str:
+# Prompt budgeting: NEVER blind-slice the questions block (a mid-JSON cut hands the
+# checker a broken guide, and a tail cut silently drops whole questions on big sheets).
+# Instead each guide is compacted to a per-question budget by dropping whole
+# low-priority FIELDS (output stays valid JSON), and long answers are capped with an
+# EXPLICIT marker so the checker knows it is judging a truncated transcript.
+GUIDE_BUDGET_DEFAULT = 6000
+GUIDE_BUDGET_FLOOR = 2500
+ANSWER_CHAR_CAP = 12000
+BLOCK_TARGET_CHARS = 60000
+
+# Guide fields dropped first when over budget (least marking-critical first). The
+# marking-critical core — intent, expected points, marks_breakdown, partial rules,
+# serious wrong statements — is never dropped.
+_GUIDE_DROP_ORDER = (
+    "sample_answer_fragments",
+    "acceptable_alternative_wording",
+    "theory_guidance",
+    "common_mistakes",
+    "annotation_worthy_mistakes",
+    "feedback_guidance",
+    "strictness_guidance",
+    "numerical_guidance",
+)
+_GUIDE_KEEP_ALWAYS = {
+    "question_number", "question_intent", "topic", "subtopic", "max_marks", "answer_type",
+    "expected_answer_points", "marks_breakdown", "partial_marking_rules",
+    "serious_wrong_statements",
+}
+
+
+def _compact_skill(skill, budget: int) -> str:
+    """Serialize a checking guide within ~`budget` chars by dropping whole low-priority
+    fields — the result is ALWAYS valid JSON (never a mid-string cut)."""
     import json
+    if not isinstance(skill, dict):
+        return json.dumps(skill, ensure_ascii=False)[:budget]
+    s = json.dumps(skill, ensure_ascii=False)
+    if len(s) <= budget:
+        return s
+    slim = dict(skill)
+    dropped: list[str] = []
+    for field in _GUIDE_DROP_ORDER:
+        if field not in slim:
+            continue
+        slim.pop(field)
+        dropped.append(field)
+        s = json.dumps(slim, ensure_ascii=False)
+        if len(s) <= budget:
+            break
+    if len(s) > budget:
+        slim = {k: v for k, v in slim.items() if k in _GUIDE_KEEP_ALWAYS}
+        s = json.dumps(slim, ensure_ascii=False)
+        dropped.append("(all non-critical fields)")
+    logger.warning(
+        "checking guide for Q%s compacted to fit prompt budget (dropped: %s)",
+        skill.get("question_number"), ", ".join(dropped),
+    )
+    return s
+
+
+def _format_questions_block(questions: list[dict], skills_by_qid: dict[str, dict]) -> str:
+    # Per-question guide budget shrinks proportionally on many-question sheets so the
+    # block stays near BLOCK_TARGET_CHARS without ever cutting JSON or whole questions.
+    n = max(1, len(questions))
+    guide_budget = max(GUIDE_BUDGET_FLOOR, min(GUIDE_BUDGET_DEFAULT, BLOCK_TARGET_CHARS // n))
     parts: list[str] = []
     for q in questions:
         qid = q.get("qid")
         skill = skills_by_qid.get(qid) or {}
         pages = ", ".join(str(p) for p in q.get("page_numbers", []) or []) or "?"
         answer = q.get("answer_text") or "(no legible answer extracted for this question)"
+        if len(answer) > ANSWER_CHAR_CAP:
+            answer = (answer[:ANSWER_CHAR_CAP]
+                      + "\n[answer truncated for prompt length — judge the visible part fairly; "
+                        "do not penalize what may follow]")
+            logger.warning("student answer for Q%s capped at %s chars for the prompt", qid, ANSWER_CHAR_CAP)
         parts.append(
             f"━━━ Question {qid} (MAX MARKS: {q.get('marks', 0)}; pages {pages}) ━━━\n"
             f"QUESTION: {q.get('question_text', '')}\n"
-            f"CHECKING GUIDE: {json.dumps(skill, ensure_ascii=False)[:6000]}\n"
+            f"CHECKING GUIDE: {_compact_skill(skill, guide_budget)}\n"
             f"STUDENT ANSWER:\n{answer}"
         )
     return "\n\n".join(parts)
@@ -153,7 +221,7 @@ class AnswerEvaluationAgent:
             custom_instruction=custom_instruction or "none",
             rubric=rubric_text or DEFAULT_RUBRIC,
             skill_instructions=skill,
-            questions_block=_format_questions_block(questions, skills_by_qid)[:50000],
+            questions_block=_format_questions_block(questions, skills_by_qid),
         )
         audit_ctx = {
             "db": self.db,
