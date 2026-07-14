@@ -248,7 +248,7 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
             async with gen_sem:
                 try:
                     async with AsyncSessionLocal() as gdb:
-                        knowledge = await svc.fetch_question_resources(
+                        knowledge, knowledge_chunks = await svc.fetch_question_resources(
                             gdb, exam_id=exam_id, chapter=qd["chapter"], topic=qd["topic"],
                             subtopic=qd["subtopic"], query=qd["question_text"],
                         )
@@ -257,7 +257,8 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
                             topic=qd["topic"], subtopic=qd["subtopic"], model_answer=model_answer, rubric=rubric_text,
                             custom_instruction=custom_instruction, knowledge=knowledge, test_id=test_uuid,
                         )
-                    return {"q": qd, "skill_json": skill_json, "knowledge": knowledge, "iterations": 1,
+                    return {"q": qd, "skill_json": skill_json, "knowledge": knowledge,
+                            "knowledge_chunks": knowledge_chunks, "iterations": 1,
                             "evaluation_status": "passed", "evaluation_notes": None}
                 except Exception as exc:
                     logger.warning("skill generation failed for %s: %s", qd["question_number"], exc)
@@ -316,6 +317,7 @@ def generate_test_skills(self, job_id: str, test_id: str) -> None:
                 db.add(QuestionSpecificCheckingSkill(
                     test_id=test_uuid, question_id=qd["id"], skill_json=s["skill_json"], version=1, is_active=True,
                     evaluation_status=status, evaluation_notes=notes, iterations=s["iterations"],
+                    knowledge_context=s.get("knowledge_chunks") or None,
                 ))
             t = (await db.execute(select(SubjectiveTest).where(SubjectiveTest.id == test_uuid))).scalar_one()
             t.skill_generation_status = "completed"
@@ -486,11 +488,16 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
                        output={"needs_reupload": True, "quality_notes": metrics.quality_notes})
             return
 
-        # 2a) Whole-sheet STRUCTURE pass — one Gemini call on its own session ─────
+        # 2a) Whole-sheet STRUCTURE pass — two Gemini calls (segment → label) on its
+        # own session. The label call gets the question TEXTS so it can resolve unclear/
+        # unlabeled blocks by content (a clearly-written number is still never overridden).
         await _job(progress=20, step="Detecting sheet structure")
+        structure_questions = [
+            {"number": q.question_number, "text": q.question_text} for q in questions
+        ]
         async with AsyncSessionLocal() as db:
             structure_map = await AnswerStructureAgent(db).detect(
-                page_pngs=page_pngs, valid_numbers=valid_numbers, sheet_id=sid,
+                page_pngs=page_pngs, questions=structure_questions, sheet_id=sid,
             )
         # Normalize the map's question labels to exact known numbers (drop garbage) so
         # extraction hints and assembly tie-breaking never see an unknown label.

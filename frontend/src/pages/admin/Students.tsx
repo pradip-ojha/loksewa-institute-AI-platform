@@ -1,7 +1,25 @@
 import React, { useEffect, useState } from "react";
+import { Users, Plus, Pencil, GraduationCap, KeyRound, UserX, UserCheck } from "lucide-react";
 import { studentsService, type CreateStudentPayload } from "../../services/students";
 import { examsService, type Exam } from "../../services/exams";
 import type { User } from "../../types";
+import {
+  PageHeader,
+  Button,
+  Modal,
+  FormField,
+  TextInput,
+  Alert,
+  StatusBadge,
+  DataTable,
+  SearchInput,
+  Pagination,
+  Menu,
+  ConfirmDialog,
+  type Column,
+} from "../../components/ui";
+
+const PAGE_SIZE = 20;
 
 export function AdminStudents() {
   const [students, setStudents] = useState<User[]>([]);
@@ -14,6 +32,8 @@ export function AdminStudents() {
   const [showEdit, setShowEdit] = useState<User | null>(null);
   const [showReset, setShowReset] = useState<User | null>(null);
   const [showExams, setShowExams] = useState<User | null>(null);
+  const [confirmToggle, setConfirmToggle] = useState<User | null>(null);
+  const [toggleBusy, setToggleBusy] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -26,95 +46,105 @@ export function AdminStudents() {
     }
   };
 
-  useEffect(() => { load(); }, [page, search]);
-
-  const handleDeactivate = async (s: User) => {
-    if (!confirm(`Deactivate ${s.full_name}?`)) return;
-    await (s.status === "active" ? studentsService.deactivate(s.id) : studentsService.activate(s.id));
+  useEffect(() => {
     load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, search]);
+
+  const doToggle = async () => {
+    if (!confirmToggle) return;
+    setToggleBusy(true);
+    try {
+      await (confirmToggle.status === "active"
+        ? studentsService.deactivate(confirmToggle.id)
+        : studentsService.activate(confirmToggle.id));
+      setConfirmToggle(null);
+      load();
+    } finally {
+      setToggleBusy(false);
+    }
   };
+
+  const columns: Column<User>[] = [
+    {
+      key: "name",
+      header: "Name",
+      accessor: (s) => s.full_name,
+      render: (s) => <span className="font-medium text-gray-900">{s.full_name}</span>,
+    },
+    { key: "email", header: "Email", accessor: (s) => s.email, render: (s) => <span className="text-gray-600">{s.email}</span> },
+    { key: "phone", header: "Phone", render: (s) => <span className="text-gray-600">{s.phone ?? "—"}</span> },
+    { key: "status", header: "Status", render: (s) => <StatusBadge status={s.status} /> },
+    {
+      key: "actions",
+      header: "",
+      align: "right",
+      width: "3rem",
+      render: (s) => (
+        <Menu
+          items={[
+            { label: "Edit", icon: <Pencil className="h-4 w-4" />, onClick: () => setShowEdit(s) },
+            { label: "Manage exams", icon: <GraduationCap className="h-4 w-4" />, onClick: () => setShowExams(s) },
+            { label: "Reset password", icon: <KeyRound className="h-4 w-4" />, onClick: () => setShowReset(s) },
+            s.status === "active"
+              ? { label: "Deactivate", icon: <UserX className="h-4 w-4" />, tone: "danger" as const, onClick: () => setConfirmToggle(s) }
+              : { label: "Activate", icon: <UserCheck className="h-4 w-4" />, onClick: () => setConfirmToggle(s) },
+          ]}
+        />
+      ),
+    },
+  ];
 
   return (
     <div>
-      <div className="mb-6 flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-semibold text-gray-900">Students</h2>
-          <p className="mt-1 text-sm text-gray-500">{total} total</p>
-        </div>
-        <button
-          onClick={() => setShowCreate(true)}
-          className="rounded-lg bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-600"
-        >
-          + Add Student
-        </button>
-      </div>
+      <PageHeader
+        title="Students"
+        description={`${total} total`}
+        icon={<Users className="h-5 w-5" />}
+        actions={
+          <Button icon={<Plus className="h-4 w-4" />} onClick={() => setShowCreate(true)}>
+            Add Student
+          </Button>
+        }
+      />
 
-      <div className="mb-4">
-        <input
-          type="text"
-          placeholder="Search by name or email…"
-          value={search}
-          onChange={e => { setSearch(e.target.value); setPage(1); }}
-          className="w-full max-w-sm rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
-        />
-      </div>
-
-      <div className="overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-gray-100">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-gray-100 bg-gray-50 text-left text-xs font-medium uppercase tracking-wide text-gray-500">
-              <th className="px-5 py-3">Name</th>
-              <th className="px-5 py-3">Email</th>
-              <th className="px-5 py-3">Phone</th>
-              <th className="px-5 py-3">Status</th>
-              <th className="px-5 py-3">Actions</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-50">
-            {loading ? (
-              <tr><td colSpan={5} className="px-5 py-8 text-center text-gray-400">Loading…</td></tr>
-            ) : students.length === 0 ? (
-              <tr><td colSpan={5} className="px-5 py-8 text-center text-gray-400">No students yet.</td></tr>
-            ) : students.map(s => (
-              <tr key={s.id} className="hover:bg-gray-50">
-                <td className="px-5 py-3 font-medium text-gray-900">{s.full_name}</td>
-                <td className="px-5 py-3 text-gray-600">{s.email}</td>
-                <td className="px-5 py-3 text-gray-600">{s.phone ?? "—"}</td>
-                <td className="px-5 py-3">
-                  <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                    s.status === "active" ? "bg-green-50 text-green-700" : "bg-red-50 text-red-700"
-                  }`}>
-                    {s.status}
-                  </span>
-                </td>
-                <td className="px-5 py-3">
-                  <div className="flex gap-2">
-                    <button onClick={() => setShowEdit(s)} className="text-xs text-brand-600 hover:underline">Edit</button>
-                    <button onClick={() => setShowExams(s)} className="text-xs text-brand-600 hover:underline">Exams</button>
-                    <button onClick={() => setShowReset(s)} className="text-xs text-gray-500 hover:underline">Reset PW</button>
-                    <button onClick={() => handleDeactivate(s)} className={`text-xs hover:underline ${s.status === "active" ? "text-red-500" : "text-green-600"}`}>
-                      {s.status === "active" ? "Deactivate" : "Activate"}
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {total > 20 && (
-        <div className="mt-4 flex gap-2">
-          <button disabled={page === 1} onClick={() => setPage(p => p - 1)} className="rounded-lg border px-3 py-1.5 text-sm disabled:opacity-40">Prev</button>
-          <span className="px-3 py-1.5 text-sm text-gray-600">Page {page}</span>
-          <button disabled={page * 20 >= total} onClick={() => setPage(p => p + 1)} className="rounded-lg border px-3 py-1.5 text-sm disabled:opacity-40">Next</button>
-        </div>
-      )}
+      <DataTable
+        columns={columns}
+        rows={students}
+        rowKey={(s) => s.id}
+        loading={loading}
+        toolbar={
+          <SearchInput
+            value={search}
+            onChange={(v) => {
+              setSearch(v);
+              setPage(1);
+            }}
+            placeholder="Search by name or email…"
+          />
+        }
+        footer={total > PAGE_SIZE ? <Pagination page={page} pageSize={PAGE_SIZE} total={total} onPage={setPage} /> : undefined}
+      />
 
       {showCreate && <CreateStudentModal onClose={() => setShowCreate(false)} onCreated={load} />}
       {showEdit && <EditStudentModal student={showEdit} onClose={() => setShowEdit(null)} onSaved={load} />}
       {showReset && <ResetPasswordModal student={showReset} onClose={() => setShowReset(null)} />}
       {showExams && <ManageExamsModal student={showExams} onClose={() => setShowExams(null)} />}
+
+      <ConfirmDialog
+        open={!!confirmToggle}
+        title={confirmToggle?.status === "active" ? "Deactivate student" : "Activate student"}
+        description={
+          confirmToggle
+            ? `${confirmToggle.status === "active" ? "Deactivate" : "Activate"} ${confirmToggle.full_name}?`
+            : ""
+        }
+        confirmLabel={confirmToggle?.status === "active" ? "Deactivate" : "Activate"}
+        tone={confirmToggle?.status === "active" ? "danger" : "default"}
+        loading={toggleBusy}
+        onConfirm={doToggle}
+        onClose={() => setConfirmToggle(null)}
+      />
     </div>
   );
 }
@@ -139,7 +169,11 @@ function ManageExamsModal({ student, onClose }: { student: User; onClose: () => 
     try {
       if (enrolled.has(examId)) {
         await examsService.unenroll(student.id, examId);
-        setEnrolled((s) => { const n = new Set(s); n.delete(examId); return n; });
+        setEnrolled((s) => {
+          const n = new Set(s);
+          n.delete(examId);
+          return n;
+        });
       } else {
         await examsService.enroll(student.id, examId);
         setEnrolled((s) => new Set(s).add(examId));
@@ -150,7 +184,12 @@ function ManageExamsModal({ student, onClose }: { student: User; onClose: () => 
   };
 
   return (
-    <Modal title={`Exams — ${student.full_name}`} onClose={onClose}>
+    <Modal
+      open
+      onClose={onClose}
+      title={`Exams — ${student.full_name}`}
+      footer={<Button onClick={onClose}>Done</Button>}
+    >
       {loading ? (
         <p className="py-6 text-center text-sm text-gray-400">Loading…</p>
       ) : exams.length === 0 ? (
@@ -164,7 +203,7 @@ function ManageExamsModal({ student, onClose }: { student: User; onClose: () => 
                 key={e.id}
                 onClick={() => toggle(e.id)}
                 disabled={busy === e.id}
-                className={`flex w-full items-center justify-between rounded-lg border px-3 py-2 text-left text-sm transition-colors disabled:opacity-50 ${
+                className={`flex w-full items-center justify-between rounded-md border px-3 py-2 text-left text-sm transition-colors disabled:opacity-50 ${
                   on ? "border-brand-200 bg-brand-50" : "border-gray-200 hover:bg-gray-50"
                 }`}
               >
@@ -173,16 +212,13 @@ function ManageExamsModal({ student, onClose }: { student: User; onClose: () => 
                   <span className="ml-2 text-xs text-gray-400">{e.exam_type}</span>
                 </span>
                 <span className={`text-xs font-medium ${on ? "text-brand-600" : "text-gray-400"}`}>
-                  {on ? "Enrolled ✓" : "Enroll"}
+                  {on ? "Enrolled" : "Enroll"}
                 </span>
               </button>
             );
           })}
         </div>
       )}
-      <div className="flex justify-end pt-4">
-        <button onClick={onClose} className="rounded-lg bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-600">Done</button>
-      </div>
     </Modal>
   );
 }
@@ -208,19 +244,35 @@ function CreateStudentModal({ onClose, onCreated }: { onClose: () => void; onCre
   };
 
   return (
-    <Modal title="Add Student" onClose={onClose}>
-      <form onSubmit={submit} className="space-y-4">
-        {error && <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
-        <Field label="Full Name"><input required value={form.full_name} onChange={e => setForm(f => ({ ...f, full_name: e.target.value }))} className={inputCls} /></Field>
-        <Field label="Email"><input required type="email" value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} className={inputCls} /></Field>
-        <Field label="Password"><input required type="password" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} className={inputCls} placeholder="Min 6 characters" /></Field>
-        <Field label="Phone (optional)"><input value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} className={inputCls} /></Field>
-        <div className="flex justify-end gap-2 pt-2">
-          <button type="button" onClick={onClose} className="rounded-lg px-4 py-2 text-sm text-gray-600 hover:bg-gray-100">Cancel</button>
-          <button type="submit" disabled={loading} className="rounded-lg bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-600 disabled:opacity-60">
-            {loading ? "Creating…" : "Create Student"}
-          </button>
-        </div>
+    <Modal
+      open
+      onClose={onClose}
+      title="Add Student"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" form="create-student-form" loading={loading}>
+            Create Student
+          </Button>
+        </>
+      }
+    >
+      <form id="create-student-form" onSubmit={submit} className="space-y-4">
+        {error && <Alert>{error}</Alert>}
+        <FormField label="Full Name" required>
+          <TextInput required value={form.full_name} onChange={(e) => setForm((f) => ({ ...f, full_name: e.target.value }))} />
+        </FormField>
+        <FormField label="Email" required>
+          <TextInput required type="email" value={form.email} onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))} />
+        </FormField>
+        <FormField label="Password" required>
+          <TextInput required type="password" value={form.password} onChange={(e) => setForm((f) => ({ ...f, password: e.target.value }))} placeholder="Min 6 characters" />
+        </FormField>
+        <FormField label="Phone (optional)">
+          <TextInput value={form.phone} onChange={(e) => setForm((f) => ({ ...f, phone: e.target.value }))} />
+        </FormField>
       </form>
     </Modal>
   );
@@ -243,16 +295,28 @@ function EditStudentModal({ student, onClose, onSaved }: { student: User; onClos
   };
 
   return (
-    <Modal title="Edit Student" onClose={onClose}>
-      <form onSubmit={submit} className="space-y-4">
-        <Field label="Full Name"><input required value={form.full_name} onChange={e => setForm(f => ({ ...f, full_name: e.target.value }))} className={inputCls} /></Field>
-        <Field label="Phone (optional)"><input value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} className={inputCls} /></Field>
-        <div className="flex justify-end gap-2 pt-2">
-          <button type="button" onClick={onClose} className="rounded-lg px-4 py-2 text-sm text-gray-600 hover:bg-gray-100">Cancel</button>
-          <button type="submit" disabled={loading} className="rounded-lg bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-600 disabled:opacity-60">
-            {loading ? "Saving…" : "Save Changes"}
-          </button>
-        </div>
+    <Modal
+      open
+      onClose={onClose}
+      title="Edit Student"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" form="edit-student-form" loading={loading}>
+            Save Changes
+          </Button>
+        </>
+      }
+    >
+      <form id="edit-student-form" onSubmit={submit} className="space-y-4">
+        <FormField label="Full Name" required>
+          <TextInput required value={form.full_name} onChange={(e) => setForm((f) => ({ ...f, full_name: e.target.value }))} />
+        </FormField>
+        <FormField label="Phone (optional)">
+          <TextInput value={form.phone} onChange={(e) => setForm((f) => ({ ...f, phone: e.target.value }))} />
+        </FormField>
       </form>
     </Modal>
   );
@@ -279,51 +343,35 @@ function ResetPasswordModal({ student, onClose }: { student: User; onClose: () =
   };
 
   return (
-    <Modal title={`Reset Password — ${student.full_name}`} onClose={onClose}>
+    <Modal
+      open
+      onClose={onClose}
+      title={`Reset Password — ${student.full_name}`}
+      footer={
+        done ? (
+          <Button onClick={onClose}>Close</Button>
+        ) : (
+          <>
+            <Button variant="secondary" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button type="submit" form="reset-pw-form" loading={loading}>
+              Reset Password
+            </Button>
+          </>
+        )
+      }
+    >
       {done ? (
-        <div className="text-center">
-          <p className="mb-4 text-sm text-green-700">Password reset successfully.</p>
-          <button onClick={onClose} className="rounded-lg bg-brand-500 px-4 py-2 text-sm font-medium text-white">Close</button>
-        </div>
+        <Alert tone="success">Password reset successfully.</Alert>
       ) : (
-        <form onSubmit={submit} className="space-y-4">
-          {error && <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
-          <Field label="New Password">
-            <input required type="password" value={pw} onChange={e => setPw(e.target.value)} className={inputCls} placeholder="Min 6 characters" />
-          </Field>
-          <div className="flex justify-end gap-2 pt-2">
-            <button type="button" onClick={onClose} className="rounded-lg px-4 py-2 text-sm text-gray-600 hover:bg-gray-100">Cancel</button>
-            <button type="submit" disabled={loading} className="rounded-lg bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-brand-600 disabled:opacity-60">
-              {loading ? "Resetting…" : "Reset Password"}
-            </button>
-          </div>
+        <form id="reset-pw-form" onSubmit={submit} className="space-y-4">
+          {error && <Alert>{error}</Alert>}
+          <FormField label="New Password" required>
+            <TextInput required type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="Min 6 characters" />
+          </FormField>
         </form>
       )}
     </Modal>
-  );
-}
-
-const inputCls = "w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100";
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <label className="mb-1.5 block text-sm font-medium text-gray-700">{label}</label>
-      {children}
-    </div>
-  );
-}
-
-function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
-      <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl">
-        <div className="mb-5 flex items-center justify-between">
-          <h3 className="text-base font-semibold text-gray-900">{title}</h3>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">✕</button>
-        </div>
-        {children}
-      </div>
-    </div>
   );
 }

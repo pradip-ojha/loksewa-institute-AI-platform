@@ -18,7 +18,7 @@ export function AdminSettings() {
 
       <Card>
         <div className="flex items-center gap-4">
-          <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-brand-700 text-lg font-bold text-white shadow-glow">
+          <div className="flex h-14 w-14 items-center justify-center rounded-lg bg-brand-50 text-lg font-semibold text-brand-700">
             {initials}
           </div>
           <div className="min-w-0">
@@ -27,7 +27,7 @@ export function AdminSettings() {
               <Mail className="h-3.5 w-3.5" /> {user?.email}
             </p>
           </div>
-          <span className="ml-auto inline-flex items-center gap-1 rounded-full bg-brand-50 px-3 py-1 text-xs font-semibold text-brand-700 ring-1 ring-brand-100">
+          <span className="ml-auto inline-flex items-center gap-1 rounded-full bg-brand-50 px-3 py-1 text-xs font-medium text-brand-700">
             <ShieldCheck className="h-3.5 w-3.5" /> Admin
           </span>
         </div>

@@ -7,6 +7,7 @@ import { videoTutorService } from "../../services/videoTutor";
 import type {
   AskSelectedSegment, StudentPlayerData, StudentVideoListItem,
 } from "../../services/videoTutor";
+import { useStudentExam } from "../../context/StudentExamContext";
 import { getErrorMessage } from "../../utils/error";
 import { PageHeader, Card, Badge, EmptyState, Skeleton, Alert } from "../../components/ui";
 import { RichText } from "../../components/content/RichText";
@@ -25,6 +26,7 @@ const TABS: { key: PlayerTab; label: string; icon: React.ReactNode }[] = [
 ];
 
 export function StudentVideoTutor() {
+  const { selectedExamId } = useStudentExam();
   const [videos, setVideos] = useState<StudentVideoListItem[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -33,13 +35,13 @@ export function StudentVideoTutor() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setVideos(await videoTutorService.listStudentVideos());
+      setVideos(await videoTutorService.listStudentVideos(selectedExamId));
     } catch (err) {
       setError(getErrorMessage(err, "Failed to load videos."));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [selectedExamId]);
 
   useEffect(() => {
     if (!activeId) void load();
@@ -77,7 +79,7 @@ export function StudentVideoTutor() {
               onClick={() => setActiveId(v.id)}
               className="flex items-center gap-4 p-4"
             >
-              <div className="flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-glow">
+              <div className="flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-lg bg-brand-50 text-brand-600">
                 {v.is_audio_only ? <Headphones className="h-5 w-5" /> : <Play className="h-5 w-5" />}
               </div>
               <div className="min-w-0 flex-1">
@@ -218,7 +220,7 @@ function PlayerView({ videoId, onBack }: { videoId: string; onBack: () => void }
             <EmptyState icon={<FileText className="h-6 w-6" />} title="सारांश तयार हुँदैछ" />
           )}
           {data.summary?.short_summary && (
-            <Card className="border-l-4 border-brand-400 bg-gradient-to-br from-brand-50/70 to-white">
+            <Card className="border-l-4 border-l-brand-500 bg-brand-50/40">
               <ContentSectionTitle icon={<Sparkles className="h-4 w-4" />}>द्रुत सारांश</ContentSectionTitle>
               <p className="font-deva text-sm leading-relaxed text-gray-700">{data.summary.short_summary}</p>
             </Card>
@@ -426,8 +428,8 @@ function TutorTab({
     <div className="flex flex-col">
       <div className="min-h-[40vh] space-y-4">
         {historyLoaded && turns.length === 0 && (
-          <div className="rounded-2xl bg-gradient-to-br from-brand-50 to-white p-5 text-center ring-1 ring-brand-100">
-            <div className="mx-auto mb-2 flex h-11 w-11 items-center justify-center rounded-full bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-glow">
+          <div className="rounded-lg border border-gray-200 bg-white p-5 text-center">
+            <div className="mx-auto mb-2 flex h-11 w-11 items-center justify-center rounded-full bg-brand-50 text-brand-600">
               <Sparkles className="h-5 w-5" />
             </div>
             <p className="text-sm font-semibold text-gray-800">AI Tutor लाई सोध्नुहोस्</p>
@@ -477,7 +479,7 @@ function TutorTab({
 
                     {turn.segments && turn.segments.length > 0 && (
                       <div className="mt-3 border-t border-gray-100 pt-3">
-                        <p className="mb-1.5 text-xs font-medium text-gray-400">📍 भिडियोमा हेर्नुहोस्</p>
+                        <p className="mb-1.5 text-xs font-medium text-gray-400">भिडियोमा हेर्नुहोस्</p>
                         <div className="flex flex-wrap gap-2">
                           {turn.segments.map((s) => (
                             <button

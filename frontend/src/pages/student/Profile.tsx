@@ -1,5 +1,6 @@
 import React, { useState } from "react";
-import { User, Mail, KeyRound } from "lucide-react";
+import { Link } from "react-router-dom";
+import { User, Mail, KeyRound, BarChart3, FileCheck2, ChevronRight } from "lucide-react";
 import { useAuth } from "../../context/AuthContext";
 import api from "../../services/api";
 import { PageHeader, Card, CardHeader, Button, FormField, TextInput, Alert } from "../../components/ui";
@@ -50,7 +51,7 @@ export function StudentProfile() {
 
       <Card>
         <div className="flex items-center gap-4">
-          <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-brand-700 text-lg font-bold text-white shadow-glow">
+          <div className="flex h-14 w-14 items-center justify-center rounded-lg bg-brand-50 text-lg font-semibold text-brand-700">
             {initials}
           </div>
           <div className="min-w-0">
@@ -60,6 +61,19 @@ export function StudentProfile() {
             </p>
           </div>
         </div>
+      </Card>
+
+      <Card padded={false}>
+        <Link to="/student/results" className="flex items-center gap-3 border-b border-gray-100 px-5 py-3.5 transition-colors hover:bg-gray-50">
+          <BarChart3 className="h-4 w-4 flex-shrink-0 text-gray-400" />
+          <span className="flex-1 text-sm font-medium text-gray-800">My Results</span>
+          <ChevronRight className="h-4 w-4 text-gray-300" />
+        </Link>
+        <Link to="/student/subjective-tests" className="flex items-center gap-3 px-5 py-3.5 transition-colors hover:bg-gray-50">
+          <FileCheck2 className="h-4 w-4 flex-shrink-0 text-gray-400" />
+          <span className="flex-1 text-sm font-medium text-gray-800">Subjective Tests</span>
+          <ChevronRight className="h-4 w-4 text-gray-300" />
+        </Link>
       </Card>
 
       <Card>

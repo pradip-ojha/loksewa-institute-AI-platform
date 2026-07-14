@@ -165,8 +165,8 @@ export const subjectiveTestsService = {
     api.get(`/api/admin/subjective/tests/${id}/submissions`).then((r) => r.data),
 
   // Student
-  listStudentTests: (): Promise<StudentTestListItem[]> =>
-    api.get("/api/student/subjective/tests").then((r) => r.data),
+  listStudentTests: (examId?: string | null): Promise<StudentTestListItem[]> =>
+    api.get("/api/student/subjective/tests", { params: examId ? { exam_id: examId } : {} }).then((r) => r.data),
   getStudentTest: (id: string): Promise<StudentTestDetail> =>
     api.get(`/api/student/subjective/tests/${id}`).then((r) => r.data),
   uploadAnswer: (testId: string, form: FormData): Promise<JobRef> =>

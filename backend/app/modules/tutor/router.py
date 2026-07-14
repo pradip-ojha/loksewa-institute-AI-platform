@@ -88,9 +88,18 @@ async def ask_tutor_stream(
 
 @router.get("/student/tutor/history", response_model=list[TutorChatMessageOut])
 async def tutor_history(
-    session_id: uuid.UUID = Query(...),
+    session_id: uuid.UUID | None = Query(None),
+    exam_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_student),
 ):
-    msgs = await svc.get_history(db, current_user.id, session_id)
+    """History for one session, or (via ``exam_id``) the student's full tutor
+    conversation for that exam merged across sessions — used to restore the chat
+    when the AI Tutor page is reopened."""
+    if session_id:
+        msgs = await svc.get_history(db, current_user.id, session_id)
+    elif exam_id:
+        msgs = await svc.get_history_by_exam(db, current_user.id, exam_id)
+    else:
+        raise AppException(422, "missing_param", "Provide session_id or exam_id.")
     return [TutorChatMessageOut.model_validate(m) for m in msgs]

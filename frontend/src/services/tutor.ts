@@ -28,6 +28,7 @@ export interface TutorAskBody {
 
 export interface TutorHistoryItem {
   id: string;
+  session_id: string;
   question: string;
   answer: string;
   language: string | null;
@@ -44,4 +45,8 @@ export const tutorService = {
     streamNdjson("/api/student/tutor/ask/stream", body, handlers, signal),
   getHistory: (sessionId: string): Promise<TutorHistoryItem[]> =>
     api.get("/api/student/tutor/history", { params: { session_id: sessionId } }).then((r) => r.data),
+  // Full conversation for an exam, merged across sessions — used to restore the
+  // chat when the AI Tutor page is reopened.
+  getHistoryByExam: (examId: string): Promise<TutorHistoryItem[]> =>
+    api.get("/api/student/tutor/history", { params: { exam_id: examId } }).then((r) => r.data),
 };

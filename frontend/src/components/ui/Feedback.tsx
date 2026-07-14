@@ -3,7 +3,7 @@ import { Loader2 } from "lucide-react";
 import { cn } from "./cn";
 
 export function Spinner({ className }: { className?: string }) {
-  return <Loader2 className={cn("h-5 w-5 animate-spin text-brand-500", className)} />;
+  return <Loader2 className={cn("h-5 w-5 animate-spin text-brand-600", className)} />;
 }
 
 export function PageLoader({ label = "Loading…" }: { label?: string }) {
@@ -31,12 +31,12 @@ export function EmptyState({
   return (
     <div
       className={cn(
-        "flex flex-col items-center justify-center rounded-2xl border border-dashed border-gray-200 bg-gray-50/50 px-6 py-12 text-center",
+        "flex flex-col items-center justify-center rounded-lg border border-dashed border-gray-300 bg-white px-6 py-12 text-center",
         className,
       )}
     >
       {icon && (
-        <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-brand-50 text-brand-500">
+        <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-lg bg-gray-100 text-gray-400">
           {icon}
         </div>
       )}

@@ -242,11 +242,13 @@ async def delete_set(db: AsyncSession, set_id: uuid.UUID) -> bool:
 
 # ── Student attempt flow ──────────────────────────────────────────────────────
 
-async def list_student_tests(db: AsyncSession, student_id: uuid.UUID):
+async def list_student_tests(db: AsyncSession, student_id: uuid.UUID, exam_id: uuid.UUID | None = None):
     """Tests a student can see: every active set, PLUS any set this student
     already has an attempt on (so an in-progress attempt stays visible even if
     the admin deactivated the set mid-attempt). Each item carries the student's
-    own attempt state so the UI can show Start / Continue / View Result."""
+    own attempt state so the UI can show Start / Continue / View Result.
+    ``exam_id`` narrows to the student's currently-selected exam (shared exam
+    picker across MCQ/Video/Subjective/AI Tutor)."""
     # This student's attempts, keyed by set.
     att_r = await db.execute(
         select(MCQAttempt).where(MCQAttempt.student_id == student_id)
@@ -261,6 +263,8 @@ async def list_student_tests(db: AsyncSession, student_id: uuid.UUID):
     cond = (MCQTestSet.status == "active") & MCQTestSet.exam_id.in_(enrolled or [uuid.uuid4()])
     if set_ids:
         cond = cond | MCQTestSet.id.in_(set_ids)
+    if exam_id is not None:
+        cond = cond & (MCQTestSet.exam_id == exam_id)
     r = await db.execute(
         select(MCQTestSet, MCQTestBlueprint)
         .join(MCQTestBlueprint, MCQTestBlueprint.id == MCQTestSet.blueprint_id)

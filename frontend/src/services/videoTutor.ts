@@ -166,8 +166,8 @@ export const videoTutorService = {
     api.delete(`/api/admin/videos/${id}`).then(() => undefined),
 
   // Student
-  listStudentVideos: (): Promise<StudentVideoListItem[]> =>
-    api.get("/api/student/videos").then((r) => r.data),
+  listStudentVideos: (examId?: string | null): Promise<StudentVideoListItem[]> =>
+    api.get("/api/student/videos", { params: examId ? { exam_id: examId } : {} }).then((r) => r.data),
   getPlayerData: (id: string): Promise<StudentPlayerData> =>
     api.get(`/api/student/videos/${id}`).then((r) => r.data),
   ask: (id: string, body: AskBody): Promise<AskResponse> =>

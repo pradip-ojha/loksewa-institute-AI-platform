@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { BarChart3 } from "lucide-react";
 import { analyticsService } from "../../services/analytics";
 import type {
   MCQOverview,
@@ -7,39 +8,31 @@ import type {
   VideoOverviewItem,
   VideoDetail,
 } from "../../services/analytics";
+import { PageHeader, Tabs, StatCard, Card as UICard, CardHeader } from "../../components/ui";
 
 type Tab = "mcq" | "subjective" | "video";
 
-const TABS: { key: Tab; label: string }[] = [
-  { key: "mcq", label: "MCQ Analytics" },
-  { key: "subjective", label: "Subjective Analytics" },
-  { key: "video", label: "Video Tutor Analytics" },
+const TABS = [
+  { id: "mcq", label: "MCQ Analytics" },
+  { id: "subjective", label: "Subjective Analytics" },
+  { id: "video", label: "Video Tutor Analytics" },
 ];
 
-// ── Small shared UI ───────────────────────────────────────────────────────────
-function StatCard({ label, value, tone = "text-gray-900" }: { label: string; value: string | number; tone?: string }) {
-  return (
-    <div className="rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-100">
-      <p className="text-xs font-medium text-gray-500">{label}</p>
-      <p className={`mt-1.5 text-2xl font-bold ${tone}`}>{value}</p>
-    </div>
-  );
-}
-
+// ── Small shared UI (delegates to the shared kit) ─────────────────────────────
 function Card({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-100">
-      <h3 className="mb-3 text-sm font-semibold text-gray-700">{title}</h3>
+    <UICard>
+      <CardHeader title={title} />
       {children}
-    </div>
+    </UICard>
   );
 }
 
 function AccuracyBar({ value }: { value: number }) {
-  const color = value >= 75 ? "bg-green-500" : value >= 50 ? "bg-yellow-500" : "bg-red-500";
+  const color = value >= 75 ? "bg-success-500" : value >= 50 ? "bg-warning-500" : "bg-danger-500";
   return (
     <div className="flex items-center gap-2">
-      <div className="h-2 w-24 overflow-hidden rounded-full bg-gray-100">
+      <div className="h-1.5 w-24 overflow-hidden rounded-full bg-gray-100">
         <div className={`h-full ${color}`} style={{ width: `${Math.min(100, value)}%` }} />
       </div>
       <span className="w-10 text-right text-xs tabular-nums text-gray-600">{value}%</span>
@@ -68,11 +61,11 @@ export function MCQAnalyticsView() {
   return (
     <div className="space-y-5">
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-        <StatCard label="Total Attempts" value={s.total_attempts} tone="text-blue-700" />
-        <StatCard label="Students" value={s.total_students} tone="text-indigo-700" />
-        <StatCard label="Average Score" value={`${s.average_score_percent}%`} tone="text-teal-700" />
-        <StatCard label="Highest" value={`${s.highest_score_percent}%`} tone="text-green-700" />
-        <StatCard label="Lowest" value={`${s.lowest_score_percent}%`} tone="text-red-700" />
+        <StatCard label="Total Attempts" value={s.total_attempts} />
+        <StatCard label="Students" value={s.total_students} />
+        <StatCard label="Average Score" value={`${s.average_score_percent}%`} />
+        <StatCard label="Highest" value={`${s.highest_score_percent}%`} tone="success" />
+        <StatCard label="Lowest" value={`${s.lowest_score_percent}%`} tone="danger" />
       </div>
 
       <Card title="Topic-wise Performance">
@@ -139,7 +132,7 @@ export function MCQAnalyticsView() {
                 <li key={q.question_id}>
                   <div className="flex items-start justify-between gap-3">
                     <span className="text-sm text-gray-700">{q.question_text}</span>
-                    <span className="whitespace-nowrap text-xs font-medium text-red-600">{q.accuracy}%</span>
+                    <span className="whitespace-nowrap text-xs font-medium tabular-nums text-danger-600">{q.accuracy}%</span>
                   </div>
                   <div className="text-xs text-gray-400">{q.topic} · answered {q.times_answered}×</div>
                 </li>
@@ -177,12 +170,12 @@ export function SubjectiveAnalyticsView() {
   return (
     <div className="space-y-5">
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-        <StatCard label="Submissions" value={s.total_submissions} tone="text-blue-700" />
-        <StatCard label="Checked" value={s.checked_submissions} tone="text-teal-700" />
-        <StatCard label="Students" value={s.total_students} tone="text-indigo-700" />
-        <StatCard label="Avg Score" value={`${s.average_percent}%`} tone="text-green-700" />
-        <StatCard label="Low Confidence" value={s.low_confidence_count} tone="text-amber-700" />
-        <StatCard label="Checked PDFs" value={s.checked_pdf_count} tone="text-pink-700" />
+        <StatCard label="Submissions" value={s.total_submissions} />
+        <StatCard label="Checked" value={s.checked_submissions} />
+        <StatCard label="Students" value={s.total_students} />
+        <StatCard label="Avg Score" value={`${s.average_percent}%`} />
+        <StatCard label="Low Confidence" value={s.low_confidence_count} tone="warning" />
+        <StatCard label="Checked PDFs" value={s.checked_pdf_count} />
       </div>
 
       <Card title="Per-Test Breakdown">
@@ -217,7 +210,7 @@ export function SubjectiveAnalyticsView() {
             {data.common_mistakes.map((m, i) => (
               <li key={i} className="flex items-center justify-between">
                 <span className="text-sm text-gray-700">{m.text}</span>
-                <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700">{m.count}×</span>
+                <span className="rounded-full bg-warning-50 px-2 py-0.5 text-xs font-medium tabular-nums text-warning-700">{m.count}×</span>
               </li>
             ))}
           </ul>
@@ -329,10 +322,10 @@ export function VideoAnalyticsView() {
           {detailLoading ? <Empty text="Loading…" /> : detail && (
             <div className="space-y-5">
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                <StatCard label="Views" value={detail.total_views} tone="text-teal-700" />
-                <StatCard label="Unique Viewers" value={detail.unique_viewers} tone="text-indigo-700" />
-                <StatCard label="Questions" value={detail.total_questions} tone="text-blue-700" />
-                <StatCard label="Low-Confidence" value={detail.low_confidence_answers.length} tone="text-amber-700" />
+                <StatCard label="Views" value={detail.total_views} />
+                <StatCard label="Unique Viewers" value={detail.unique_viewers} />
+                <StatCard label="Questions" value={detail.total_questions} />
+                <StatCard label="Low-Confidence" value={detail.low_confidence_answers.length} tone="warning" />
               </div>
 
               <div className="grid gap-5 lg:grid-cols-2">
@@ -343,7 +336,7 @@ export function VideoAnalyticsView() {
                       {detail.most_asked_questions.map((q, i) => (
                         <li key={i} className="flex items-center justify-between gap-3">
                           <span className="text-sm text-gray-700">{q.question}</span>
-                          <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600">{q.count}×</span>
+                          <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium tabular-nums text-gray-600">{q.count}×</span>
                         </li>
                       ))}
                     </ul>
@@ -356,7 +349,7 @@ export function VideoAnalyticsView() {
                       {detail.unclear_concepts.map((c, i) => (
                         <li key={i} className="flex items-center justify-between">
                           <span className="text-sm text-gray-700">{c.topic}</span>
-                          <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700">{c.count}×</span>
+                          <span className="rounded-full bg-warning-50 px-2 py-0.5 text-xs font-medium tabular-nums text-warning-700">{c.count}×</span>
                         </li>
                       ))}
                     </ul>
@@ -390,7 +383,7 @@ export function VideoAnalyticsView() {
                     {detail.low_confidence_answers.map((a, i) => (
                       <li key={i} className="flex items-start justify-between gap-3">
                         <span className="text-sm text-gray-700">{a.question}</span>
-                        <span className="whitespace-nowrap text-xs font-medium text-amber-600">{Math.round(a.confidence * 100)}%</span>
+                        <span className="whitespace-nowrap text-xs font-medium tabular-nums text-warning-600">{Math.round(a.confidence * 100)}%</span>
                       </li>
                     ))}
                   </ul>
@@ -410,24 +403,13 @@ export function AdminAnalytics() {
 
   return (
     <div>
-      <div className="mb-6">
-        <h2 className="text-xl font-semibold text-gray-900">Analytics</h2>
-        <p className="mt-1 text-sm text-gray-500">Performance across MCQ tests, answer-sheet checking, and the video tutor.</p>
-      </div>
+      <PageHeader
+        title="Analytics"
+        description="Performance across MCQ tests, answer-sheet checking, and the video tutor."
+        icon={<BarChart3 className="h-5 w-5" />}
+      />
 
-      <div className="mb-5 flex gap-1 border-b border-gray-200">
-        {TABS.map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setTab(t.key)}
-            className={`px-4 py-2 text-sm transition-colors ${
-              tab === t.key ? "border-b-2 border-brand-600 text-brand-700" : "text-gray-500 hover:text-gray-700"
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
+      <Tabs items={TABS} value={tab} onChange={(id) => setTab(id as Tab)} className="mb-5" />
 
       {tab === "mcq" && <MCQAnalyticsView />}
       {tab === "subjective" && <SubjectiveAnalyticsView />}

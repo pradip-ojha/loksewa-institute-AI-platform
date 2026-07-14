@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Sparkles, GraduationCap, Send, BookOpen } from "lucide-react";
 import { tutorService } from "../../services/tutor";
-import { examsService, type Enrollment } from "../../services/exams";
+import { useStudentExam } from "../../context/StudentExamContext";
 import { PageHeader } from "../../components/ui";
 import { RichText } from "../../components/content/RichText";
 
@@ -28,12 +28,12 @@ const MODE_LABEL: Record<string, string> = {
 };
 
 export function StudentTutor() {
+  const { exams, selectedExamId: examId, isLoading: examsLoading } = useStudentExam();
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [question, setQuestion] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [exams, setExams] = useState<Enrollment[]>([]);
-  const [examId, setExamId] = useState<string>("");
+  const [historyLoaded, setHistoryLoaded] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
   // Tracks the in-flight stream so we can abort it (unmount / exam switch / new
   // question), stopping backend token generation and avoiding setState-after-unmount.
@@ -42,24 +42,49 @@ export function StudentTutor() {
   // Abort any in-flight stream when the page unmounts.
   useEffect(() => () => abortRef.current?.abort(), []);
 
+  // Load this exam's prior conversation (merged across sessions, like the video
+  // tutor) so reopening AI Tutor resumes instead of starting blank. Continuing
+  // the chat resumes the most recent session so the backend keeps in-session context.
   useEffect(() => {
-    examsService.myExams().then((list) => {
-      setExams(list);
-      setExamId((cur) => cur || list[0]?.exam_id || "");
-    }).catch(() => {});
-  }, []);
+    abortRef.current?.abort();
+    setTurns([]);
+    setSessionId(null);
+    setHistoryLoaded(false);
+    if (!examId) {
+      setHistoryLoaded(true);
+      return;
+    }
+    let cancelled = false;
+    tutorService.getHistoryByExam(examId)
+      .then((items) => {
+        if (cancelled) return;
+        setTurns(
+          items.map((m) => ({
+            question: m.question,
+            answer: m.answer,
+            mode: m.related_mode,
+            topic: m.detected_topic,
+            followUps: m.follow_up_suggestions,
+            loading: false,
+          })),
+        );
+        const last = items[items.length - 1];
+        if (last) setSessionId(last.session_id);
+      })
+      .catch(() => {
+        /* history is best-effort; a failure just starts an empty chat */
+      })
+      .finally(() => {
+        if (!cancelled) setHistoryLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [examId]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [turns]);
-
-  // Switching exam starts a fresh conversation (sessions are exam-scoped).
-  function switchExam(id: string) {
-    abortRef.current?.abort();
-    setExamId(id);
-    setSessionId(null);
-    setTurns([]);
-  }
 
   async function ask(q: string) {
     const text = q.trim();
@@ -119,32 +144,18 @@ export function StudentTutor() {
         title="AI Tutor"
         description="नोट र पुस्तकमा आधारित AI शिक्षकसँग जे पनि सोध्नुहोस्"
         icon={<Sparkles className="h-5 w-5" />}
-        actions={
-          exams.length > 0 ? (
-            <select
-              value={examId}
-              onChange={(e) => switchExam(e.target.value)}
-              className="rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-xs font-medium text-gray-700 focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-100"
-              title="Exam"
-            >
-              {exams.map((e) => (
-                <option key={e.exam_id} value={e.exam_id}>{e.name}</option>
-              ))}
-            </select>
-          ) : undefined
-        }
       />
 
-      {exams.length === 0 && (
+      {!examsLoading && exams.length === 0 && (
         <div className="rounded-xl bg-warning-50 p-4 text-sm text-warning-700 ring-1 ring-warning-100">
           You are not enrolled in any exam yet. Ask your institute to enroll you.
         </div>
       )}
 
       <div className="flex-1 space-y-4">
-        {turns.length === 0 && (
-          <div className="rounded-2xl bg-gradient-to-br from-brand-50 to-white p-5 text-center ring-1 ring-brand-100">
-            <div className="mx-auto mb-2 flex h-11 w-11 items-center justify-center rounded-full bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-glow">
+        {historyLoaded && turns.length === 0 && (
+          <div className="rounded-lg border border-gray-200 bg-white p-5 text-center">
+            <div className="mx-auto mb-2 flex h-11 w-11 items-center justify-center rounded-full bg-brand-50 text-brand-600">
               <GraduationCap className="h-5 w-5" />
             </div>
             <p className="text-sm font-semibold text-gray-800">AI Tutor लाई सोध्नुहोस्</p>

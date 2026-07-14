@@ -181,9 +181,12 @@ async def list_submissions(db: AsyncSession, test_id: uuid.UUID) -> list[dict]:
 
 # ── Student ─────────────────────────────────────────────────────────────────────
 
-async def list_student_tests(db: AsyncSession, student_id: uuid.UUID) -> list[dict]:
+async def list_student_tests(
+    db: AsyncSession, student_id: uuid.UUID, exam_id: uuid.UUID | None = None,
+) -> list[dict]:
     """Active tests + any test this student already submitted to, each with the
-    student's own latest submission status."""
+    student's own latest submission status. ``exam_id`` narrows to the student's
+    currently-selected exam (shared exam picker across MCQ/Video/Subjective/AI Tutor)."""
     from app.modules.exams.service import get_enrolled_exam_ids
     enrolled = await get_enrolled_exam_ids(db, student_id)
     sheets = await _student_sheets_by_test(db, student_id)
@@ -192,6 +195,8 @@ async def list_student_tests(db: AsyncSession, student_id: uuid.UUID) -> list[di
     cond = (SubjectiveTest.status == "active") & SubjectiveTest.exam_id.in_(enrolled or [uuid.uuid4()])
     if test_ids:
         cond = cond | SubjectiveTest.id.in_(test_ids)
+    if exam_id is not None:
+        cond = cond & (SubjectiveTest.exam_id == exam_id)
     r = await db.execute(select(SubjectiveTest).where(cond).order_by(SubjectiveTest.created_at.desc()))
 
     out: list[dict] = []
@@ -599,22 +604,26 @@ async def get_feedback_chat(db: AsyncSession, sheet_id: uuid.UUID, student_id: u
 async def fetch_question_resources(
     db: AsyncSession, *, exam_id, topic: str | None, subtopic: str | None, query: str,
     chapter: str | None = None, top_k: int = 6,
-) -> str:
+) -> tuple[str, list[dict]]:
     """Vector-search the exam's knowledge set for a question's chapter/topic/subtopic and
-    return distilled excerpt text. Always filtered by `exam_id` so retrieval never crosses
-    exams, and by `chapter` (the PRIMARY retrieval dimension, CLAUDE.md §8) when known so it
-    never crosses chapters within an exam; topic/subtopic narrow within the chapter.
-    Best-effort: returns "" on any failure or when no knowledge is uploaded, so skill
-    generation never blocks (CLAUDE.md §11 — knowledge is used ONLY here at skill-generation
-    time, never during per-sheet checking). Runs a dual (prose + model_qa) query so model-answer
-    pairs are retrieved alongside prose (CLAUDE.md §8)."""
+    return `(excerpt_text, chunks)` — the joined excerpt text fed to the SkillGenerator plus
+    the structured per-chunk list ({content, topic, subtopic, is_qa, question, chunk_id}),
+    which the task persists to `question_specific_checking_skills.knowledge_context` so the
+    admin skill-debug endpoint can show WHAT each guide was distilled from. Always filtered
+    by `exam_id` so retrieval never crosses exams, and by `chapter` (the PRIMARY retrieval
+    dimension, CLAUDE.md §8) when known so it never crosses chapters within an exam;
+    topic/subtopic narrow within the chapter. Best-effort: returns ("", []) on any failure
+    or when no knowledge is uploaded, so skill generation never blocks (CLAUDE.md §11 —
+    knowledge is used ONLY here at skill-generation time, never during per-sheet checking).
+    Runs a dual (prose + model_qa) query so model-answer pairs are retrieved alongside prose
+    (CLAUDE.md §8)."""
     try:
         from app.ai.model_router import get_provider
         from app.modules.knowledge.retrieval import query_knowledge_dual
 
         embeddings = await get_provider("reasoning").embed([query[:6000]])
         if not embeddings:
-            return ""
+            return "", []
         filter_dict: dict = {"exam_id": str(exam_id)}
         if chapter:
             filter_dict["chapter"] = chapter
@@ -627,18 +636,27 @@ async def fetch_question_resources(
             db, embedding=embeddings[0], base_filter=filter_dict, prose_top_k=top_k,
         )
         if not hits:
-            return ""
+            return "", []
         lines: list[str] = []
+        chunks: list[dict] = []
         for h in hits:
             if h.is_qa:
                 lines.append(f"[Model Q&A — प्रश्न: {h.question or 'General'}]\n{h.content}")
             else:
                 label = " | ".join(filter(None, [h.topic, h.subtopic])) or "General"
                 lines.append(f"[{label}]\n{h.content}")
-        return "\n\n".join(lines)
+            chunks.append({
+                "chunk_id": h.chunk_id,
+                "topic": h.topic,
+                "subtopic": h.subtopic,
+                "is_qa": h.is_qa,
+                "question": h.question,
+                "content": h.content,
+            })
+        return "\n\n".join(lines), chunks
     except Exception as exc:
         logger.warning("question-resource retrieval failed (continuing without it): %s", exc)
-        return ""
+        return "", []
 
 
 # ── Question-wise assembly + marks clamp (AI-free, used by the task) ──────────────
@@ -1081,9 +1099,9 @@ async def build_sheet_debug(db: AsyncSession, sheet_id: uuid.UUID) -> dict | Non
 
 async def build_skill_debug(db: AsyncSession, test_id: uuid.UUID) -> dict | None:
     """Full step-by-step trace of the question-paper → checking-skill generation
-    workflow for one test: extracted questions + marks, detected topic/subtopic, and
-    the locked per-question checking guide with its evaluator verdict + iterations,
-    plus every AI call. Admin-only."""
+    workflow for one test: extracted questions + marks, detected topic/subtopic, the
+    locked per-question checking guide with its evaluator verdict + iterations AND the
+    knowledge chunks fetched for that question, plus every AI call. Admin-only."""
     test = await get_test(db, test_id)
     if not test:
         return None
@@ -1103,6 +1121,9 @@ async def build_skill_debug(db: AsyncSession, test_id: uuid.UUID) -> dict | None
             "evaluation_notes": sk.evaluation_notes,
             "iterations": sk.iterations,
             "skill_json": sk.skill_json,
+            # What the guide was distilled from: the Pinecone chunks fetched for this
+            # question at skill-generation time (null on skills locked before migration 024).
+            "fetched_knowledge_chunks": sk.knowledge_context,
         }
 
     return {

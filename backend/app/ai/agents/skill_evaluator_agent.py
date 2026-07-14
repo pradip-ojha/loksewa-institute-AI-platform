@@ -7,7 +7,8 @@ content. A skill PASSES if it is good enough to check student answers fairly.
 It FAILS a skill only for serious issues:
   • skill mapped to the wrong question / question-number mismatch
   • max-marks mismatch, or marks_breakdown not summing to full marks
-  • major expected answer areas missing
+  • reference notes missing, irrelevant to the question's topic, or too thin to judge from
+  • biasing content in the guide (sample answers, expected phrasings, pre-listed mistakes)
   • skill too vague to check answers
   • rubric or admin instruction clearly ignored
   • numerical question lacking formula/step checking guidance
@@ -37,10 +38,15 @@ content. A guide that lets a checker mark answers fairly PASSES, even if imperfe
 TASK: Give a verdict for each question's guide.
 
 HARD RULES (your bar):
+- A good guide is LEAN and UNBIASED: neutral "reference_notes" theory for the question's topics +
+  a marks_breakdown — the downstream checker judges answers independently from the theory, so the
+  guide must give it knowledge, not answers.
 - Default to PASS. FAIL ONLY for a serious, operational defect:
   • guide belongs to the wrong question / question-number mismatch
   • max_marks mismatch, or marks_breakdown does not sum to full marks
-  • major expected answer areas missing
+  • "reference_notes" missing, irrelevant to the question's topic, or too thin to judge answers from
+  • guide contains biasing content — sample answers, expected/mark-worthy phrasings, or pre-listed
+    mistakes — instead of neutral theory notes
   • guide too vague to actually mark answers
   • rubric or admin instruction clearly ignored
   • a numerical question's guide lacks formula/step-checking guidance

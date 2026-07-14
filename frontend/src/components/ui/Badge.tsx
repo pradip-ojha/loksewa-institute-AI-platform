@@ -5,7 +5,7 @@ type Tone = "brand" | "accent" | "success" | "warning" | "danger" | "info" | "ne
 
 const TONES: Record<Tone, string> = {
   brand: "bg-brand-50 text-brand-700 ring-brand-100",
-  accent: "bg-accent-50 text-accent-700 ring-accent-100",
+  accent: "bg-brand-50 text-brand-700 ring-brand-100",
   success: "bg-success-50 text-success-700 ring-success-100",
   warning: "bg-warning-50 text-warning-700 ring-warning-100",
   danger: "bg-danger-50 text-danger-700 ring-danger-100",

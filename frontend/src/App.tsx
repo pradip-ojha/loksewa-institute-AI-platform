@@ -1,6 +1,7 @@
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { AuthProvider } from "./context/AuthContext";
 import { ExamProvider } from "./context/ExamContext";
+import { StudentExamProvider } from "./context/StudentExamContext";
 import { ProtectedRoute } from "./routes/ProtectedRoute";
 import { Login } from "./pages/Login";
 import { AdminLayout } from "./layouts/AdminLayout";
@@ -10,7 +11,6 @@ import { AdminDashboard } from "./pages/admin/Dashboard";
 import { AdminStudents } from "./pages/admin/Students";
 import { AdminSyllabus } from "./pages/admin/Syllabus";
 import { AdminKnowledge } from "./pages/admin/Knowledge";
-import { AdminFileUploadTest } from "./pages/admin/FileUploadTest";
 import { AdminMCQ } from "./pages/admin/MCQ";
 import { AdminMCQTests } from "./pages/admin/MCQTests";
 import { AdminSubjectiveTests } from "./pages/admin/SubjectiveTests";
@@ -31,6 +31,7 @@ function App() {
     <BrowserRouter>
       <AuthProvider>
         <ExamProvider>
+        <StudentExamProvider>
         <Routes>
           {/* Public */}
           <Route path="/login" element={<Login />} />
@@ -45,7 +46,6 @@ function App() {
               <Route path="syllabus" element={<AdminSyllabus />} />
               <Route path="students" element={<AdminStudents />} />
               <Route path="knowledge" element={<AdminKnowledge />} />
-              <Route path="file-test" element={<AdminFileUploadTest />} />
               <Route path="mcq" element={<AdminMCQ />} />
               <Route path="mcq-tests" element={<AdminMCQTests />} />
               <Route path="video-tutor" element={<AdminVideoTutor />} />
@@ -72,6 +72,7 @@ function App() {
 
           <Route path="*" element={<Navigate to="/login" replace />} />
         </Routes>
+        </StudentExamProvider>
         </ExamProvider>
       </AuthProvider>
     </BrowserRouter>

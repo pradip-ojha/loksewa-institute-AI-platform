@@ -57,10 +57,20 @@ FEEDBACK FORMATTING (the "feedback" and "overall_summary" fields ONLY):
 - DO NOT use markdown in any other field. "comment_text", "target_text", "evidence_text", "missing_points",
   "section", and the section "note" stay PLAIN TEXT (comment_text must remain ≤ ~8 words for the page margin).
 
-METHOD: For each question, work section by section through the guide's marks_breakdown — find what
-the student wrote for that section, decide correct/partial/wrong, and award that section's marks.
-Sum the sections for the question total (≤ max). Then write feedback and pick at most ~2 genuinely
-wrong written items to annotate.
+METHOD — INDEPENDENT JUDGING (the core of your job):
+- Each CHECKING GUIDE gives you neutral REFERENCE THEORY NOTES for the question's topics and a
+  section-wise marks breakdown — NOT expected answers. YOU judge the student's answer on its merits.
+- For each question, work section by section through the guide's marks_breakdown: find what the
+  student wrote for that section, judge its factual correctness and completeness against the
+  guide's reference notes AND your own expert knowledge of the topic, decide correct/partial/wrong,
+  and award that section's marks.
+- NEVER search for specific wording: any factually correct formulation in the student's own words
+  earns the marks. A correct point the reference notes happen not to mention still counts — the
+  notes are grounding, not a checklist.
+- YOU decide what is factually wrong and annotation-worthy — the guide lists no mistakes; judge
+  each claim yourself against the theory.
+- Sum the sections for the question total (≤ max). Then write feedback and pick at most ~2 genuinely
+  wrong written items to annotate.
 
 SECTION-WISE MARKING (required):
 - Use the question's CHECKING GUIDE "marks_breakdown" criteria as the sections. For EACH section return its max marks, the marks you award, a status ("correct" | "partial" | "wrong"), "evidence_text" = the exact words the student wrote that earned the marks (empty string if the student wrote nothing for that section), and a "note".
@@ -131,23 +141,26 @@ GUIDE_BUDGET_FLOOR = 2500
 ANSWER_CHAR_CAP = 12000
 BLOCK_TARGET_CHARS = 60000
 
-# Guide fields dropped first when over budget (least marking-critical first). The
-# marking-critical core — intent, expected points, marks_breakdown, partial rules,
-# serious wrong statements — is never dropped.
+# Guide fields dropped first when over budget (least marking-critical first). Current
+# lean guides (reference notes + marks breakdown) are small enough to never trigger
+# compaction; the old-format field names are kept here so guides locked before the
+# lean redesign still compact safely. The marking-critical core — intent, reference
+# notes, marks_breakdown, partial rules, numerical guidance — is never dropped.
 _GUIDE_DROP_ORDER = (
     "sample_answer_fragments",
     "acceptable_alternative_wording",
     "theory_guidance",
     "common_mistakes",
+    "serious_wrong_statements",
     "annotation_worthy_mistakes",
+    "expected_answer_points",
     "feedback_guidance",
     "strictness_guidance",
-    "numerical_guidance",
 )
 _GUIDE_KEEP_ALWAYS = {
     "question_number", "question_intent", "topic", "subtopic", "max_marks", "answer_type",
-    "expected_answer_points", "marks_breakdown", "partial_marking_rules",
-    "serious_wrong_statements",
+    "reference_notes", "marks_breakdown", "partial_marking_rules",
+    "numerical_guidance", "special_instructions",
 }
 
 

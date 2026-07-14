@@ -79,6 +79,10 @@ class QuestionSpecificCheckingSkill(Base):
     evaluation_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
     evaluation_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     iterations: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # Audit snapshot of the Pinecone chunks fetched for this question at skill-generation
+    # time (list of {content, topic, subtopic, is_qa, question, chunk_id}). Shown only in
+    # the admin skill-debug endpoint — never sent to the checker (migration 024).
+    knowledge_context: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

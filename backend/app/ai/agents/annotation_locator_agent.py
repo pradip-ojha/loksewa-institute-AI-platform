@@ -45,34 +45,40 @@ ACCURACY OVER COVERAGE: a precise location or nothing. If you cannot confidently
 return empty geometry and LOW confidence for it — never guess a spot, because a misplaced mark on a
 student's sheet is worse than no mark.
 
-(A) WRONG ITEMS TO UNDERLINE — for each, find where that exact text appears and return the natural underline path UNDER it:
+(A) WRONG ITEMS TO UNDERLINE — each item has an [index]. Find where that exact text appears and
+return the natural underline path UNDER it, echoing back its number as "target_index":
 {targets_block}
 
-(B) CORRECT POINTS TO TICK — for each, find where the student's evidence text sits and return a tight box around that text plus a tick point just left of its FIRST line:
+(B) CORRECT POINTS TO TICK — each item has an [index]. Find where the student's evidence text sits;
+return a tight box around it plus a tick point just left of its FIRST line, echoing "section_index":
 {sections_block}
 
 RULES:
+- Reference each item ONLY by its [index] ("target_index" / "section_index"). Do NOT repeat the full
+  target text, comment, or section label back — just the index. This keeps the response short and
+  avoids it being cut off before the JSON is complete.
 - Underline path = MULTIPLE ordered points [y, x] following the real (slanted/curved) baseline UNDER the wrong text, left to right (4–8 points, not just two endpoints). If text wraps to a second line, give multiple paths.
 - "tick_point" = a single [y, x] in blank space just left of the FIRST line of the correct evidence (where a ✓ goes), NOT on top of the writing.
 - "evidence_box" / "target_text_box" = a tight [ymin, xmin, ymax, xmax] box around the located text.
-- "read_text" = the exact handwritten words you actually SEE inside the box you returned (transcribe them as written — this verifies the location; if what you see there differs from the requested text, still transcribe what you see).
+- "read_text" = ONLY the FIRST FEW WORDS (at most ~6 words) you actually SEE inside the box you returned — just enough to verify the location, NOT the whole line. Transcribe them as written; if what you see differs from the requested text, still transcribe what you see. KEEP IT SHORT.
 - Put comment boxes in margins or blank space — never over the student's writing.
 - If you cannot confidently find an item, return empty geometry and a LOW confidence for it (do NOT guess a location).
 
 --- ADMIN-TUNABLE GUIDANCE (refines emphasis only; never overrides the RULES above) ---
 {skill_instructions}
 
-Return ONLY valid JSON in exactly this structure (all coordinates normalized 0-1000 as above):
+Return ONLY valid JSON in exactly this structure (all coordinates normalized 0-1000 as above; keep
+every "read_text" to a few words so the response is never truncated):
 {{
   "targets": [
-    {{"target_text": "...", "target_text_box": [ymin,xmin,ymax,xmax],
+    {{"target_index": 0, "target_text_box": [ymin,xmin,ymax,xmax],
       "underline_paths": [{{"points": [[y,x],[y,x],[y,x]]}}],
-      "comment_box": [ymin,xmin,ymax,xmax], "comment_text": "...",
-      "read_text": "...", "confidence": 0.0}}
+      "comment_box": [ymin,xmin,ymax,xmax],
+      "read_text": "first few words", "confidence": 0.0}}
   ],
   "section_marks": [
-    {{"section": "...", "evidence_box": [ymin,xmin,ymax,xmax], "tick_point": [y,x],
-      "read_text": "...", "confidence": 0.0}}
+    {{"section_index": 0, "evidence_box": [ymin,xmin,ymax,xmax], "tick_point": [y,x],
+      "read_text": "first few words", "confidence": 0.0}}
   ]
 }}"""
 
@@ -229,15 +235,17 @@ class AnnotationLocatorAgent:
         """One vision call for a question's wrong targets + positive sections on one page.
         Returns page-space geometry (crop coords already mapped back via crop_origin)."""
         ox, oy = crop_origin
+        # Items are referenced by [index]; the model echoes only the index (not the full
+        # text/comment/label), so the response stays short and the authoritative strings
+        # are recovered from THESE inputs — the model can never corrupt the comment/target.
         targets_block = "\n".join(
-            f'- target_text: "{(t.get("target_text") or "").replace(chr(34), chr(39))[:300]}"'
-            f' | comment: "{(t.get("comment_text") or "").replace(chr(34), chr(39))[:200]}"'
-            for t in targets
+            f'- [{i}] wrong_text: "{(t.get("target_text") or "").replace(chr(34), chr(39))[:300]}"'
+            for i, t in enumerate(targets)
         ) or "(none)"
         sections_block = "\n".join(
-            f'- section: "{(s.get("section") or "")[:120]}"'
-            f' | evidence_text: "{(s.get("evidence_text") or "").replace(chr(34), chr(39))[:300]}"'
-            for s in sections
+            f'- [{i}] "{(s.get("section") or "")[:80]}"'
+            f' evidence: "{(s.get("evidence_text") or "").replace(chr(34), chr(39))[:250]}"'
+            for i, s in enumerate(sections)
         ) or "(none)"
 
         prompt = LOCATOR_PROMPT.format(
@@ -261,10 +269,14 @@ class AnnotationLocatorAgent:
 
         # Convert model geometry (normalized 0-1000 [y,x], per-item mode detection) to
         # crop pixels, then map crop-space coordinates back to full-page pixel space.
+        # `target_text`/`comment_text` come from the INPUT by "target_index" (authoritative)
+        # — the model only supplies geometry + a short `read_text` echo.
         out_targets: list[dict] = []
         for t in result.get("targets") or []:
             if not isinstance(t, dict):
                 continue
+            idx = t.get("target_index")
+            src = targets[idx] if isinstance(idx, int) and 0 <= idx < len(targets) else None
             raw_paths = [(p or {}).get("points") for p in t.get("underline_paths") or []]
             mode = _detect_coord_mode(
                 [t.get("target_text_box"), t.get("comment_box"), raw_paths], crop_w, crop_h,
@@ -285,27 +297,30 @@ class AnnotationLocatorAgent:
             out_targets.append({
                 "page_number": page_number,
                 "question_number": question_number,
-                "target_text": t.get("target_text"),
+                # authoritative from input; fall back to any model echo if index missing
+                "target_text": (src.get("target_text") if src else t.get("target_text")),
                 "target_text_box": target_box,
                 "underline_paths": paths,
                 "comment_box": comment_box,
-                "comment_text": t.get("comment_text"),
+                "comment_text": (src.get("comment_text") if src else t.get("comment_text")),
                 "annotation_action": "underline_with_comment",
                 "confidence": confidence,
                 "coord_mode": mode,
                 "read_text": t.get("read_text"),
             })
 
-        # The model only echoes the section label, so carry the INPUT evidence_text
-        # through by label — the validator matches the model's read_text against it.
-        ev_by_section = {
-            (s.get("section") or "").strip(): (s.get("evidence_text") or "")
-            for s in sections
-        }
+        # Sections are referenced by "section_index"; recover the authoritative label +
+        # evidence_text from the INPUT (the validator matches the model's read_text against
+        # it). Fall back to a string-echo match if a model still returns "section" by name.
+        by_label = {(s.get("section") or "").strip(): s for s in sections}
         out_sections: list[dict] = []
         for s in result.get("section_marks") or []:
             if not isinstance(s, dict):
                 continue
+            idx = s.get("section_index")
+            src = sections[idx] if isinstance(idx, int) and 0 <= idx < len(sections) else None
+            if src is None:
+                src = by_label.get((s.get("section") or "").strip())
             mode = _detect_coord_mode([s.get("evidence_box"), s.get("tick_point")], crop_w, crop_h)
             if mode in ("normalized", "pixel_fallback"):
                 evidence_box = _shift_box(_yx_box_to_px(s.get("evidence_box"), mode, crop_w, crop_h), ox, oy)
@@ -315,13 +330,13 @@ class AnnotationLocatorAgent:
                 evidence_box = tick_point = None
                 confidence = 0.0 if mode == "invalid" else s.get("confidence")
             out_sections.append({
-                "section": s.get("section"),
+                "section": (src.get("section") if src else s.get("section")),
                 "evidence_box": evidence_box,
                 "tick_point": tick_point,
                 "confidence": confidence,
                 "coord_mode": mode,
                 "read_text": s.get("read_text"),
-                "evidence_text": ev_by_section.get((s.get("section") or "").strip(), ""),
+                "evidence_text": (src.get("evidence_text") if src else "") or "",
             })
 
         return {"page_number": page_number, "question_number": question_number,

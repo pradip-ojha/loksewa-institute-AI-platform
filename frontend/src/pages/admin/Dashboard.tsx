@@ -4,7 +4,7 @@ import {
   Clock, Activity,
 } from "lucide-react";
 import api from "../../services/api";
-import { PageHeader, Card, StatCard, EmptyState, Skeleton, Badge } from "../../components/ui";
+import { PageHeader, Card, CardHeader, StatCard, EmptyState, Skeleton, Badge } from "../../components/ui";
 
 interface Stats {
   total_students: number;
@@ -62,9 +62,9 @@ export function AdminDashboard() {
     <div>
       <PageHeader title="Dashboard" description="Platform overview at a glance" icon={<LayoutDashboard className="h-5 w-5" />} />
 
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
         {loading
-          ? CARD_DEFS.map((_, i) => <Skeleton key={i} className="h-28 rounded-2xl" />)
+          ? CARD_DEFS.map((_, i) => <Skeleton key={i} className="h-24 rounded-lg" />)
           : CARD_DEFS.map((card, i) => (
               <StatCard
                 key={card.key}
@@ -78,10 +78,9 @@ export function AdminDashboard() {
             ))}
       </div>
 
-      <Card className="mt-8">
-        <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-gray-800">
-          <Activity className="h-4 w-4 text-brand-500" /> Recent Activity
-        </h3>
+      <Card className="mt-6">
+        <CardHeader title="Recent Activity" icon={<Activity className="h-4 w-4" />} />
+
         {activity.length === 0 ? (
           <EmptyState icon={<Activity className="h-6 w-6" />} title="No activity yet" description="The feed populates as content is added." />
         ) : (
@@ -92,7 +91,7 @@ export function AdminDashboard() {
                   <Badge tone="neutral">{TYPE_LABELS[item.type] || item.type}</Badge>
                   <span className="truncate text-sm text-gray-700 font-deva">{item.title}</span>
                 </div>
-                <span className="flex-shrink-0 text-xs text-gray-400">
+                <span className="flex-shrink-0 text-xs tabular-nums text-gray-400">
                   {new Date(item.created_at).toLocaleDateString()}
                 </span>
               </li>

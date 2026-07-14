@@ -26,7 +26,7 @@ export function KeyPointsList({ items }: { items?: string[] | null }) {
 export function ExamPointCallout({ items }: { items?: string[] | null }) {
   if (!items?.length) return null;
   return (
-    <div className="rounded-2xl border border-warning-100 bg-gradient-to-br from-warning-50 to-amber-50/40 p-4">
+    <div className="rounded-lg border border-warning-100 bg-warning-50 p-4">
       <div className="mb-2 flex items-center gap-2 text-warning-700">
         <Target className="h-4 w-4" />
         <h4 className="text-sm font-semibold">परीक्षा केन्द्रित बुँदाहरू · Exam Focus</h4>

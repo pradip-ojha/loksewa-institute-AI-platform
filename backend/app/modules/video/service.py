@@ -226,15 +226,20 @@ def slide_out(s: VideoSlideLabel) -> dict:
 
 # ── Student ──────────────────────────────────────────────────────────────────────
 
-async def list_student_videos(db: AsyncSession, student_id: uuid.UUID) -> list[Video]:
+async def list_student_videos(
+    db: AsyncSession, student_id: uuid.UUID, exam_id: uuid.UUID | None = None,
+) -> list[Video]:
+    """``exam_id`` narrows to the student's currently-selected exam (shared exam
+    picker across MCQ/Video/Subjective/AI Tutor)."""
     from app.modules.exams.service import get_enrolled_exam_ids
     enrolled = await get_enrolled_exam_ids(db, student_id)
     if not enrolled:
         return []
+    exam_filter = [exam_id] if exam_id is not None else enrolled
     r = await db.execute(
         select(Video).where(
             Video.status == "active", Video.processing_status == "completed",
-            Video.exam_id.in_(enrolled),
+            Video.exam_id.in_(enrolled), Video.exam_id.in_(exam_filter),
         )
         .order_by(Video.created_at.desc())
     )

@@ -49,9 +49,9 @@ _DEFAULT_SKILLS: dict[str, str] = {
         "subtopic null over forcing a shaky precise match."
     ),
     "SkillGeneratorAgent": (
-        "Make guides concrete enough that a checker never has to guess: spell out acceptable Nepali "
-        "phrasings, partial-credit thresholds, and the specific wrong statements students actually write. "
-        "Keep numerical guides step-by-step (formula → steps → calculation → final answer/units)."
+        "Keep reference notes neutral and concise — enough theory to judge any correct answer, never "
+        "sample answers or mistake lists. Keep numerical guidance step-by-step (formula → steps → "
+        "final answer/units)."
     ),
     "SkillEvaluatorAgent": (
         "Stay lenient — a usable guide passes. Reserve failure for defects that would actually produce "

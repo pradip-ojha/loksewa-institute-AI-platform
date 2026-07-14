@@ -205,8 +205,8 @@ export const mcqTestsService = {
     api.delete(`/api/admin/mcq-tests/sets/${id}`).then(() => undefined),
 
   // Student
-  listStudentTests: (): Promise<StudentTestSet[]> =>
-    api.get("/api/student/mcq-tests").then((r) => r.data),
+  listStudentTests: (examId?: string | null): Promise<StudentTestSet[]> =>
+    api.get("/api/student/mcq-tests", { params: examId ? { exam_id: examId } : {} }).then((r) => r.data),
   startTest: (setId: string): Promise<AttemptStart> =>
     api.post(`/api/student/mcq-tests/${setId}/start`).then((r) => r.data),
   submitTest: (setId: string, answers: { question_id: string; selected_option_id: string | null }[], timeTakenSeconds: number): Promise<AttemptResult> =>

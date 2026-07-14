@@ -229,7 +229,7 @@ export function AdminExams() {
           </p>
           <div>
             <p className="mb-1.5 text-sm text-gray-600">
-              To confirm, type <span className="select-none font-semibold text-red-600">{CONFIRM_PHRASE}</span>{" "}
+              To confirm, type <span className="select-none font-semibold text-danger-600">{CONFIRM_PHRASE}</span>{" "}
               below (typing required — pasting is disabled):
             </p>
             <input
@@ -244,7 +244,7 @@ export function AdminExams() {
               spellCheck={false}
               placeholder={CONFIRM_PHRASE}
               disabled={deleting}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-red-400 focus:ring-2 focus:ring-red-100 disabled:opacity-50"
+              className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm outline-none focus:border-danger-500 focus:ring-2 focus:ring-danger-500/20 disabled:opacity-50"
             />
           </div>
         </div>

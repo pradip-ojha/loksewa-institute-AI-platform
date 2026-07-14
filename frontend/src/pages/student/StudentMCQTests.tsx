@@ -7,6 +7,7 @@ import { mcqTestsService } from "../../services/mcqTests";
 import type {
   AttemptStart, AttemptResult, StudentTestSet, AttemptHistoryItem, StudentAnalytics,
 } from "../../services/mcqTests";
+import { useStudentExam } from "../../context/StudentExamContext";
 import { getErrorMessage } from "../../utils/error";
 import { PageHeader, Card, Button, Badge, Tabs, EmptyState, Alert, cn } from "../../components/ui";
 import { RichText } from "../../components/content/RichText";
@@ -134,7 +135,7 @@ function AnalyticsTab({ data, error }: { data: StudentAnalytics | null; error: s
       </div>
 
       {data.weak_topics.length > 0 && (
-        <div className="rounded-2xl bg-gradient-to-br from-danger-50 to-white p-4 ring-1 ring-danger-100">
+        <div className="rounded-lg border border-danger-100 bg-danger-50 p-4">
           <p className="flex items-center gap-1.5 text-sm font-semibold text-danger-700">
             <AlertTriangle className="h-4 w-4" /> Topics to focus on
           </p>
@@ -174,13 +175,13 @@ function AnalyticsTab({ data, error }: { data: StudentAnalytics | null; error: s
 
 function ResultView({ result, onDone }: { result: AttemptResult; onDone: () => void }) {
   const p = pct(result.correct_count, result.total_questions);
-  const tone = p >= 60 ? "from-success-500 to-success-700" : p >= 40 ? "from-warning-500 to-warning-600" : "from-danger-500 to-danger-700";
+  const tone = p >= 60 ? "bg-success-600" : p >= 40 ? "bg-warning-600" : "bg-danger-600";
   return (
     <div className="pb-20">
       <button onClick={onDone} className="mb-3 inline-flex items-center gap-1 text-sm font-medium text-brand-700 hover:text-brand-800">
         <ArrowLeft className="h-4 w-4" /> Back
       </button>
-      <div className={`mb-5 overflow-hidden rounded-2xl bg-gradient-to-br ${tone} p-6 text-center text-white shadow-card`}>
+      <div className={`mb-5 overflow-hidden rounded-lg ${tone} p-6 text-center text-white`}>
         <p className="text-sm font-medium text-white/80 font-deva">{result.test_name}</p>
         <p className="mt-1 text-4xl font-bold tracking-tight">{result.score}/{result.total_questions}</p>
         <p className="mt-1 text-sm font-medium text-white/90">{p}% correct</p>
@@ -289,7 +290,7 @@ function TakingView({ attempt, onSubmitted }: { attempt: AttemptStart; onSubmitt
 
   return (
     <div className="pb-4">
-      <div className="sticky top-14 z-10 -mx-4 mb-4 flex items-center justify-between border-b border-gray-200 bg-white/95 px-4 py-2.5 backdrop-blur-sm">
+      <div className="sticky top-14 z-10 -mx-4 mb-4 flex items-center justify-between border-b border-gray-200 bg-white px-4 py-2.5">
         <span className="text-sm font-semibold text-gray-700 font-deva">{attempt.test_name}</span>
         <span className={cn(
           "inline-flex items-center gap-1.5 rounded-lg px-3 py-1 text-sm font-bold tabular-nums",
@@ -366,6 +367,7 @@ function TakingView({ attempt, onSubmitted }: { attempt: AttemptStart; onSubmitt
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export function StudentMCQTests() {
+  const { selectedExamId } = useStudentExam();
   const [view, setView] = useState<View>("list");
   const [tab, setTab] = useState<Tab>("tests");
 
@@ -382,11 +384,11 @@ export function StudentMCQTests() {
 
   const loadTests = useCallback(async () => {
     try {
-      setTests(await mcqTestsService.listStudentTests());
+      setTests(await mcqTestsService.listStudentTests(selectedExamId));
     } catch (err) {
       setError(getErrorMessage(err));
     }
-  }, []);
+  }, [selectedExamId]);
 
   const loadHistory = useCallback(async () => {
     setTabError("");

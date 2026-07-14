@@ -202,10 +202,11 @@ async def delete_video(
 
 @router.get("/student/videos", response_model=list[StudentVideoListItem])
 async def student_list_videos(
+    exam_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_student),
 ):
-    videos = await svc.list_student_videos(db, current_user.id)
+    videos = await svc.list_student_videos(db, current_user.id, exam_id=exam_id)
     return [
         StudentVideoListItem(
             id=v.id, display_name=v.display_name, topic=v.topic, subtopic=v.subtopic,

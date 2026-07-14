@@ -67,7 +67,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                 animate={{ opacity: 1, x: 0, scale: 1 }}
                 exit={{ opacity: 0, x: 40, scale: 0.95 }}
                 transition={{ duration: 0.2 }}
-                className="pointer-events-auto flex items-start gap-3 rounded-xl bg-white px-4 py-3 shadow-pop ring-1 ring-gray-100"
+                className="pointer-events-auto flex items-start gap-3 rounded-lg border border-gray-200 bg-white px-4 py-3 shadow-pop"
               >
                 {ICONS[t.tone]}
                 <p className="flex-1 text-sm text-gray-700">{t.message}</p>

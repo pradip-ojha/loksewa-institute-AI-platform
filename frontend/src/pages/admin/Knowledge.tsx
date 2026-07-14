@@ -1,8 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { BookOpen, UploadCloud } from "lucide-react";
 import { knowledgeService, type KnowledgeChunk, type KnowledgeDocument } from "../../services/knowledge";
 import { syllabusService, type SyllabusTree } from "../../services/syllabus";
 import { JobStatusPoller, type JobState } from "../../components/JobStatusPoller";
 import { useExam } from "../../context/ExamContext";
+import {
+  PageHeader,
+  Tabs,
+  Button,
+  Alert,
+  FormField,
+  TextInput,
+  Textarea,
+  Select,
+  StatusBadge,
+  DataTable,
+  Menu,
+  ConfirmDialog,
+  EmptyState,
+  PageLoader,
+  useToast,
+  type Column,
+} from "../../components/ui";
 
 const DOC_TYPES = [
   { value: "notes", label: "Notes" },
@@ -12,38 +31,26 @@ const DOC_TYPES = [
   { value: "model_qa", label: "Model Q&A" },
 ];
 
-const STATUS_COLORS: Record<string, string> = {
-  pending: "bg-gray-100 text-gray-600",
-  processing: "bg-blue-100 text-blue-700",
-  completed: "bg-green-100 text-green-700",
-  failed: "bg-red-100 text-red-700",
-};
-
 type Tab = "upload" | "processed" | "logs";
+
+const TABS = [
+  { id: "upload", label: "Upload Knowledge" },
+  { id: "processed", label: "Processed Knowledge" },
+  { id: "logs", label: "Processing Logs" },
+];
 
 export function AdminKnowledge() {
   const [tab, setTab] = useState<Tab>("upload");
 
   return (
     <div>
-      <div className="mb-6">
-        <h2 className="text-xl font-semibold text-gray-900">Knowledge Layer</h2>
-        <p className="mt-1 text-sm text-gray-500">Upload and manage knowledge documents for AI workflows.</p>
-      </div>
+      <PageHeader
+        title="Knowledge Layer"
+        description="Upload and manage knowledge documents for AI workflows."
+        icon={<BookOpen className="h-5 w-5" />}
+      />
 
-      <div className="mb-6 flex gap-1 rounded-xl bg-gray-100 p-1">
-        {(["upload", "processed", "logs"] as Tab[]).map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className={`flex-1 rounded-lg py-2 text-sm font-medium capitalize transition-colors ${
-              tab === t ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"
-            }`}
-          >
-            {t === "processed" ? "Processed Knowledge" : t === "logs" ? "Processing Logs" : "Upload Knowledge"}
-          </button>
-        ))}
-      </div>
+      <Tabs items={TABS} value={tab} onChange={(id) => setTab(id as Tab)} className="mb-6" />
 
       {tab === "upload" && <UploadTab />}
       {tab === "processed" && <ProcessedTab />}
@@ -76,7 +83,10 @@ function UploadTab() {
   const [tree, setTree] = useState<SyllabusTree | null>(null);
 
   useEffect(() => {
-    if (!selectedExamId) { setTree(null); return; }
+    if (!selectedExamId) {
+      setTree(null);
+      return;
+    }
     syllabusService.get(selectedExamId).then(setTree).catch(() => setTree(null));
   }, [selectedExamId]);
 
@@ -87,13 +97,9 @@ function UploadTab() {
     return availableChapters.flatMap((c) => c.topics);
   }, [form.chapter, availableChapters]);
 
-  const availableSubtopics = useMemo(
-    () => availableTopics.find((t) => t.topic === form.topic)?.subtopics ?? [],
-    [form.topic, availableTopics]
-  );
+  const availableSubtopics = useMemo(() => availableTopics.find((t) => t.topic === form.topic)?.subtopics ?? [], [form.topic, availableTopics]);
 
-  const set = (field: string, value: string) =>
-    setForm((f) => ({ ...f, [field]: value }));
+  const set = (field: string, value: string) => setForm((f) => ({ ...f, [field]: value }));
 
   const handleChapterChange = (value: string) => {
     setForm((f) => ({ ...f, chapter: value, topic: "", subtopic: "" }));
@@ -105,9 +111,18 @@ function UploadTab() {
 
   const handleSubmit = async () => {
     const file = fileRef.current?.files?.[0];
-    if (!selectedExamId) { setError("Select an exam in the top bar first."); return; }
-    if (!file) { setError("Select a file to upload."); return; }
-    if (!form.display_name.trim()) { setError("Display name is required."); return; }
+    if (!selectedExamId) {
+      setError("Select an exam in the top bar first.");
+      return;
+    }
+    if (!file) {
+      setError("Select a file to upload.");
+      return;
+    }
+    if (!form.display_name.trim()) {
+      setError("Display name is required.");
+      return;
+    }
 
     setSubmitting(true);
     setError(null);
@@ -139,124 +154,99 @@ function UploadTab() {
   const handleJobDone = (_job: JobState) => {};
 
   return (
-    <div className="rounded-xl bg-white p-6 shadow-sm ring-1 ring-gray-100">
-      <h3 className="mb-5 font-semibold text-gray-800">Upload Knowledge Document</h3>
+    <div className="max-w-3xl rounded-lg border border-gray-200 bg-white p-6">
+      <h3 className="mb-5 text-sm font-semibold text-gray-900">Upload Knowledge Document</h3>
 
       <div className="grid gap-4 sm:grid-cols-2">
-        <div className="sm:col-span-2">
-          <Label>Exam *</Label>
-          <Select
-            value={selectedExamId ?? ""}
-            onChange={(e) => { if (e.target.value) setSelectedExamId(e.target.value); }}
-          >
+        <FormField label="Exam" required className="sm:col-span-2" hint="Changing this also updates the exam selected in the top bar (used across the admin workspace, including the Processed Knowledge and Logs tabs).">
+          <Select value={selectedExamId ?? ""} onChange={(e) => { if (e.target.value) setSelectedExamId(e.target.value); }}>
             {!selectedExamId && <option value="">— Select an exam —</option>}
             {exams.map((ex) => (
-              <option key={ex.id} value={ex.id}>{ex.name} ({ex.exam_type})</option>
+              <option key={ex.id} value={ex.id}>
+                {ex.name} ({ex.exam_type})
+              </option>
             ))}
           </Select>
-          <p className="mt-1 text-xs text-gray-400">
-            Changing this also updates the exam selected in the top bar (used across the admin
-            workspace, including the Processed Knowledge and Logs tabs).
-          </p>
-        </div>
+        </FormField>
 
-        <div className="sm:col-span-2">
-          <Label>Document Display Name *</Label>
-          <Input
-            value={form.display_name}
-            onChange={(e) => set("display_name", e.target.value)}
-            placeholder="e.g. RBB Objective Notes Chapter 1"
-          />
-        </div>
+        <FormField label="Document Display Name" required className="sm:col-span-2">
+          <TextInput value={form.display_name} onChange={(e) => set("display_name", e.target.value)} placeholder="e.g. RBB Objective Notes Chapter 1" />
+        </FormField>
 
-        <div>
-          <Label>Document Type *</Label>
+        <FormField
+          label="Document Type"
+          required
+          hint={form.document_type === "model_qa" ? "Upload a question paper with model answers. Each question–answer pair is stored separately and retrieved by its question." : undefined}
+        >
           <Select value={form.document_type} onChange={(e) => set("document_type", e.target.value)}>
-            {DOC_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+            {DOC_TYPES.map((t) => (
+              <option key={t.value} value={t.value}>
+                {t.label}
+              </option>
+            ))}
           </Select>
-          {form.document_type === "model_qa" && (
-            <p className="mt-1 text-xs text-gray-500">
-              Upload a question paper with model answers. Each question–answer pair is stored
-              separately and retrieved by its question.
-            </p>
-          )}
-        </div>
+        </FormField>
 
-        <div>
-          <Label>Chapter <span className="font-normal text-gray-400">(optional)</span></Label>
+        <FormField label="Chapter (optional)" hint="Leave blank for a whole book or note set spanning multiple chapters — each chunk is auto-mapped to the syllabus. Pick a chapter only for single-chapter material.">
           <Select value={form.chapter} onChange={(e) => handleChapterChange(e.target.value)}>
             <option value="">— Whole book / all chapters —</option>
             {availableChapters.map((c) => (
-              <option key={c.chapter} value={c.chapter}>{c.chapter}</option>
+              <option key={c.chapter} value={c.chapter}>
+                {c.chapter}
+              </option>
             ))}
           </Select>
-          <p className="mt-1 text-xs text-gray-400">
-            Leave blank for a whole book or note set spanning multiple chapters — each chunk is
-            auto-mapped to the syllabus. Pick a chapter only for single-chapter material.
-          </p>
-        </div>
+        </FormField>
 
-        <div>
-          <Label>Topic <span className="font-normal text-gray-400">(optional)</span></Label>
+        <FormField label="Topic (optional)">
           <Select value={form.topic} onChange={(e) => handleTopicChange(e.target.value)}>
             <option value="">— Leave blank for auto-detection —</option>
             {availableTopics.map((t) => (
-              <option key={t.topic} value={t.topic}>{t.topic}</option>
+              <option key={t.topic} value={t.topic}>
+                {t.topic}
+              </option>
             ))}
           </Select>
-        </div>
+        </FormField>
 
-        <div>
-          <Label>Subtopic <span className="font-normal text-gray-400">(optional)</span></Label>
+        <FormField label="Subtopic (optional)">
           {availableSubtopics.length > 0 ? (
             <Select value={form.subtopic} onChange={(e) => set("subtopic", e.target.value)}>
               <option value="">— Leave blank for auto-detection —</option>
               {availableSubtopics.map((s) => (
-                <option key={s.id} value={s.subtopic}>{s.subtopic}</option>
+                <option key={s.id} value={s.subtopic}>
+                  {s.subtopic}
+                </option>
               ))}
             </Select>
           ) : (
             <Select value="" disabled>
-              <option value="">
-                {form.topic ? "No subtopics for this topic" : "Select a topic first"}
-              </option>
+              <option value="">{form.topic ? "No subtopics for this topic" : "Select a topic first"}</option>
             </Select>
           )}
-        </div>
+        </FormField>
 
-        <div className="sm:col-span-2">
-          <Label>Custom Instruction <span className="font-normal text-gray-400">(optional)</span></Label>
-          <textarea
-            value={form.custom_instruction}
-            onChange={(e) => set("custom_instruction", e.target.value)}
-            rows={3}
-            placeholder="e.g. Focus on exam-relevant definitions and formulas only"
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none"
-          />
-        </div>
+        <FormField label="Custom Instruction (optional)" className="sm:col-span-2">
+          <Textarea value={form.custom_instruction} onChange={(e) => set("custom_instruction", e.target.value)} rows={3} placeholder="e.g. Focus on exam-relevant definitions and formulas only" />
+        </FormField>
 
-        <div className="sm:col-span-2">
-          <Label>Upload File * <span className="font-normal text-gray-400">(PDF or DOCX, max 50 MB)</span></Label>
+        <FormField label="Upload File (PDF or DOCX, max 50 MB)" required className="sm:col-span-2">
           <input ref={fileRef} type="file" accept=".pdf,.docx,.doc" className="text-sm text-gray-600" />
-        </div>
+        </FormField>
       </div>
 
-      {error && (
-        <div className="mt-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</div>
-      )}
+      {error && <Alert className="mt-4">{error}</Alert>}
 
-      <button
-        onClick={handleSubmit}
-        disabled={submitting}
-        className="mt-5 rounded-lg bg-brand-500 px-6 py-2.5 text-sm font-medium text-white hover:bg-brand-600 disabled:opacity-50"
-      >
-        {submitting ? "Uploading…" : "Upload & Process"}
-      </button>
+      <Button className="mt-5" icon={<UploadCloud className="h-4 w-4" />} onClick={handleSubmit} loading={submitting}>
+        Upload &amp; Process
+      </Button>
 
       {jobId && (
         <div className="mt-6 space-y-2">
           <p className="text-sm font-medium text-gray-700">Processing…</p>
-          <p className="text-xs text-gray-500">Document ID: <span className="font-mono">{docId}</span></p>
+          <p className="text-xs text-gray-500">
+            Document ID: <span className="font-mono">{docId}</span>
+          </p>
           <JobStatusPoller jobId={jobId} onComplete={handleJobDone} onFail={handleJobDone} />
         </div>
       )}
@@ -268,11 +258,10 @@ function UploadTab() {
 
 function ProcessedTab() {
   const { exams, selectedExamId } = useExam();
-  // Filter documents by exam. Defaults to the exam selected in the top bar; re-syncs when that
-  // changes. "" = All exams. A local state so the admin can widen to "All exams" without
-  // disturbing the global selection used by uploads and the other workspaces.
   const [filterExamId, setFilterExamId] = useState<string>(selectedExamId ?? "");
-  useEffect(() => { setFilterExamId(selectedExamId ?? ""); }, [selectedExamId]);
+  useEffect(() => {
+    setFilterExamId(selectedExamId ?? "");
+  }, [selectedExamId]);
 
   const [docs, setDocs] = useState<KnowledgeDocument[]>([]);
   const [loading, setLoading] = useState(true);
@@ -280,14 +269,21 @@ function ProcessedTab() {
   const [chunksDocName, setChunksDocName] = useState<string>("");
   const [chunksLoading, setChunksLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [reprocessJobId, setReprocessJobId] = useState<string | null>(null);
 
   const load = async () => {
     setLoading(true);
-    try { setDocs(await knowledgeService.list(filterExamId || undefined)); } finally { setLoading(false); }
+    try {
+      setDocs(await knowledgeService.list(filterExamId || undefined));
+    } finally {
+      setLoading(false);
+    }
   };
 
-  useEffect(() => { load(); }, [filterExamId]);
+  useEffect(() => {
+    load(); // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterExamId]);
 
   const handleViewChunks = async (doc: KnowledgeDocument) => {
     setChunksLoading(true);
@@ -295,17 +291,23 @@ function ProcessedTab() {
     setChunksDocName(doc.display_name);
     try {
       setChunks(await knowledgeService.getChunks(doc.id));
-    } finally { setChunksLoading(false); }
+    } finally {
+      setChunksLoading(false);
+    }
   };
 
-  const handleDelete = async (id: string) => {
-    if (!confirm("Delete this document and all its chunks from Pinecone?")) return;
+  const doDelete = async () => {
+    if (!confirmDel) return;
+    const id = confirmDel;
+    setConfirmDel(null);
     setDeletingId(id);
     try {
       await knowledgeService.delete(id);
       await load();
       if (chunks !== null) setChunks(null);
-    } finally { setDeletingId(null); }
+    } finally {
+      setDeletingId(null);
+    }
   };
 
   const handleReprocess = async (id: string) => {
@@ -313,107 +315,86 @@ function ProcessedTab() {
     setReprocessJobId(job.id);
   };
 
-  const filterBar = (
-    <div className="flex items-center gap-2">
-      <label className="text-sm font-medium text-gray-600">Exam:</label>
-      <div className="w-72">
-        <Select value={filterExamId} onChange={(e) => setFilterExamId(e.target.value)}>
-          <option value="">All exams</option>
-          {exams.map((ex) => (
-            <option key={ex.id} value={ex.id}>{ex.name} ({ex.exam_type})</option>
-          ))}
-        </Select>
-      </div>
-    </div>
-  );
+  const columns: Column<KnowledgeDocument>[] = [
+    {
+      key: "display_name",
+      header: "Name",
+      accessor: (d) => d.display_name,
+      render: (d) => <span className="block max-w-xs truncate font-medium text-gray-900">{d.display_name}</span>,
+    },
+    { key: "type", header: "Type", render: (d) => <span className="capitalize text-gray-500">{d.document_type.replace("_", " ")}</span> },
+    { key: "chapter", header: "Chapter", render: (d) => <span className="text-gray-500">{d.chapter ?? "—"}</span> },
+    { key: "chunks", header: "Chunks", align: "right", render: (d) => <span className="tabular-nums text-gray-700">{d.chunk_count}</span> },
+    { key: "status", header: "Status", render: (d) => <StatusBadge status={d.processing_status} /> },
+    {
+      key: "actions",
+      header: "",
+      align: "right",
+      width: "3rem",
+      render: (d) => (
+        <Menu
+          items={[
+            { label: "View chunks", onClick: () => handleViewChunks(d) },
+            { label: "Reprocess", onClick: () => handleReprocess(d.id) },
+            { label: deletingId === d.id ? "Deleting…" : "Delete", tone: "danger", disabled: deletingId === d.id, onClick: () => setConfirmDel(d.id) },
+          ]}
+        />
+      ),
+    },
+  ];
 
   return (
     <div className="space-y-4">
-      {filterBar}
-
-      {loading ? (
-        <p className="text-sm text-gray-400">Loading…</p>
-      ) : docs.length === 0 ? (
-        <div className="rounded-xl bg-white p-8 text-center shadow-sm ring-1 ring-gray-100">
-          <p className="text-sm text-gray-400">
-            {filterExamId ? "No documents for this exam." : "No documents yet. Upload one from the Upload tab."}
-          </p>
+      <div className="flex items-center gap-2">
+        <label className="text-sm font-medium text-gray-600">Exam:</label>
+        <div className="w-72">
+          <Select value={filterExamId} onChange={(e) => setFilterExamId(e.target.value)}>
+            <option value="">All exams</option>
+            {exams.map((ex) => (
+              <option key={ex.id} value={ex.id}>
+                {ex.name} ({ex.exam_type})
+              </option>
+            ))}
+          </Select>
         </div>
-      ) : (
-      <>
+      </div>
+
       {reprocessJobId && (
-        <div className="rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-100">
+        <div className="rounded-lg border border-gray-200 bg-white p-4">
           <p className="mb-2 text-sm font-medium text-gray-700">Reprocessing…</p>
           <JobStatusPoller
             jobId={reprocessJobId}
-            onComplete={() => { setReprocessJobId(null); load(); }}
+            onComplete={() => {
+              setReprocessJobId(null);
+              load();
+            }}
             onFail={() => setReprocessJobId(null)}
           />
         </div>
       )}
 
-      <div className="overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-gray-100">
-        <table className="w-full text-sm">
-          <thead className="border-b border-gray-100 bg-gray-50 text-xs uppercase text-gray-500">
-            <tr>
-              <th className="px-4 py-3 text-left">Name</th>
-              <th className="px-4 py-3 text-left">Type</th>
-              <th className="px-4 py-3 text-left">Chapter</th>
-              <th className="px-4 py-3 text-left">Chunks</th>
-              <th className="px-4 py-3 text-left">Status</th>
-              <th className="px-4 py-3 text-left">Actions</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-50">
-            {docs.map((doc) => (
-              <tr key={doc.id} className="hover:bg-gray-50">
-                <td className="px-4 py-3 font-medium text-gray-900 max-w-xs truncate">{doc.display_name}</td>
-                <td className="px-4 py-3 text-gray-500 capitalize">{doc.document_type.replace("_", " ")}</td>
-                <td className="px-4 py-3 text-gray-500">{doc.chapter ?? "—"}</td>
-                <td className="px-4 py-3 text-gray-700">{doc.chunk_count}</td>
-                <td className="px-4 py-3">
-                  <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_COLORS[doc.processing_status] ?? STATUS_COLORS.pending}`}>
-                    {doc.processing_status}
-                  </span>
-                </td>
-                <td className="px-4 py-3">
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => handleViewChunks(doc)}
-                      className="text-xs font-medium text-brand-600 hover:text-brand-800"
-                    >
-                      View Chunks
-                    </button>
-                    <button
-                      onClick={() => handleReprocess(doc.id)}
-                      className="text-xs font-medium text-gray-500 hover:text-gray-800"
-                    >
-                      Reprocess
-                    </button>
-                    <button
-                      onClick={() => handleDelete(doc.id)}
-                      disabled={deletingId === doc.id}
-                      className="text-xs font-medium text-red-500 hover:text-red-700 disabled:opacity-40"
-                    >
-                      {deletingId === doc.id ? "Deleting…" : "Delete"}
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <DataTable
+        columns={columns}
+        rows={docs}
+        rowKey={(d) => d.id}
+        loading={loading}
+        emptyState={
+          <EmptyState
+            icon={<BookOpen className="h-5 w-5" />}
+            title={filterExamId ? "No documents for this exam" : "No documents yet"}
+            description={filterExamId ? undefined : "Upload one from the Upload tab."}
+            className="border-0"
+          />
+        }
+      />
 
       {(chunks !== null || chunksLoading) && (
-        <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-100">
+        <div className="rounded-lg border border-gray-200 bg-white p-5">
           <div className="mb-4 flex items-center justify-between">
-            <h3 className="font-semibold text-gray-800">
-              Chunks — {chunksDocName}
-            </h3>
-            <button onClick={() => setChunks(null)} className="text-sm text-gray-400 hover:text-gray-600">
+            <h3 className="text-sm font-semibold text-gray-900">Chunks — {chunksDocName}</h3>
+            <Button variant="ghost" size="sm" onClick={() => setChunks(null)}>
               Close
-            </button>
+            </Button>
           </div>
 
           {chunksLoading ? (
@@ -421,9 +402,9 @@ function ProcessedTab() {
           ) : chunks && chunks.length === 0 ? (
             <p className="text-sm text-gray-400">No chunks yet (document may still be processing).</p>
           ) : (
-            <div className="space-y-3 max-h-96 overflow-y-auto">
+            <div className="max-h-96 space-y-3 overflow-y-auto scrollbar-thin">
               {chunks?.map((chunk) => (
-                <div key={chunk.id} className="rounded-lg bg-gray-50 p-3">
+                <div key={chunk.id} className="rounded-md bg-gray-50 p-3">
                   <div className="mb-2 flex flex-wrap gap-2 text-xs">
                     <Tag label="Type" value={chunk.content_type} />
                     <Tag label="Chapter" value={chunk.chapter} />
@@ -431,143 +412,125 @@ function ProcessedTab() {
                     {chunk.subtopic && <Tag label="Subtopic" value={chunk.subtopic} />}
                     <Tag label="Language" value={chunk.language} />
                   </div>
-                  <p className="text-xs text-gray-700 leading-relaxed line-clamp-4">{chunk.content}</p>
-                  {chunk.pinecone_vector_id && (
-                    <p className="mt-1 text-xs text-gray-400 font-mono truncate">vec: {chunk.pinecone_vector_id}</p>
-                  )}
+                  <p className="line-clamp-4 text-xs leading-relaxed text-gray-700">{chunk.content}</p>
+                  {chunk.pinecone_vector_id && <p className="mt-1 truncate font-mono text-xs text-gray-400">vec: {chunk.pinecone_vector_id}</p>}
                 </div>
               ))}
             </div>
           )}
         </div>
       )}
-      </>
-      )}
+
+      <ConfirmDialog
+        open={!!confirmDel}
+        title="Delete document"
+        description="Delete this document and all its chunks from Pinecone? This cannot be undone."
+        confirmLabel="Delete"
+        tone="danger"
+        onConfirm={doDelete}
+        onClose={() => setConfirmDel(null)}
+      />
     </div>
   );
 }
 
 // ── Processing Logs Tab ──────────────────────────────────────────────────────
 
+interface JobRow {
+  id: string;
+  job_type: string;
+  status: string;
+  progress_percent: number;
+  current_step: string | null;
+  error_message: string | null;
+  created_at: string;
+}
+
 function LogsTab() {
-  const [jobs, setJobs] = useState<Array<{
-    id: string; job_type: string; status: string;
-    progress_percent: number; current_step: string | null;
-    error_message: string | null; created_at: string;
-  }>>([]);
+  const toast = useToast();
+  const [jobs, setJobs] = useState<JobRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [confirmDel, setConfirmDel] = useState<string | null>(null);
 
   const load = () => {
     import("../../services/api").then(({ default: api }) => {
-      api.get("/api/admin/jobs/knowledge")
+      api
+        .get("/api/admin/jobs/knowledge")
         .then((r) => setJobs(r.data))
         .catch(() => {})
         .finally(() => setLoading(false));
     });
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+  }, []);
 
-  const handleDelete = async (id: string) => {
-    if (!confirm(
-      "Delete this job? Use this only for a job you believe is stuck. The worker task " +
-      "is cancelled and the job removed; if content was mid-processing it will be marked " +
-      "failed so you can retry it. No finished content is lost."
-    )) return;
+  const doDelete = async () => {
+    if (!confirmDel) return;
+    const id = confirmDel;
+    setConfirmDel(null);
     setDeletingId(id);
     try {
       const { default: api } = await import("../../services/api");
       await api.delete(`/api/admin/jobs/${id}`);
       load();
     } catch {
-      alert("Could not delete the job. Please try again.");
+      toast.error("Could not delete the job. Please try again.");
     } finally {
       setDeletingId(null);
     }
   };
 
-  if (loading) return <p className="text-sm text-gray-400">Loading…</p>;
+  const columns: Column<JobRow>[] = [
+    { key: "job_type", header: "Type", accessor: (j) => j.job_type, render: (j) => <span className="text-gray-700">{j.job_type}</span> },
+    { key: "status", header: "Status", render: (j) => <StatusBadge status={j.status} /> },
+    { key: "progress", header: "Progress", align: "right", render: (j) => <span className="tabular-nums text-gray-700">{j.progress_percent}%</span> },
+    { key: "step", header: "Step", render: (j) => <span className="block max-w-xs truncate text-gray-500">{j.current_step ?? "—"}</span> },
+    { key: "created", header: "Created", render: (j) => <span className="tabular-nums text-gray-400">{new Date(j.created_at).toLocaleString()}</span> },
+    {
+      key: "actions",
+      header: "",
+      align: "right",
+      width: "6rem",
+      render: (j) => (
+        <Button variant="ghost" size="xs" className="text-danger-600 hover:bg-danger-50" disabled={deletingId === j.id} onClick={() => setConfirmDel(j.id)}>
+          {deletingId === j.id ? "Deleting…" : "Delete"}
+        </Button>
+      ),
+    },
+  ];
 
-  if (jobs.length === 0)
-    return (
-      <div className="rounded-xl bg-white p-8 text-center shadow-sm ring-1 ring-gray-100">
-        <p className="text-sm text-gray-400">No processing jobs yet.</p>
-      </div>
-    );
+  if (loading) return <PageLoader />;
 
   return (
-    <div className="overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-gray-100">
-      <table className="w-full text-sm">
-        <thead className="border-b border-gray-100 bg-gray-50 text-xs uppercase text-gray-500">
-          <tr>
-            <th className="px-4 py-3 text-left">Type</th>
-            <th className="px-4 py-3 text-left">Status</th>
-            <th className="px-4 py-3 text-left">Progress</th>
-            <th className="px-4 py-3 text-left">Step</th>
-            <th className="px-4 py-3 text-left">Created</th>
-            <th className="px-4 py-3 text-right">Actions</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-gray-50">
-          {jobs.map((job) => (
-            <tr key={job.id} className="hover:bg-gray-50">
-              <td className="px-4 py-3 text-gray-700">{job.job_type}</td>
-              <td className="px-4 py-3">
-                <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_COLORS[job.status] ?? STATUS_COLORS.pending}`}>
-                  {job.status}
-                </span>
-              </td>
-              <td className="px-4 py-3 text-gray-700">{job.progress_percent}%</td>
-              <td className="px-4 py-3 text-gray-500 max-w-xs truncate">{job.current_step ?? "—"}</td>
-              <td className="px-4 py-3 text-gray-400">{new Date(job.created_at).toLocaleString()}</td>
-              <td className="px-4 py-3 text-right">
-                <button
-                  onClick={() => handleDelete(job.id)}
-                  disabled={deletingId === job.id}
-                  className="rounded-lg px-2 py-1 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50"
-                >
-                  {deletingId === job.id ? "Deleting…" : "Delete"}
-                </button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <>
+      <DataTable
+        columns={columns}
+        rows={jobs}
+        rowKey={(j) => j.id}
+        emptyState={<EmptyState title="No processing jobs yet" className="border-0" />}
+      />
+      <ConfirmDialog
+        open={!!confirmDel}
+        title="Delete job"
+        description="Delete this job? Use this only for a job you believe is stuck. The worker task is cancelled and the job removed; if content was mid-processing it will be marked failed so you can retry it. No finished content is lost."
+        confirmLabel="Delete"
+        tone="danger"
+        onConfirm={doDelete}
+        onClose={() => setConfirmDel(null)}
+      />
+    </>
   );
 }
 
 // ── Shared primitives ────────────────────────────────────────────────────────
 
-function Label({ children }: { children: React.ReactNode }) {
-  return <label className="mb-1 block text-sm font-medium text-gray-700">{children}</label>;
-}
-
-function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
-  return (
-    <input
-      {...props}
-      className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none"
-    />
-  );
-}
-
-function Select({ children, ...props }: React.SelectHTMLAttributes<HTMLSelectElement>) {
-  return (
-    <select
-      {...props}
-      className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none"
-    >
-      {children}
-    </select>
-  );
-}
-
 function Tag({ label, value }: { label: string; value: string | null | undefined }) {
   if (!value) return null;
   return (
-    <span className="rounded bg-white px-1.5 py-0.5 ring-1 ring-gray-200">
+    <span className="rounded border border-gray-200 bg-white px-1.5 py-0.5">
       <span className="text-gray-400">{label}: </span>
       <span className="text-gray-700">{value}</span>
     </span>

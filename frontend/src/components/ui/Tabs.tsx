@@ -48,7 +48,7 @@ export function Tabs({
             {active && (
               <motion.div
                 layoutId="tab-underline"
-                className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-brand-500"
+                className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-brand-600"
               />
             )}
           </button>

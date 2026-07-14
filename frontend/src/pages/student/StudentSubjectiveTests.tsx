@@ -7,6 +7,7 @@ import { JobStatusPoller } from "../../components/JobStatusPoller";
 import type { JobState } from "../../components/JobStatusPoller";
 import { subjectiveTestsService } from "../../services/subjectiveTests";
 import type { AnswerResult, FeedbackChatMessage, StudentTestListItem } from "../../services/subjectiveTests";
+import { useStudentExam } from "../../context/StudentExamContext";
 import { getErrorMessage } from "../../utils/error";
 import { PageHeader, Card, Button, Badge, StatusBadge, EmptyState, Skeleton, Alert } from "../../components/ui";
 import { RichText } from "../../components/content/RichText";
@@ -15,6 +16,7 @@ import { SectionBreakdown } from "../../components/content/LearningContent";
 type View = "list" | "detail" | "result";
 
 export function StudentSubjectiveTests() {
+  const { selectedExamId } = useStudentExam();
   const [view, setView] = useState<View>("list");
   const [tests, setTests] = useState<StudentTestListItem[]>([]);
   const [activeTestId, setActiveTestId] = useState<string | null>(null);
@@ -24,13 +26,13 @@ export function StudentSubjectiveTests() {
   const loadTests = useCallback(async () => {
     setLoading(true);
     try {
-      setTests(await subjectiveTestsService.listStudentTests());
+      setTests(await subjectiveTestsService.listStudentTests(selectedExamId));
     } catch (err) {
       setError(getErrorMessage(err, "Failed to load tests."));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [selectedExamId]);
 
   useEffect(() => { if (view === "list") void loadTests(); }, [view, loadTests]);
 
@@ -277,10 +279,10 @@ function ResultView({ testId, onBack }: { testId: string; onBack: () => void }) 
       : null;
   const tone = pct == null ? "brand" : pct >= 60 ? "success" : pct >= 40 ? "warning" : "danger";
   const toneGrad: Record<string, string> = {
-    success: "from-success-500 to-success-700",
-    warning: "from-warning-500 to-warning-600",
-    danger: "from-danger-500 to-danger-700",
-    brand: "from-brand-500 to-brand-700",
+    success: "bg-success-600",
+    warning: "bg-warning-600",
+    danger: "bg-danger-600",
+    brand: "bg-brand-600",
   };
 
   return (
@@ -317,7 +319,7 @@ function ResultView({ testId, onBack }: { testId: string; onBack: () => void }) 
               तपाईंको नतिजा तयार छ। जाँचिएको PDF (रातो कलमको टिप्पणीसहित) तयार हुँदैछ…
             </Alert>
           )}
-          <div className={`my-4 overflow-hidden rounded-2xl bg-gradient-to-br ${toneGrad[tone]} p-6 text-center text-white shadow-card`}>
+          <div className={`my-4 overflow-hidden rounded-lg ${toneGrad[tone]} p-6 text-center text-white`}>
             <p className="text-sm font-medium text-white/80">Total Marks</p>
             <p className="mt-1 text-4xl font-bold tracking-tight">
               {result.total_marks_awarded}
@@ -329,7 +331,7 @@ function ResultView({ testId, onBack }: { testId: string; onBack: () => void }) 
                 href={result.checked_pdf_url}
                 target="_blank"
                 rel="noreferrer"
-                className="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-white/20 px-4 py-2 text-sm font-semibold text-white backdrop-blur-sm transition-colors hover:bg-white/30"
+                className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-white/20 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-white/30"
               >
                 <ExternalLink className="h-4 w-4" /> View Checked PDF
               </a>
@@ -474,9 +476,9 @@ function FeedbackChat({ sheetId }: { sheetId: string }) {
     return (
       <button
         onClick={handleOpen}
-        className="mt-4 flex w-full items-center gap-3 rounded-2xl bg-gradient-to-br from-brand-50 to-white p-4 text-left shadow-sm ring-1 ring-brand-100 transition-colors hover:from-brand-100"
+        className="mt-4 flex w-full items-center gap-3 rounded-lg border border-gray-200 bg-white p-4 text-left transition-colors hover:bg-gray-50"
       >
-        <span className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-glow">
+        <span className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-brand-50 text-brand-600">
           <MessageCircleQuestion className="h-5 w-5" />
         </span>
         <span className="min-w-0">

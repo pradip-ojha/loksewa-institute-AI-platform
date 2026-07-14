@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { HelpCircle, ArrowLeft, Check } from "lucide-react";
 import { JobStatusPoller } from "../../components/JobStatusPoller";
 import type { JobState } from "../../components/JobStatusPoller";
 import { mcqService } from "../../services/mcq";
@@ -7,20 +8,38 @@ import { syllabusService } from "../../services/syllabus";
 import type { ChapterNode } from "../../services/syllabus";
 import { getErrorMessage } from "../../utils/error";
 import { useExam } from "../../context/ExamContext";
+import {
+  PageHeader,
+  Tabs,
+  Button,
+  Alert,
+  FormField,
+  TextInput,
+  Textarea,
+  Select,
+  Badge,
+  StatusBadge,
+  ConfirmDialog,
+  EmptyState,
+  Pagination,
+  PageLoader,
+} from "../../components/ui";
 
-type Tab = "upload" | "generate" | "batches" | "review" | "bank" | "manual";
+type Tab = "upload" | "generate" | "batches" | "bank" | "manual";
 
-const COMPLEXITY_BADGE: Record<string, string> = {
-  easy: "bg-green-100 text-green-700",
-  medium: "bg-yellow-100 text-yellow-700",
-  hard: "bg-red-100 text-red-700",
+const COMPLEXITY_TONE: Record<string, "success" | "warning" | "danger" | "neutral"> = {
+  easy: "success",
+  medium: "warning",
+  hard: "danger",
 };
-const STATUS_BADGE: Record<string, string> = {
-  draft: "bg-gray-100 text-gray-600",
-  approved: "bg-green-100 text-green-700",
-  rejected: "bg-red-100 text-red-700",
-  archived: "bg-gray-200 text-gray-500",
-};
+
+function ComplexityBadge({ value }: { value: string }) {
+  return (
+    <Badge tone={COMPLEXITY_TONE[value] ?? "neutral"} className="capitalize">
+      {value}
+    </Badge>
+  );
+}
 
 // ── Upload Existing MCQ Tab ───────────────────────────────────────────────────
 
@@ -31,30 +50,20 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  // Chapter is the primary scope: topics are shown only for the chosen chapter.
-  const chapterTopics = useMemo(
-    () => chapters.find(c => c.chapter === form.chapter)?.topics ?? [],
-    [form.chapter, chapters]
-  );
-  const availableSubtopics = useMemo(
-    () => chapterTopics.find(t => t.topic === form.topic)?.subtopics ?? [],
-    [form.topic, chapterTopics]
-  );
+  const chapterTopics = useMemo(() => chapters.find((c) => c.chapter === form.chapter)?.topics ?? [], [form.chapter, chapters]);
+  const availableSubtopics = useMemo(() => chapterTopics.find((t) => t.topic === form.topic)?.subtopics ?? [], [form.topic, chapterTopics]);
 
-  function handleChapterChange(value: string) {
-    setForm(p => ({ ...p, chapter: value, topic: "", subtopic: "" }));
-  }
-  function handleTopicChange(value: string) {
-    setForm(p => ({ ...p, topic: value, subtopic: "" }));
-  }
+  const handleChapterChange = (value: string) => setForm((p) => ({ ...p, chapter: value, topic: "", subtopic: "" }));
+  const handleTopicChange = (value: string) => setForm((p) => ({ ...p, topic: value, subtopic: "" }));
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!file) { setError("Please select a file."); return; }
-    if (!selectedExamId) { setError("Select an exam in the top bar first."); return; }
-    if (!form.display_name.trim()) { setError("Document name is required."); return; }
-    if (!form.chapter) { setError("Chapter is required."); return; }
-    setLoading(true); setError("");
+    if (!file) return setError("Please select a file.");
+    if (!selectedExamId) return setError("Select an exam in the top bar first.");
+    if (!form.display_name.trim()) return setError("Document name is required.");
+    if (!form.chapter) return setError("Chapter is required.");
+    setLoading(true);
+    setError("");
     try {
       const fd = new FormData();
       fd.append("file", file);
@@ -75,78 +84,51 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
 
   return (
     <form onSubmit={handleSubmit} className="max-w-xl space-y-4">
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">Document Display Name *</label>
-        <input className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.display_name} onChange={e => setForm(p => ({ ...p, display_name: e.target.value }))} placeholder="e.g. Banking MCQ Set 2024" />
-      </div>
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">PDF or Word File *</label>
-        <input aria-label="PDF or Word File" type="file" accept=".pdf,.doc,.docx" className="w-full text-sm" onChange={e => setFile(e.target.files?.[0] || null)} />
-      </div>
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">Chapter *</label>
-        <select
-          aria-label="Chapter"
-          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
-          value={form.chapter}
-          onChange={e => handleChapterChange(e.target.value)}
-        >
+      <FormField label="Document Display Name" required>
+        <TextInput value={form.display_name} onChange={(e) => setForm((p) => ({ ...p, display_name: e.target.value }))} placeholder="e.g. Banking MCQ Set 2024" />
+      </FormField>
+      <FormField label="PDF or Word File" required>
+        <input aria-label="PDF or Word File" type="file" accept=".pdf,.doc,.docx" className="w-full text-sm" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+      </FormField>
+      <FormField label="Chapter" required>
+        <Select value={form.chapter} onChange={(e) => handleChapterChange(e.target.value)}>
           <option value="">— Select chapter —</option>
-          {chapters.map(c => (
-            <option key={c.chapter} value={c.chapter}>{c.chapter}</option>
+          {chapters.map((c) => (
+            <option key={c.chapter} value={c.chapter}>
+              {c.chapter}
+            </option>
           ))}
-        </select>
-      </div>
+        </Select>
+      </FormField>
       <div className="grid grid-cols-2 gap-3">
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Topic (optional)</label>
-          {chapterTopics.length > 0 ? (
-            <select
-              aria-label="Topic"
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
-              value={form.topic}
-              onChange={e => handleTopicChange(e.target.value)}
-            >
-              <option value="">— Auto-detect —</option>
-              {chapterTopics.map(t => (
-                <option key={t.topic} value={t.topic}>{t.topic}</option>
-              ))}
-            </select>
-          ) : (
-            <select aria-label="Topic" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white" disabled>
-              <option value="">{form.chapter ? "No topics" : "Select chapter first"}</option>
-            </select>
-          )}
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Subtopic (optional)</label>
-          {availableSubtopics.length > 0 ? (
-            <select
-              aria-label="Subtopic"
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
-              value={form.subtopic}
-              onChange={e => setForm(p => ({ ...p, subtopic: e.target.value }))}
-            >
-              <option value="">— Auto-detect —</option>
-              {availableSubtopics.map(s => (
-                <option key={s.id} value={s.subtopic}>{s.subtopic}</option>
-              ))}
-            </select>
-          ) : (
-            <select aria-label="Subtopic" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white" disabled>
-              <option value="">{form.topic ? "No subtopics" : "Select topic first"}</option>
-            </select>
-          )}
-        </div>
+        <FormField label="Topic (optional)">
+          <Select value={form.topic} onChange={(e) => handleTopicChange(e.target.value)} disabled={chapterTopics.length === 0}>
+            <option value="">{chapterTopics.length > 0 ? "— Auto-detect —" : form.chapter ? "No topics" : "Select chapter first"}</option>
+            {chapterTopics.map((t) => (
+              <option key={t.topic} value={t.topic}>
+                {t.topic}
+              </option>
+            ))}
+          </Select>
+        </FormField>
+        <FormField label="Subtopic (optional)">
+          <Select value={form.subtopic} onChange={(e) => setForm((p) => ({ ...p, subtopic: e.target.value }))} disabled={availableSubtopics.length === 0}>
+            <option value="">{availableSubtopics.length > 0 ? "— Auto-detect —" : form.topic ? "No subtopics" : "Select topic first"}</option>
+            {availableSubtopics.map((s) => (
+              <option key={s.id} value={s.subtopic}>
+                {s.subtopic}
+              </option>
+            ))}
+          </Select>
+        </FormField>
       </div>
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">Custom Extraction Instruction (optional)</label>
-        <textarea aria-label="Custom Extraction Instruction" rows={3} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.custom_instruction} onChange={e => setForm(p => ({ ...p, custom_instruction: e.target.value }))} placeholder="e.g. Focus on questions about monetary policy" />
-      </div>
-      {error && <p className="text-sm text-red-600">{error}</p>}
-      <button type="submit" disabled={loading} className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white hover:bg-brand-700 disabled:opacity-50">
-        {loading ? "Uploading…" : "Extract MCQs"}
-      </button>
+      <FormField label="Custom Extraction Instruction (optional)">
+        <Textarea rows={3} value={form.custom_instruction} onChange={(e) => setForm((p) => ({ ...p, custom_instruction: e.target.value }))} placeholder="e.g. Focus on questions about monetary policy" />
+      </FormField>
+      {error && <Alert>{error}</Alert>}
+      <Button type="submit" loading={loading}>
+        Extract MCQs
+      </Button>
     </form>
   );
 }
@@ -160,30 +142,20 @@ function GenerateTab({ onJobStart, chapters }: { onJobStart: (jobId: string, mod
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  // Chapter is the primary scope: topics are shown only for the chosen chapter.
-  const chapterTopics = useMemo(
-    () => chapters.find(c => c.chapter === form.chapter)?.topics ?? [],
-    [form.chapter, chapters]
-  );
-  const availableSubtopics = useMemo(
-    () => chapterTopics.find(t => t.topic === form.topic)?.subtopics ?? [],
-    [form.topic, chapterTopics]
-  );
+  const chapterTopics = useMemo(() => chapters.find((c) => c.chapter === form.chapter)?.topics ?? [], [form.chapter, chapters]);
+  const availableSubtopics = useMemo(() => chapterTopics.find((t) => t.topic === form.topic)?.subtopics ?? [], [form.topic, chapterTopics]);
 
-  function handleChapterChange(value: string) {
-    setForm(p => ({ ...p, chapter: value, topic: "", subtopic: "" }));
-  }
-  function handleTopicChange(value: string) {
-    setForm(p => ({ ...p, topic: value, subtopic: "" }));
-  }
+  const handleChapterChange = (value: string) => setForm((p) => ({ ...p, chapter: value, topic: "", subtopic: "" }));
+  const handleTopicChange = (value: string) => setForm((p) => ({ ...p, topic: value, subtopic: "" }));
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!file) { setError("Please select a file."); return; }
-    if (!selectedExamId) { setError("Select an exam in the top bar first."); return; }
-    if (!form.display_name.trim()) { setError("Document name is required."); return; }
-    if (!form.chapter) { setError("Chapter is required."); return; }
-    setLoading(true); setError("");
+    if (!file) return setError("Please select a file.");
+    if (!selectedExamId) return setError("Select an exam in the top bar first.");
+    if (!form.display_name.trim()) return setError("Document name is required.");
+    if (!form.chapter) return setError("Chapter is required.");
+    setLoading(true);
+    setError("");
     try {
       const fd = new FormData();
       fd.append("file", file);
@@ -205,97 +177,61 @@ function GenerateTab({ onJobStart, chapters }: { onJobStart: (jobId: string, mod
 
   return (
     <form onSubmit={handleSubmit} className="max-w-xl space-y-4">
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">Content Display Name *</label>
-        <input className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.display_name} onChange={e => setForm(p => ({ ...p, display_name: e.target.value }))} placeholder="e.g. Banking Notes Chapter 3" />
-      </div>
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">Content File (PDF or Word) *</label>
-        <input aria-label="Content File" type="file" accept=".pdf,.doc,.docx" className="w-full text-sm" onChange={e => setFile(e.target.files?.[0] || null)} />
-      </div>
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">Number of MCQs to Generate</label>
-        <input aria-label="Number of MCQs to Generate" type="number" min={1} max={100} className="w-32 rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.count} onChange={e => setForm(p => ({ ...p, count: e.target.value }))} />
-      </div>
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">Chapter *</label>
-        <select
-          aria-label="Chapter"
-          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
-          value={form.chapter}
-          onChange={e => handleChapterChange(e.target.value)}
-        >
+      <FormField label="Content Display Name" required>
+        <TextInput value={form.display_name} onChange={(e) => setForm((p) => ({ ...p, display_name: e.target.value }))} placeholder="e.g. Banking Notes Chapter 3" />
+      </FormField>
+      <FormField label="Content File (PDF or Word)" required>
+        <input aria-label="Content File" type="file" accept=".pdf,.doc,.docx" className="w-full text-sm" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+      </FormField>
+      <FormField label="Number of MCQs to Generate">
+        <TextInput type="number" min={1} max={100} className="w-32" value={form.count} onChange={(e) => setForm((p) => ({ ...p, count: e.target.value }))} />
+      </FormField>
+      <FormField label="Chapter" required>
+        <Select value={form.chapter} onChange={(e) => handleChapterChange(e.target.value)}>
           <option value="">— Select chapter —</option>
-          {chapters.map(c => (
-            <option key={c.chapter} value={c.chapter}>{c.chapter}</option>
+          {chapters.map((c) => (
+            <option key={c.chapter} value={c.chapter}>
+              {c.chapter}
+            </option>
           ))}
-        </select>
-      </div>
+        </Select>
+      </FormField>
       <div className="grid grid-cols-2 gap-3">
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Topic (optional)</label>
-          {chapterTopics.length > 0 ? (
-            <select
-              aria-label="Topic"
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
-              value={form.topic}
-              onChange={e => handleTopicChange(e.target.value)}
-            >
-              <option value="">— Auto-detect —</option>
-              {chapterTopics.map(t => (
-                <option key={t.topic} value={t.topic}>{t.topic}</option>
-              ))}
-            </select>
-          ) : (
-            <select aria-label="Topic" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white" disabled>
-              <option value="">{form.chapter ? "No topics" : "Select chapter first"}</option>
-            </select>
-          )}
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Subtopic (optional)</label>
-          {availableSubtopics.length > 0 ? (
-            <select
-              aria-label="Subtopic"
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
-              value={form.subtopic}
-              onChange={e => setForm(p => ({ ...p, subtopic: e.target.value }))}
-            >
-              <option value="">— Auto-detect —</option>
-              {availableSubtopics.map(s => (
-                <option key={s.id} value={s.subtopic}>{s.subtopic}</option>
-              ))}
-            </select>
-          ) : (
-            <select aria-label="Subtopic" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white" disabled>
-              <option value="">{form.topic ? "No subtopics" : "Select topic first"}</option>
-            </select>
-          )}
-        </div>
+        <FormField label="Topic (optional)">
+          <Select value={form.topic} onChange={(e) => handleTopicChange(e.target.value)} disabled={chapterTopics.length === 0}>
+            <option value="">{chapterTopics.length > 0 ? "— Auto-detect —" : form.chapter ? "No topics" : "Select chapter first"}</option>
+            {chapterTopics.map((t) => (
+              <option key={t.topic} value={t.topic}>
+                {t.topic}
+              </option>
+            ))}
+          </Select>
+        </FormField>
+        <FormField label="Subtopic (optional)">
+          <Select value={form.subtopic} onChange={(e) => setForm((p) => ({ ...p, subtopic: e.target.value }))} disabled={availableSubtopics.length === 0}>
+            <option value="">{availableSubtopics.length > 0 ? "— Auto-detect —" : form.topic ? "No subtopics" : "Select topic first"}</option>
+            {availableSubtopics.map((s) => (
+              <option key={s.id} value={s.subtopic}>
+                {s.subtopic}
+              </option>
+            ))}
+          </Select>
+        </FormField>
       </div>
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">Custom Instruction (optional)</label>
-        <textarea aria-label="Custom Instruction" rows={3} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.custom_instruction} onChange={e => setForm(p => ({ ...p, custom_instruction: e.target.value }))} />
-      </div>
-      {error && <p className="text-sm text-red-600">{error}</p>}
-      <button type="submit" disabled={loading} className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white hover:bg-brand-700 disabled:opacity-50">
-        {loading ? "Submitting…" : "Generate MCQs"}
-      </button>
+      <FormField label="Custom Instruction (optional)">
+        <Textarea rows={3} value={form.custom_instruction} onChange={(e) => setForm((p) => ({ ...p, custom_instruction: e.target.value }))} />
+      </FormField>
+      {error && <Alert>{error}</Alert>}
+      <Button type="submit" loading={loading}>
+        Generate MCQs
+      </Button>
     </form>
   );
 }
 
 // ── Question Card ─────────────────────────────────────────────────────────────
 
-function QuestionCard({
-  question,
-  batchId,
-  onUpdate,
-}: {
-  question: MCQQuestion;
-  batchId: string;
-  onUpdate: (q: MCQQuestion) => void;
-}) {
+function QuestionCard({ question, batchId, onUpdate }: { question: MCQQuestion; batchId: string; onUpdate: (q: MCQQuestion) => void }) {
   const [rejectFeedback, setRejectFeedback] = useState("");
   const [showReject, setShowReject] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -303,71 +239,87 @@ function QuestionCard({
   async function accept() {
     setLoading(true);
     try {
-      const updated = await mcqService.acceptQuestion(batchId, question.id);
-      onUpdate(updated);
-    } finally { setLoading(false); }
+      onUpdate(await mcqService.acceptQuestion(batchId, question.id));
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function reject() {
     if (!rejectFeedback.trim()) return;
     setLoading(true);
     try {
-      const updated = await mcqService.rejectQuestion(batchId, question.id, rejectFeedback);
-      onUpdate(updated);
+      onUpdate(await mcqService.rejectQuestion(batchId, question.id, rejectFeedback));
       setShowReject(false);
       setRejectFeedback("");
-    } finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+    }
   }
 
+  const borderTone =
+    question.status === "approved" ? "border-success-200" : question.status === "rejected" ? "border-danger-200" : "border-gray-200";
+
   return (
-    <div className={`rounded-xl bg-white p-5 shadow-sm ring-1 ${question.status === "approved" ? "ring-green-200" : question.status === "rejected" ? "ring-red-200" : "ring-gray-100"}`}>
+    <div className={`rounded-lg border bg-white p-5 ${borderTone}`}>
       <div className="mb-3 flex items-start justify-between gap-2">
         {question.question_text ? (
-          <p className="text-sm font-medium text-gray-900 leading-relaxed flex-1">{question.question_text}</p>
+          <p className="flex-1 text-sm font-medium leading-relaxed text-gray-900">{question.question_text}</p>
         ) : (
-          <p className="text-sm italic text-red-400 flex-1">[Question text missing — regenerate this batch]</p>
+          <p className="flex-1 text-sm italic text-danger-500">[Question text missing — regenerate this batch]</p>
         )}
-        <div className="flex gap-1 shrink-0">
-          <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${COMPLEXITY_BADGE[question.complexity] || "bg-gray-100 text-gray-600"}`}>{question.complexity}</span>
-          <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_BADGE[question.status] || "bg-gray-100 text-gray-600"}`}>{question.status}</span>
+        <div className="flex shrink-0 gap-1">
+          <ComplexityBadge value={question.complexity} />
+          <StatusBadge status={question.status} />
         </div>
       </div>
 
       <div className="mb-3 grid grid-cols-2 gap-2">
-        {question.options.map(opt => (
-          <div key={opt.id} className={`rounded-lg border px-3 py-2 text-sm ${question.correct_option_ids.includes(opt.id) ? "border-green-300 bg-green-50" : "border-gray-200"}`}>
+        {question.options.map((opt) => (
+          <div
+            key={opt.id}
+            className={`rounded-md border px-3 py-2 text-sm ${question.correct_option_ids.includes(opt.id) ? "border-success-300 bg-success-50" : "border-gray-200"}`}
+          >
             <span className="font-medium">{opt.label}.</span> {opt.text}
           </div>
         ))}
       </div>
 
       {question.explanation && (
-        <div className="mb-3 rounded-lg bg-blue-50 px-3 py-2 text-xs text-blue-700">
-          <span className="font-medium">Explanation: </span>{question.explanation}
+        <div className="mb-3 rounded-md bg-info-50 px-3 py-2 text-xs text-info-700">
+          <span className="font-medium">Explanation: </span>
+          {question.explanation}
         </div>
       )}
 
-      {question.topic && <p className="text-xs text-gray-400 mb-2">Topic: {question.topic}{question.subtopic ? ` › ${question.subtopic}` : ""}</p>}
+      {question.topic && (
+        <p className="mb-2 text-xs text-gray-400">
+          Topic: {question.topic}
+          {question.subtopic ? ` › ${question.subtopic}` : ""}
+        </p>
+      )}
 
       {question.status === "draft" && (
-        <div className="flex gap-2 flex-wrap">
-          <button onClick={accept} disabled={loading} className="rounded-lg bg-green-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-green-700 disabled:opacity-50">Accept</button>
-          <button onClick={() => setShowReject(!showReject)} className="rounded-lg border border-red-300 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50">Reject</button>
+        <div className="flex flex-wrap gap-2">
+          <Button size="xs" onClick={accept} loading={loading} icon={<Check className="h-3.5 w-3.5" />}>
+            Accept
+          </Button>
+          <Button size="xs" variant="secondary" className="text-danger-600" onClick={() => setShowReject(!showReject)}>
+            Reject
+          </Button>
         </div>
       )}
 
       {showReject && (
         <div className="mt-3 space-y-2">
-          <textarea
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
-            rows={2}
-            placeholder="Explain why this question is rejected..."
-            value={rejectFeedback}
-            onChange={e => setRejectFeedback(e.target.value)}
-          />
+          <Textarea rows={2} placeholder="Explain why this question is rejected..." value={rejectFeedback} onChange={(e) => setRejectFeedback(e.target.value)} />
           <div className="flex gap-2">
-            <button onClick={reject} disabled={loading || !rejectFeedback.trim()} className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50">Confirm Reject</button>
-            <button onClick={() => setShowReject(false)} className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-50">Cancel</button>
+            <Button size="xs" variant="danger" onClick={reject} disabled={loading || !rejectFeedback.trim()}>
+              Confirm Reject
+            </Button>
+            <Button size="xs" variant="ghost" onClick={() => setShowReject(false)}>
+              Cancel
+            </Button>
           </div>
         </div>
       )}
@@ -388,19 +340,20 @@ function BatchReview({ batchId, onBack }: { batchId: string; onBack: () => void 
   async function load() {
     setLoading(true);
     try {
-      const b = await mcqService.getBatch(batchId);
-      setBatch(b);
+      setBatch(await mcqService.getBatch(batchId));
     } catch {
-      // Batch was deleted or is unreachable — fall back to the "not found"
-      // state instead of leaving a stale batch or an unhandled rejection.
       setBatch(null);
-    } finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+    }
   }
 
-  useEffect(() => { load(); }, [batchId]);
+  useEffect(() => {
+    load(); // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [batchId]);
 
   function handleQuestionUpdate(updated: MCQQuestion) {
-    setBatch(prev => prev ? { ...prev, questions: prev.questions.map(q => q.id === updated.id ? updated : q) } : prev);
+    setBatch((prev) => (prev ? { ...prev, questions: prev.questions.map((q) => (q.id === updated.id ? updated : q)) } : prev));
   }
 
   async function handleAcceptAll() {
@@ -411,7 +364,8 @@ function BatchReview({ batchId, onBack }: { batchId: string; onBack: () => void 
   async function handleRejectAll() {
     if (!bulkFeedback.trim()) return;
     await mcqService.rejectAll(batchId, bulkFeedback);
-    setBulkFeedback(""); setShowBulkReject(false);
+    setBulkFeedback("");
+    setShowBulkReject(false);
     load();
   }
 
@@ -422,58 +376,80 @@ function BatchReview({ batchId, onBack }: { batchId: string; onBack: () => void 
     setRegenFeedback("");
   }
 
-  if (loading) return <div className="p-6 text-sm text-gray-500">Loading batch…</div>;
-  if (!batch) return <div className="p-6 text-sm text-red-500">Batch not found.</div>;
+  if (loading) return <PageLoader label="Loading batch…" />;
+  if (!batch) return <Alert className="m-2">Batch not found.</Alert>;
 
-  const rejected = batch.questions.filter(q => q.status === "rejected");
-  const approved = batch.questions.filter(q => q.status === "approved");
-  const draft = batch.questions.filter(q => q.status === "draft");
+  const rejected = batch.questions.filter((q) => q.status === "rejected");
+  const approved = batch.questions.filter((q) => q.status === "approved");
+  const draft = batch.questions.filter((q) => q.status === "draft");
 
   return (
     <div>
       <div className="mb-4 flex items-center gap-3">
-        <button onClick={onBack} className="text-sm text-brand-600 hover:underline">← Back to batches</button>
-        <span className="text-xs text-gray-400">{batch.batch_type} · {batch.total_questions} questions</span>
-        <div className="ml-auto flex gap-2 flex-wrap">
-          <span className="text-xs text-green-600">{approved.length} accepted</span>
-          <span className="text-xs text-red-600">{rejected.length} rejected</span>
+        <Button variant="ghost" size="sm" icon={<ArrowLeft className="h-4 w-4" />} onClick={onBack}>
+          Back to batches
+        </Button>
+        <span className="text-xs text-gray-400">
+          {batch.batch_type} · {batch.total_questions} questions
+        </span>
+        <div className="ml-auto flex flex-wrap gap-2 tabular-nums">
+          <span className="text-xs text-success-600">{approved.length} accepted</span>
+          <span className="text-xs text-danger-600">{rejected.length} rejected</span>
           <span className="text-xs text-gray-500">{draft.length} pending</span>
         </div>
       </div>
 
       {draft.length > 0 && (
-        <div className="mb-4 flex gap-2 flex-wrap">
-          <button onClick={handleAcceptAll} className="rounded-lg bg-green-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-green-700">Accept All Pending</button>
-          <button onClick={() => setShowBulkReject(!showBulkReject)} className="rounded-lg border border-red-300 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50">Reject All Pending</button>
+        <div className="mb-4 flex flex-wrap gap-2">
+          <Button size="sm" onClick={handleAcceptAll}>
+            Accept All Pending
+          </Button>
+          <Button size="sm" variant="secondary" className="text-danger-600" onClick={() => setShowBulkReject(!showBulkReject)}>
+            Reject All Pending
+          </Button>
         </div>
       )}
 
       {showBulkReject && (
         <div className="mb-4 space-y-2">
-          <textarea className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" rows={2} placeholder="Reason for rejecting all..." value={bulkFeedback} onChange={e => setBulkFeedback(e.target.value)} />
+          <Textarea rows={2} placeholder="Reason for rejecting all..." value={bulkFeedback} onChange={(e) => setBulkFeedback(e.target.value)} />
           <div className="flex gap-2">
-            <button onClick={handleRejectAll} disabled={!bulkFeedback.trim()} className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50">Confirm Reject All</button>
-            <button onClick={() => setShowBulkReject(false)} className="text-xs text-gray-500 hover:underline">Cancel</button>
+            <Button size="sm" variant="danger" onClick={handleRejectAll} disabled={!bulkFeedback.trim()}>
+              Confirm Reject All
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setShowBulkReject(false)}>
+              Cancel
+            </Button>
           </div>
         </div>
       )}
 
       {regenJobId && (
         <div className="mb-4">
-          <JobStatusPoller jobId={regenJobId} onComplete={() => { setRegenJobId(""); load(); }} />
+          <JobStatusPoller
+            jobId={regenJobId}
+            onComplete={() => {
+              setRegenJobId("");
+              load();
+            }}
+          />
         </div>
       )}
 
       {rejected.length > 0 && !regenJobId && (
-        <div className="mb-4 rounded-xl bg-orange-50 p-4 space-y-2">
-          <p className="text-sm font-medium text-orange-700">{rejected.length} rejected question{rejected.length > 1 ? "s" : ""} — regenerate them with feedback:</p>
-          <textarea className="w-full rounded-lg border border-orange-200 px-3 py-2 text-sm" rows={2} placeholder="e.g. Questions are too easy, make them harder and more exam-focused" value={regenFeedback} onChange={e => setRegenFeedback(e.target.value)} />
-          <button onClick={handleRegenerate} disabled={!regenFeedback.trim()} className="rounded-lg bg-orange-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-orange-700 disabled:opacity-50">Regenerate Rejected</button>
+        <div className="mb-4 space-y-2 rounded-lg border border-warning-100 bg-warning-50 p-4">
+          <p className="text-sm font-medium text-warning-700">
+            {rejected.length} rejected question{rejected.length > 1 ? "s" : ""} — regenerate them with feedback:
+          </p>
+          <Textarea rows={2} placeholder="e.g. Questions are too easy, make them harder and more exam-focused" value={regenFeedback} onChange={(e) => setRegenFeedback(e.target.value)} />
+          <Button size="sm" variant="secondary" onClick={handleRegenerate} disabled={!regenFeedback.trim()}>
+            Regenerate Rejected
+          </Button>
         </div>
       )}
 
       <div className="space-y-4">
-        {batch.questions.map(q => (
+        {batch.questions.map((q) => (
           <QuestionCard key={q.id} question={q} batchId={batchId} onUpdate={handleQuestionUpdate} />
         ))}
       </div>
@@ -488,32 +464,31 @@ function BatchesTab({ onOpenBatch }: { onOpenBatch: (id: string) => void }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    mcqService.listBatches().then(r => setBatches(r.items)).finally(() => setLoading(false));
+    mcqService
+      .listBatches()
+      .then((r) => setBatches(r.items))
+      .finally(() => setLoading(false));
   }, []);
 
-  if (loading) return <div className="text-sm text-gray-500">Loading…</div>;
-  if (!batches.length) return <div className="text-sm text-gray-400">No review batches yet.</div>;
-
-  const BATCH_STATUS: Record<string, string> = {
-    pending: "bg-gray-100 text-gray-600",
-    in_review: "bg-yellow-100 text-yellow-700",
-    completed: "bg-green-100 text-green-700",
-  };
+  if (loading) return <PageLoader />;
+  if (!batches.length) return <EmptyState icon={<HelpCircle className="h-5 w-5" />} title="No review batches yet" />;
 
   return (
     <div className="space-y-3">
-      {batches.map(b => (
-        <div key={b.id} className="flex items-center justify-between rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-100">
+      {batches.map((b) => (
+        <div key={b.id} className="flex items-center justify-between rounded-lg border border-gray-200 bg-white p-4">
           <div>
-            <div className="flex items-center gap-2 mb-1">
-              <span className="text-sm font-medium text-gray-900 capitalize">{b.batch_type} batch</span>
-              <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${BATCH_STATUS[b.status] || "bg-gray-100 text-gray-600"}`}>{b.status}</span>
+            <div className="mb-1 flex items-center gap-2">
+              <span className="text-sm font-medium capitalize text-gray-900">{b.batch_type} batch</span>
+              <StatusBadge status={b.status} />
             </div>
-            <p className="text-xs text-gray-500">
+            <p className="text-xs tabular-nums text-gray-500">
               {b.total_questions} questions · {b.accepted_count} accepted · {b.rejected_count} rejected · {new Date(b.created_at).toLocaleDateString()}
             </p>
           </div>
-          <button onClick={() => onOpenBatch(b.id)} className="rounded-lg bg-brand-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-700">Review</button>
+          <Button size="sm" onClick={() => onOpenBatch(b.id)}>
+            Review
+          </Button>
         </div>
       ))}
     </div>
@@ -528,8 +503,9 @@ function QuestionBankTab({ chapters }: { chapters: ChapterNode[] }) {
   const [page, setPage] = useState(1);
   const [filters, setFilters] = useState({ status: "approved", topic: "", complexity: "" });
   const [loading, setLoading] = useState(true);
+  const [confirmDel, setConfirmDel] = useState<string | null>(null);
 
-  const allTopics = useMemo(() => chapters.flatMap(c => c.topics), [chapters]);
+  const allTopics = useMemo(() => chapters.flatMap((c) => c.topics), [chapters]);
 
   async function load() {
     setLoading(true);
@@ -537,89 +513,99 @@ function QuestionBankTab({ chapters }: { chapters: ChapterNode[] }) {
       const r = await mcqService.listQuestions({ ...filters, page, per_page: 20 });
       setQuestions(r.items);
       setTotal(r.total);
-    } finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+    }
   }
 
-  useEffect(() => { load(); }, [page, filters]);
+  useEffect(() => {
+    load(); // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, filters]);
 
-  async function handleDelete(id: string) {
-    if (!confirm("Delete this question?")) return;
-    await mcqService.deleteQuestion(id);
+  async function doDelete() {
+    if (!confirmDel) return;
+    await mcqService.deleteQuestion(confirmDel);
+    setConfirmDel(null);
     load();
   }
 
   async function toggleApproval(q: MCQQuestion) {
-    if (q.status === "approved") {
-      await mcqService.unapproveQuestion(q.id);
-    } else {
-      await mcqService.approveQuestion(q.id);
-    }
+    if (q.status === "approved") await mcqService.unapproveQuestion(q.id);
+    else await mcqService.approveQuestion(q.id);
     load();
   }
 
   return (
     <div>
-      <div className="mb-4 flex gap-3 flex-wrap">
-        <select aria-label="Filter by Status" className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm" value={filters.status} onChange={e => setFilters(p => ({ ...p, status: e.target.value }))}>
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <Select aria-label="Filter by Status" className="w-40" value={filters.status} onChange={(e) => setFilters((p) => ({ ...p, status: e.target.value }))}>
           <option value="">All Status</option>
           <option value="approved">Approved</option>
           <option value="draft">Draft</option>
           <option value="rejected">Rejected</option>
-        </select>
-        <select aria-label="Filter by Difficulty" className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm" value={filters.complexity} onChange={e => setFilters(p => ({ ...p, complexity: e.target.value }))}>
+        </Select>
+        <Select aria-label="Filter by Difficulty" className="w-40" value={filters.complexity} onChange={(e) => setFilters((p) => ({ ...p, complexity: e.target.value }))}>
           <option value="">All Difficulty</option>
           <option value="easy">Easy</option>
           <option value="medium">Medium</option>
           <option value="hard">Hard</option>
-        </select>
-        <select
-          aria-label="Filter by Topic"
-          className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm bg-white"
-          value={filters.topic}
-          onChange={e => { setPage(1); setFilters(p => ({ ...p, topic: e.target.value })); }}
-        >
+        </Select>
+        <Select aria-label="Filter by Topic" className="w-56" value={filters.topic} onChange={(e) => { setPage(1); setFilters((p) => ({ ...p, topic: e.target.value })); }}>
           <option value="">All Topics</option>
-          {allTopics.map(t => (
-            <option key={t.topic} value={t.topic}>{t.topic}</option>
+          {allTopics.map((t) => (
+            <option key={t.topic} value={t.topic}>
+              {t.topic}
+            </option>
           ))}
-        </select>
-        <span className="ml-auto text-sm text-gray-500 self-center">{total} questions</span>
+        </Select>
+        <span className="ml-auto self-center text-sm tabular-nums text-gray-500">{total} questions</span>
       </div>
 
       {loading ? (
-        <div className="text-sm text-gray-500">Loading…</div>
+        <PageLoader />
       ) : questions.length === 0 ? (
-        <div className="text-sm text-gray-400">No questions found.</div>
+        <EmptyState icon={<HelpCircle className="h-5 w-5" />} title="No questions found" />
       ) : (
         <div className="space-y-3">
-          {questions.map(q => (
-            <div key={q.id} className="rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-100">
+          {questions.map((q) => (
+            <div key={q.id} className="rounded-lg border border-gray-200 bg-white p-4">
               <div className="flex items-start justify-between gap-2">
-                <p className="text-sm text-gray-900 leading-relaxed flex-1">{q.question_text}</p>
-                <div className="flex gap-1 shrink-0">
-                  <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${COMPLEXITY_BADGE[q.complexity]}`}>{q.complexity}</span>
-                  <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_BADGE[q.status]}`}>{q.status}</span>
+                <p className="flex-1 text-sm leading-relaxed text-gray-900">{q.question_text}</p>
+                <div className="flex shrink-0 gap-1">
+                  <ComplexityBadge value={q.complexity} />
+                  <StatusBadge status={q.status} />
                 </div>
               </div>
-              {q.topic && <p className="text-xs text-gray-400 mt-1">{q.topic}{q.subtopic ? ` › ${q.subtopic}` : ""}</p>}
+              {q.topic && (
+                <p className="mt-1 text-xs text-gray-400">
+                  {q.topic}
+                  {q.subtopic ? ` › ${q.subtopic}` : ""}
+                </p>
+              )}
               <div className="mt-3 flex gap-2">
-                <button onClick={() => toggleApproval(q)} className={`rounded-lg px-3 py-1 text-xs font-medium ${q.status === "approved" ? "border border-gray-300 text-gray-600 hover:bg-gray-50" : "bg-green-600 text-white hover:bg-green-700"}`}>
+                <Button size="xs" variant={q.status === "approved" ? "secondary" : "primary"} onClick={() => toggleApproval(q)}>
                   {q.status === "approved" ? "Unapprove" : "Approve"}
-                </button>
-                <button onClick={() => handleDelete(q.id)} className="rounded-lg border border-red-200 px-3 py-1 text-xs font-medium text-red-600 hover:bg-red-50">Delete</button>
+                </Button>
+                <Button size="xs" variant="secondary" className="text-danger-600" onClick={() => setConfirmDel(q.id)}>
+                  Delete
+                </Button>
               </div>
             </div>
           ))}
         </div>
       )}
 
-      {total > 20 && (
-        <div className="mt-4 flex justify-center gap-2">
-          <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page === 1} className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs disabled:opacity-50">Previous</button>
-          <span className="text-xs text-gray-500 self-center">Page {page}</span>
-          <button onClick={() => setPage(p => p + 1)} disabled={page * 20 >= total} className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs disabled:opacity-50">Next</button>
-        </div>
-      )}
+      {total > 20 && <Pagination className="mt-4" page={page} pageSize={20} total={total} onPage={setPage} />}
+
+      <ConfirmDialog
+        open={!!confirmDel}
+        title="Delete question"
+        description="Delete this question? This cannot be undone."
+        confirmLabel="Delete"
+        tone="danger"
+        onConfirm={doDelete}
+        onClose={() => setConfirmDel(null)}
+      />
     </div>
   );
 }
@@ -644,34 +630,26 @@ function ManualAddTab({ onCreated, chapters }: { onCreated: () => void; chapters
     complexity: "medium" as "easy" | "medium" | "hard",
     correct_option_id: "A",
   });
-  const [options, setOptions] = useState<MCQOption[]>(EMPTY_OPTIONS.map(o => ({ ...o })));
+  const [options, setOptions] = useState<MCQOption[]>(EMPTY_OPTIONS.map((o) => ({ ...o })));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState(false);
 
-  const chapterTopics = useMemo(
-    () => chapters.find(c => c.chapter === form.chapter)?.topics ?? [],
-    [form.chapter, chapters]
-  );
-  const topicSubtopics = useMemo(
-    () => chapterTopics.find(t => t.topic === form.topic)?.subtopics ?? [],
-    [form.topic, chapterTopics]
-  );
+  const chapterTopics = useMemo(() => chapters.find((c) => c.chapter === form.chapter)?.topics ?? [], [form.chapter, chapters]);
+  const topicSubtopics = useMemo(() => chapterTopics.find((t) => t.topic === form.topic)?.subtopics ?? [], [form.topic, chapterTopics]);
 
-  function handleChapterChange(value: string) {
-    setForm(p => ({ ...p, chapter: value, topic: "", subtopic: "" }));
-  }
-  function handleTopicChange(value: string) {
-    setForm(p => ({ ...p, topic: value, subtopic: "" }));
-  }
+  const handleChapterChange = (value: string) => setForm((p) => ({ ...p, chapter: value, topic: "", subtopic: "" }));
+  const handleTopicChange = (value: string) => setForm((p) => ({ ...p, topic: value, subtopic: "" }));
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!form.question_text.trim()) { setError("Question text is required."); return; }
-    if (!selectedExamId) { setError("Select an exam in the top bar first."); return; }
-    if (!form.chapter) { setError("Chapter is required."); return; }
-    if (options.some(o => !o.text.trim())) { setError("All 4 options must have text."); return; }
-    setLoading(true); setError(""); setSuccess(false);
+    if (!form.question_text.trim()) return setError("Question text is required.");
+    if (!selectedExamId) return setError("Select an exam in the top bar first.");
+    if (!form.chapter) return setError("Chapter is required.");
+    if (options.some((o) => !o.text.trim())) return setError("All 4 options must have text.");
+    setLoading(true);
+    setError("");
+    setSuccess(false);
     try {
       await mcqService.createQuestion({
         exam_id: selectedExamId,
@@ -685,93 +663,91 @@ function ManualAddTab({ onCreated, chapters }: { onCreated: () => void; chapters
         complexity: form.complexity,
       });
       setForm({ question_text: "", explanation: "", chapter: "", topic: "", subtopic: "", complexity: "medium", correct_option_id: "A" });
-      setOptions(EMPTY_OPTIONS.map(o => ({ ...o })));
+      setOptions(EMPTY_OPTIONS.map((o) => ({ ...o })));
       setSuccess(true);
       onCreated();
     } catch (err: any) {
       setError(getErrorMessage(err, "Failed to create question."));
-    } finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
     <form onSubmit={handleSubmit} className="max-w-2xl space-y-4">
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">Question Text *</label>
-        <textarea aria-label="Question Text" rows={3} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.question_text} onChange={e => setForm(p => ({ ...p, question_text: e.target.value }))} />
-      </div>
+      <FormField label="Question Text" required>
+        <Textarea rows={3} value={form.question_text} onChange={(e) => setForm((p) => ({ ...p, question_text: e.target.value }))} />
+      </FormField>
       <div className="space-y-2">
-        <label className="block text-sm font-medium text-gray-700">Options *</label>
+        <label className="block text-sm font-medium text-gray-700">
+          Options <span className="text-danger-500">*</span>
+        </label>
         {options.map((opt, i) => (
           <div key={opt.id} className="flex items-center gap-2">
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <input type="radio" name="correct" value={opt.id} checked={form.correct_option_id === opt.id} onChange={() => setForm(p => ({ ...p, correct_option_id: opt.id }))} />
-              <span className="text-sm font-medium text-gray-700 w-6">{opt.id}.</span>
+            <label className="flex cursor-pointer items-center gap-1.5">
+              <input type="radio" name="correct" value={opt.id} checked={form.correct_option_id === opt.id} onChange={() => setForm((p) => ({ ...p, correct_option_id: opt.id }))} />
+              <span className="w-6 text-sm font-medium text-gray-700">{opt.id}.</span>
             </label>
-            <input className="flex-1 rounded-lg border border-gray-300 px-3 py-1.5 text-sm" value={opt.text} onChange={e => {
-              const updated = [...options]; updated[i] = { ...opt, text: e.target.value }; setOptions(updated);
-            }} placeholder={`Option ${opt.id}`} />
+            <TextInput
+              value={opt.text}
+              onChange={(e) => {
+                const updated = [...options];
+                updated[i] = { ...opt, text: e.target.value };
+                setOptions(updated);
+              }}
+              placeholder={`Option ${opt.id}`}
+            />
           </div>
         ))}
         <p className="text-xs text-gray-500">Select the radio button next to the correct answer.</p>
       </div>
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">Explanation</label>
-        <textarea aria-label="Explanation" rows={2} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm" value={form.explanation} onChange={e => setForm(p => ({ ...p, explanation: e.target.value }))} />
-      </div>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <div>
-          <label className="block text-xs font-medium text-gray-600 mb-1">Difficulty</label>
-          <select aria-label="Difficulty" className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.complexity} onChange={e => setForm(p => ({ ...p, complexity: e.target.value as any }))}>
+      <FormField label="Explanation">
+        <Textarea rows={2} value={form.explanation} onChange={(e) => setForm((p) => ({ ...p, explanation: e.target.value }))} />
+      </FormField>
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <FormField label="Difficulty">
+          <Select value={form.complexity} onChange={(e) => setForm((p) => ({ ...p, complexity: e.target.value as any }))}>
             <option value="easy">Easy</option>
             <option value="medium">Medium</option>
             <option value="hard">Hard</option>
-          </select>
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-gray-600 mb-1">Chapter *</label>
-          <select aria-label="Chapter" className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.chapter} onChange={e => handleChapterChange(e.target.value)}>
+          </Select>
+        </FormField>
+        <FormField label="Chapter" required>
+          <Select value={form.chapter} onChange={(e) => handleChapterChange(e.target.value)}>
             <option value="">— None —</option>
-            {chapters.map(c => (
-              <option key={c.chapter} value={c.chapter}>{c.chapter}</option>
+            {chapters.map((c) => (
+              <option key={c.chapter} value={c.chapter}>
+                {c.chapter}
+              </option>
             ))}
-          </select>
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-gray-600 mb-1">Topic</label>
-          {chapterTopics.length > 0 ? (
-            <select aria-label="Topic" className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.topic} onChange={e => handleTopicChange(e.target.value)}>
-              <option value="">— None —</option>
-              {chapterTopics.map(t => (
-                <option key={t.topic} value={t.topic}>{t.topic}</option>
-              ))}
-            </select>
-          ) : (
-            <select aria-label="Topic" className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" disabled>
-              <option value="">{form.chapter ? "No topics" : "Select chapter first"}</option>
-            </select>
-          )}
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-gray-600 mb-1">Subtopic</label>
-          {topicSubtopics.length > 0 ? (
-            <select aria-label="Subtopic" className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" value={form.subtopic} onChange={e => setForm(p => ({ ...p, subtopic: e.target.value }))}>
-              <option value="">— None —</option>
-              {topicSubtopics.map(s => (
-                <option key={s.id} value={s.subtopic}>{s.subtopic}</option>
-              ))}
-            </select>
-          ) : (
-            <select aria-label="Subtopic" className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm bg-white" disabled>
-              <option value="">{form.topic ? "No subtopics" : "Select topic first"}</option>
-            </select>
-          )}
-        </div>
+          </Select>
+        </FormField>
+        <FormField label="Topic">
+          <Select value={form.topic} onChange={(e) => handleTopicChange(e.target.value)} disabled={chapterTopics.length === 0}>
+            <option value="">{chapterTopics.length > 0 ? "— None —" : form.chapter ? "No topics" : "Select chapter first"}</option>
+            {chapterTopics.map((t) => (
+              <option key={t.topic} value={t.topic}>
+                {t.topic}
+              </option>
+            ))}
+          </Select>
+        </FormField>
+        <FormField label="Subtopic">
+          <Select value={form.subtopic} onChange={(e) => setForm((p) => ({ ...p, subtopic: e.target.value }))} disabled={topicSubtopics.length === 0}>
+            <option value="">{topicSubtopics.length > 0 ? "— None —" : form.topic ? "No subtopics" : "Select topic first"}</option>
+            {topicSubtopics.map((s) => (
+              <option key={s.id} value={s.subtopic}>
+                {s.subtopic}
+              </option>
+            ))}
+          </Select>
+        </FormField>
       </div>
-      {error && <p className="text-sm text-red-600">{error}</p>}
-      {success && <p className="text-sm text-green-600">Question created and approved.</p>}
-      <button type="submit" disabled={loading} className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white hover:bg-brand-700 disabled:opacity-50">
-        {loading ? "Saving…" : "Add MCQ"}
-      </button>
+      {error && <Alert>{error}</Alert>}
+      {success && <Alert tone="success">Question created and approved.</Alert>}
+      <Button type="submit" loading={loading}>
+        Add MCQ
+      </Button>
     </form>
   );
 }
@@ -786,16 +762,22 @@ export function AdminMCQ() {
   const [syllabusChapters, setSyllabusChapters] = useState<ChapterNode[]>([]);
 
   useEffect(() => {
-    if (!selectedExamId) { setSyllabusChapters([]); return; }
-    syllabusService.get(selectedExamId).then(tree => setSyllabusChapters(tree.chapters)).catch(() => {});
+    if (!selectedExamId) {
+      setSyllabusChapters([]);
+      return;
+    }
+    syllabusService
+      .get(selectedExamId)
+      .then((tree) => setSyllabusChapters(tree.chapters))
+      .catch(() => {});
   }, [selectedExamId]);
 
-  const TABS: { key: Tab; label: string }[] = [
-    { key: "upload", label: "Upload Existing MCQs" },
-    { key: "generate", label: "Generate from Content" },
-    { key: "batches", label: "Review Batches" },
-    { key: "bank", label: "Question Bank" },
-    { key: "manual", label: "Manual Add" },
+  const TABS = [
+    { id: "upload", label: "Upload Existing MCQs" },
+    { id: "generate", label: "Generate from Content" },
+    { id: "batches", label: "Review Batches" },
+    { id: "bank", label: "Question Bank" },
+    { id: "manual", label: "Manual Add" },
   ];
 
   function handleJobStart(jobId: string) {
@@ -809,26 +791,22 @@ export function AdminMCQ() {
 
   return (
     <div>
-      <div className="mb-6">
-        <h2 className="text-xl font-semibold text-gray-900">MCQ System</h2>
-        <p className="mt-1 text-sm text-gray-500">Upload, generate, review, and manage MCQ questions</p>
-      </div>
+      <PageHeader title="MCQ System" description="Upload, generate, review, and manage MCQ questions." icon={<HelpCircle className="h-5 w-5" />} />
 
-      <div className="mb-6 flex gap-1 flex-wrap border-b border-gray-200">
-        {TABS.map(t => (
-          <button
-            key={t.key}
-            onClick={() => { setTab(t.key); setReviewBatchId(""); setActiveJobId(""); }}
-            className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${tab === t.key ? "border-brand-600 text-brand-700" : "border-transparent text-gray-500 hover:text-gray-700"}`}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
+      <Tabs
+        items={TABS}
+        value={tab}
+        onChange={(id) => {
+          setTab(id as Tab);
+          setReviewBatchId("");
+          setActiveJobId("");
+        }}
+        className="mb-6"
+      />
 
       {activeJobId && (
         <div className="mb-6 max-w-lg">
-          <p className="text-sm text-gray-600 mb-2">Processing in background…</p>
+          <p className="mb-2 text-sm text-gray-600">Processing in background…</p>
           <JobStatusPoller jobId={activeJobId} onComplete={handleJobComplete} onFail={() => setActiveJobId("")} />
         </div>
       )}
@@ -837,7 +815,7 @@ export function AdminMCQ() {
         <>
           {tab === "upload" && <UploadTab onJobStart={handleJobStart} chapters={syllabusChapters} />}
           {tab === "generate" && <GenerateTab onJobStart={handleJobStart} chapters={syllabusChapters} />}
-          {tab === "batches" && !reviewBatchId && <BatchesTab onOpenBatch={id => setReviewBatchId(id)} />}
+          {tab === "batches" && !reviewBatchId && <BatchesTab onOpenBatch={(id) => setReviewBatchId(id)} />}
           {tab === "batches" && reviewBatchId && <BatchReview batchId={reviewBatchId} onBack={() => setReviewBatchId("")} />}
           {tab === "bank" && <QuestionBankTab chapters={syllabusChapters} />}
           {tab === "manual" && <ManualAddTab onCreated={() => {}} chapters={syllabusChapters} />}

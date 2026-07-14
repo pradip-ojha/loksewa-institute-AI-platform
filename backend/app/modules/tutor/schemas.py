@@ -31,6 +31,7 @@ class TutorAskResponse(BaseModel):
 
 class TutorChatMessageOut(BaseModel):
     id: uuid.UUID
+    session_id: uuid.UUID
     question: str
     answer: str
     language: str | None = None

@@ -84,8 +84,8 @@ export function JobStatusPoller({ jobId, onComplete, onFail, className = "" }: P
 
   if (pollerError === "timeout" && (!job || !TERMINAL.has(job.status))) {
     return (
-      <div className={`rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-100 ${className}`}>
-        <p className="text-sm font-medium text-yellow-700">Lost connection to the job</p>
+      <div className={`rounded-lg border border-gray-200 bg-white p-4 ${className}`}>
+        <p className="text-sm font-medium text-warning-700">Lost connection to the job</p>
         <p className="mt-1 text-xs text-gray-500">
           We stopped checking after repeated failures or a long wait. Refresh the page to resume tracking.
         </p>
@@ -97,24 +97,24 @@ export function JobStatusPoller({ jobId, onComplete, onFail, className = "" }: P
 
   const statusColor: Record<string, string> = {
     queued: "bg-gray-400",
-    processing: "bg-brand-500",
-    completed: "bg-green-500",
-    failed: "bg-red-500",
-    retrying: "bg-yellow-400",
+    processing: "bg-brand-600",
+    completed: "bg-success-500",
+    failed: "bg-danger-500",
+    retrying: "bg-warning-500",
     cancelled: "bg-gray-400",
   };
 
   const labelColor: Record<string, string> = {
     queued: "text-gray-600",
     processing: "text-brand-700",
-    completed: "text-green-700",
-    failed: "text-red-700",
-    retrying: "text-yellow-700",
+    completed: "text-success-700",
+    failed: "text-danger-700",
+    retrying: "text-warning-700",
     cancelled: "text-gray-600",
   };
 
   return (
-    <div className={`rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-100 ${className}`}>
+    <div className={`rounded-lg border border-gray-200 bg-white p-4 ${className}`}>
       <div className="mb-2 flex items-center justify-between">
         <span className={`text-sm font-medium capitalize ${labelColor[job.status]}`}>
           {job.status}
@@ -134,16 +134,16 @@ export function JobStatusPoller({ jobId, onComplete, onFail, className = "" }: P
         <p className="mt-2 text-xs text-gray-500">{job.current_step}</p>
       )}
       {job.status === "completed" && job.output_reference?.skipped ? (
-        <p className="mt-2 text-xs text-yellow-700">
+        <p className="mt-2 text-xs text-warning-700">
           {(job.output_reference.saved ?? job.output_reference.replaced ?? 0)} saved,{" "}
           {job.output_reference.skipped} skipped (malformed and dropped).
         </p>
       ) : null}
       {pollerError === "connection" && !TERMINAL.has(job.status) && (
-        <p className="mt-2 text-xs text-yellow-600">Reconnecting…</p>
+        <p className="mt-2 text-xs text-warning-600">Reconnecting…</p>
       )}
       {job.status === "failed" && job.error_message && (
-        <p className="mt-2 text-xs text-red-600">{job.error_message}</p>
+        <p className="mt-2 text-xs text-danger-600">{job.error_message}</p>
       )}
     </div>
   );

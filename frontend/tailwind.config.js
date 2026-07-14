@@ -1,71 +1,39 @@
 /** @type {import('tailwindcss').Config} */
 import typography from "@tailwindcss/typography";
+import colors from "tailwindcss/colors";
 
 export default {
   content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
   theme: {
     extend: {
       colors: {
+        // Single cool neutral system: every `gray-*` renders as slate.
+        // Rule: always write `gray-*`, never `slate-*`.
+        gray: colors.slate,
+        // Brand — deep desaturated blue ("enterprise navy"). Primary action = 600.
         brand: {
-          50: "#f0f4ff",
-          100: "#e0e9ff",
-          200: "#c7d4fb",
-          300: "#a5b8f5",
-          400: "#7a93ef",
-          500: "#4f70e8",
-          600: "#3d5cd4",
-          700: "#2d47c0",
-          800: "#243a9e",
-          900: "#1a2d7a",
+          50: "#f4f6fb",
+          100: "#e7edf7",
+          200: "#cbd9ee",
+          300: "#9fbade",
+          400: "#6b93c9",
+          500: "#3e6cb0", // links, icons, active-state text
+          600: "#2b5597", // PRIMARY action (buttons, focus border)
+          700: "#254a80", // hover on primary
+          800: "#223f69", // active/pressed
+          900: "#1e3354",
+          950: "#152238",
         },
-        accent: {
-          50: "#f5f3ff",
-          100: "#ede9fe",
-          200: "#ddd6fe",
-          300: "#c4b5fd",
-          400: "#a78bfa",
-          500: "#8b5cf6",
-          600: "#7c3aed",
-          700: "#6d28d9",
-        },
-        success: {
-          50: "#ecfdf5",
-          100: "#d1fae5",
-          500: "#10b981",
-          600: "#059669",
-          700: "#047857",
-        },
-        warning: {
-          50: "#fffbeb",
-          100: "#fef3c7",
-          500: "#f59e0b",
-          600: "#d97706",
-          700: "#b45309",
-        },
-        danger: {
-          50: "#fef2f2",
-          100: "#fee2e2",
-          500: "#ef4444",
-          600: "#dc2626",
-          700: "#b91c1c",
-        },
-        info: {
-          50: "#eff6ff",
-          100: "#dbeafe",
-          500: "#3b82f6",
-          600: "#2563eb",
-          700: "#1d4ed8",
-        },
+        // Muted semantic ramps — desaturated so badges/alerts read professional.
+        success: { 50: "#f2f9f4", 100: "#ddf0e2", 500: "#3d9a63", 600: "#2e7d4f", 700: "#276841" },
+        warning: { 50: "#fdf8ec", 100: "#faedcc", 500: "#d99b28", 600: "#b57d1e", 700: "#93651d" },
+        danger: { 50: "#fcf3f2", 100: "#f8dedb", 500: "#d2544a", 600: "#b83e35", 700: "#98352e" },
+        info: { 50: "#f2f7fb", 100: "#dfebf6", 500: "#4585b5", 600: "#356e99", 700: "#2d5a7d" },
       },
       boxShadow: {
-        card: "0 1px 2px 0 rgb(15 23 42 / 0.04), 0 1px 3px 0 rgb(15 23 42 / 0.06)",
-        "card-hover": "0 4px 12px -2px rgb(15 23 42 / 0.10), 0 2px 6px -2px rgb(15 23 42 / 0.06)",
-        pop: "0 10px 30px -6px rgb(15 23 42 / 0.18), 0 4px 12px -4px rgb(15 23 42 / 0.10)",
-        glow: "0 8px 24px -6px rgb(79 112 232 / 0.45)",
-      },
-      borderRadius: {
-        xl: "0.875rem",
-        "2xl": "1.125rem",
+        // Border-first: hairline card + one elevated pop (modals/toasts/menus only).
+        card: "0 1px 2px 0 rgb(15 23 42 / 0.04)",
+        pop: "0 8px 24px -8px rgb(15 23 42 / 0.14), 0 2px 8px -2px rgb(15 23 42 / 0.08)",
       },
       fontFamily: {
         sans: [
@@ -84,43 +52,38 @@ export default {
           "0%": { opacity: "0" },
           "100%": { opacity: "1" },
         },
-        "slide-up": {
-          "0%": { opacity: "0", transform: "translateY(8px)" },
-          "100%": { opacity: "1", transform: "translateY(0)" },
-        },
         shimmer: {
           "100%": { transform: "translateX(100%)" },
         },
       },
       animation: {
         "fade-in": "fade-in 0.25s ease-out",
-        "slide-up": "slide-up 0.3s ease-out",
       },
       typography: ({ theme }) => ({
         brand: {
           css: {
             "--tw-prose-body": theme("colors.gray[700]"),
             "--tw-prose-headings": theme("colors.gray[900]"),
-            "--tw-prose-bold": theme("colors.brand[700]"),
-            "--tw-prose-bullets": theme("colors.brand[400]"),
-            "--tw-prose-counters": theme("colors.brand[500]"),
+            "--tw-prose-bold": theme("colors.gray[900]"),
+            "--tw-prose-bullets": theme("colors.gray[400]"),
+            "--tw-prose-counters": theme("colors.gray[400]"),
             "--tw-prose-links": theme("colors.brand[600]"),
             "--tw-prose-quotes": theme("colors.gray[600]"),
-            "--tw-prose-quote-borders": theme("colors.brand[200]"),
+            "--tw-prose-quote-borders": theme("colors.gray[300]"),
             "--tw-prose-hr": theme("colors.gray[200]"),
             "--tw-prose-th-borders": theme("colors.gray[300]"),
             "--tw-prose-td-borders": theme("colors.gray[200]"),
             maxWidth: "none",
             lineHeight: "1.7",
-            h1: { fontWeight: "700", fontSize: "1.4em", marginTop: "1.2em", marginBottom: "0.5em" },
-            h2: { fontWeight: "700", fontSize: "1.2em", marginTop: "1.1em", marginBottom: "0.4em" },
+            h1: { fontWeight: "600", fontSize: "1.4em", marginTop: "1.2em", marginBottom: "0.5em" },
+            h2: { fontWeight: "600", fontSize: "1.2em", marginTop: "1.1em", marginBottom: "0.4em" },
             h3: { fontWeight: "600", fontSize: "1.05em", marginTop: "1em", marginBottom: "0.3em" },
             "h1, h2, h3, h4": { lineHeight: "1.3", scrollMarginTop: "5rem" },
             p: { marginTop: "0.6em", marginBottom: "0.6em" },
             "ul, ol": { marginTop: "0.5em", marginBottom: "0.5em", paddingLeft: "1.4em" },
             "li": { marginTop: "0.2em", marginBottom: "0.2em" },
             "li::marker": { fontWeight: "600" },
-            strong: { fontWeight: "700" },
+            strong: { fontWeight: "600" },
             code: {
               backgroundColor: theme("colors.gray[100]"),
               padding: "0.15em 0.4em",
@@ -134,7 +97,7 @@ export default {
               fontStyle: "normal",
               borderLeftWidth: "3px",
               paddingLeft: "1em",
-              backgroundColor: theme("colors.brand[50]"),
+              backgroundColor: theme("colors.gray[50]"),
               borderRadius: "0 0.5rem 0.5rem 0",
               paddingTop: "0.4em",
               paddingBottom: "0.4em",

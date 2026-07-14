@@ -245,10 +245,11 @@ async def delete_set(
 
 @router.get("/student/mcq-tests", response_model=list[StudentTestSetOut])
 async def list_student_tests(
+    exam_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_student),
 ):
-    rows = await svc.list_student_tests(db, current_user.id)
+    rows = await svc.list_student_tests(db, current_user.id, exam_id=exam_id)
     return [StudentTestSetOut(**r) for r in rows]
 
 

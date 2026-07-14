@@ -57,7 +57,7 @@ export function Modal({
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.15 }}
-            className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm"
+            className="absolute inset-0 bg-gray-900/40"
             onClick={closeOnBackdrop ? onClose : undefined}
           />
           <motion.div
@@ -70,19 +70,19 @@ export function Modal({
             exit={{ opacity: 0, scale: 0.97, y: 8 }}
             transition={{ duration: 0.18, ease: "easeOut" }}
             className={cn(
-              "relative z-10 w-full overflow-hidden rounded-2xl bg-white shadow-pop outline-none",
+              "relative z-10 w-full overflow-hidden rounded-lg border border-gray-200 bg-white shadow-pop outline-none",
               SIZES[size],
             )}
           >
             {(title || subtitle) && (
-              <div className="flex items-start justify-between border-b border-gray-100 px-5 py-4">
+              <div className="flex items-start justify-between border-b border-gray-200 px-5 py-4">
                 <div>
-                  {title && <h2 className="text-lg font-semibold text-gray-900">{title}</h2>}
+                  {title && <h2 className="text-base font-semibold text-gray-900">{title}</h2>}
                   {subtitle && <p className="mt-0.5 text-sm text-gray-500">{subtitle}</p>}
                 </div>
                 <button
                   onClick={onClose}
-                  className="-mr-1 rounded-lg p-1.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700"
+                  className="-mr-1 rounded-md p-1.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700"
                   aria-label="Close"
                 >
                   <X className="h-5 w-5" />
@@ -91,7 +91,7 @@ export function Modal({
             )}
             <div className="max-h-[70vh] overflow-y-auto px-5 py-4 scrollbar-thin">{children}</div>
             {footer && (
-              <div className="flex justify-end gap-2 border-t border-gray-100 bg-gray-50/60 px-5 py-3">
+              <div className="flex justify-end gap-2 border-t border-gray-200 bg-gray-50 px-5 py-3">
                 {footer}
               </div>
             )}

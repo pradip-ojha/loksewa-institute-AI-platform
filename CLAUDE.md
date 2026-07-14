@@ -538,25 +538,37 @@ The per-sheet checker reuses these **locked** skills and never re-reads the larg
 attention-focused).
 
 Two agents, bounded loop (max 2 iterations):
-- **SkillGenerator** (GPT-5.5 reasoning) — builds the detailed per-question guide; also does the
+- **SkillGenerator** (GPT-5.5 reasoning) — builds the lean per-question guide; also does the
   weak-skill regeneration on iter 2.
 - **SkillEvaluator** (GPT-5 thinking, `get_provider("consistency_check")`) — lenient QA: passes a guide
   if operationally usable; fails ONLY for serious STRUCTURAL issues (wrong-question mapping,
-  qnum/max-marks mismatch, breakdown ≠ full marks, major missing areas, too vague, rubric/admin
-  ignored, numerical lacking formula/steps, wrong topic, duplicate/missing). This is a consistency
-  check, not authoring, so it runs on the cheaper gpt-5; gpt-5.5 still generates/regenerates the guides.
+  qnum/max-marks mismatch, breakdown ≠ full marks, reference notes missing/irrelevant/too thin,
+  biasing content in the guide, too vague, rubric/admin ignored, numerical lacking formula/steps,
+  wrong topic, duplicate/missing). This is a consistency check, not authoring, so it runs on the
+  cheaper gpt-5; gpt-5.5 still generates/regenerates the guides.
 - Iter 1 generate → evaluate; only weak/failed guides improved once (iter 2) → re-evaluate → lock.
   Residual minor issues lock as `passed_with_warning` (internal audit; no admin gate, never blocks).
 
 Inputs: question paper, model answer, sample marked answer (if any), rubric (or default), detected
 topic/subtopic, fetched resources, custom instruction, active skill.
 
-Output per question (`skill_json`): question intent, topic/subtopic, max marks, expected answer
-points, sample answer fragments, acceptable alternative wording, marks breakdown (sums to full
-marks), partial marking rules, common mistakes, serious wrong statements, annotation-worthy mistakes,
-feedback + strictness guidance, plus theory-specific and numerical-specific (formula/steps/
-calculation/final-answer) guidance. It is a CHECKING GUIDE for marking many varied answers, not a
-copied model answer.
+Output per question (`skill_json`) — **LEAN + UNBIASED by design** (≈¼ the old guide length, whole
+guide ≤ ~300 words): question intent, topic/subtopic, max marks, answer type, **neutral
+`reference_notes`** (concise study-note theory of the topics involved — distilled from fetched
+knowledge/model answer/rubric where relevant, else written from the generator's own expert knowledge),
+section-wise `marks_breakdown` (sums to full marks), `partial_marking_rules`, `numerical_guidance`
+(formula/steps/units — numerical/mixed only, null for theory), and `special_instructions`
+(question-specific admin/rubric points only). The old answer-specific fields (expected answer points,
+sample fragments, acceptable wordings, mistake lists, serious wrong statements, annotation-worthy
+mistakes, feedback/strictness guidance, theory_guidance) were REMOVED — they biased the checker into
+pattern-matching pre-listed wordings. The "how to evaluate" now lives in the checker's system prompt:
+it judges each answer INDEPENDENTLY against the reference notes + its own expert judgement (correct
+ideas in any wording earn marks; the checker itself decides what is wrong/annotation-worthy).
+Old-format locked skills keep working (checker + `_compact_skill` handle both shapes); the lean format
+applies to new tests and on "Regenerate Skills". The chunks fetched per question are snapshotted to
+`question_specific_checking_skills.knowledge_context` (migration `024`) and shown in the admin
+skill-debug endpoint (`GET /admin/subjective/tests/{id}/skill-debug`, `fetched_knowledge_chunks` per
+question) — audit-only, never re-sent to the checker.
 
 ### 11.4 Checking Inputs & Priority
 Checker always reads the live admin-configured test. On conflict:
@@ -584,7 +596,7 @@ Student uploads handwritten answer-sheet PDF/image
 → Quality check (blur, brightness, tilt, resolution, orientation)
 → Low quality: ask reupload (max 2 attempts), then continue with warning
 → Convert pages to HIGH-QUALITY images
-→ Whole-sheet STRUCTURE pass (Gemini vision, all pages): page→question map, continuations, unclear-numbering notes (guidance)
+→ Whole-sheet STRUCTURE pass (Gemini vision, all pages, TWO calls: segment → label): page→question map, continuations, unclear-numbering notes (guidance). Call 1 finds answer BLOCKS + reads the written label content-blind; Call 2 assigns each block its question number from the question TEXTS — a CLEARLY written label is never overridden, only unclear/missing labels are resolved by content
 → Question-level extraction (Gemini vision, structure-aware + prev/next-page hints): per-question text + question bbox + page size + continuation
 → Backend assembles whole-question answers across pages
 → Load admin test config + LOCKED checking skills (NO large notes re-sent — skill already distilled them)
@@ -789,9 +801,16 @@ kvi_ai_subjective`):
   cap 2). One job: render pages → PNG (`processing/pdf_tools`; `PageImage` keeps the PRE-downscale
   `orig_width/orig_height`) → quality gate (`processing/image_quality`, OpenCV; resolution judged on
   the ORIGINAL capture dims, not the capped render; **poor + attempt<2 ⇒ `needs_reupload`, no AI
-  spent**) → **whole-sheet structure pass** (`AnswerStructureAgent`, Gemini vision over all pages,
-  labels normalized to exact known question numbers via `svc.validate_structure_map` — unknown
-  labels dropped — then stored under `extracted_data["structure_map"]`) → **question-level**
+  spent**) → **whole-sheet structure pass** (`AnswerStructureAgent`, Gemini vision over all pages, **TWO
+  sequential calls + an AI-free merge** — Call 1 `_segment` finds answer BLOCKS + page spans and
+  reads each written label content-blind (`written_label`/`label_clarity`/`content_summary`), Call 2
+  `_label` gets the question TEXTS and assigns each block its `final_number` (a `clear` label is
+  trusted as-is and NEVER overridden; only `unclear`/`none` labels are inferred from content),
+  `_merge_blocks_to_structure_map` folds them back into the legacy map shape; **Call 2 failing
+  degrades to Call 1's clearly-written labels**, Call 1 failing → empty map (extraction runs
+  hint-free) — always best-effort, never blocks checking; labels normalized to exact known question
+  numbers via `svc.validate_structure_map` — unknown labels dropped — then stored under
+  `extracted_data["structure_map"]`) → **question-level**
   extraction, **all pages IN PARALLEL**
   (`AnswerExtractionAgent.extract_page`, Gemini vision; `asyncio.gather` + `Semaphore(6)`, each page on
   its OWN short-lived session since audit logging makes one `AsyncSession` not concurrency-safe; the
@@ -993,7 +1012,12 @@ still answers from scope).
   `meta` event with `chat_session_id`+detected topic, `delta` events as the answer streams via
   `TutorAgent.answer_stream`, then a `done` event with follow-ups; sentinel-tail metadata parsing per
   `app/ai/agents/streaming.py`; non-stream endpoint retained as fallback),
-  `GET /api/student/tutor/history?session_id=`.
+  `GET /api/student/tutor/history?session_id=` (one session) or `?exam_id=` (this student's full
+  tutor conversation for that exam, merged across sessions via `service.get_history_by_exam` — mirrors
+  the video tutor's per-video history and is what `StudentTutor.tsx` loads on mount/exam-switch to
+  restore the chat instead of starting blank; it also resumes the most recent session id from the
+  loaded history so follow-up questions keep in-session backend context, `TutorChatMessageOut` carries
+  `session_id` for this).
 - **Tables** (migration `014_chatbots`): `tutor_chat_sessions`, `tutor_chat_messages` (mirrors
   `video_chat_messages`).
 - **Frontend:** `pages/student/StudentTutor.tsx` (full-page chat, route `/student/tutor`, 4th student
@@ -1200,12 +1224,25 @@ is intentionally not shown on the dashboard, §15.)
 
 ## 17. Student Interface (Mobile-First)
 
+**Shared exam selector (`StudentExamContext`, `frontend/src/context/StudentExamContext.tsx`).**
+Mirrors the admin `ExamContext` (§16) but sourced from `examsService.myExams()` (enrolled exams only)
+and persisted under its own localStorage key (`student_selected_exam_id`, separate from the admin
+selector). Rendered as a prominent pill (icon + exam name + chevron) in `StudentLayout`'s top header —
+visible on every student page, not per-page. ONE selection now scopes MCQ Tests, Video Tutor,
+Subjective Tests, and the AI Tutor simultaneously (previously only the AI Tutor had its own,
+page-local picker): `GET /api/student/mcq-tests`, `GET /api/student/videos`, and
+`GET /api/student/subjective/tests` all accept an optional `exam_id` query param that narrows the
+listing to that exam (services: `mcq_tests.service.list_student_tests`,
+`video.service.list_student_videos`, `subjective.service.list_student_tests`); omitting it keeps the
+old behavior (all enrolled exams merged). Defaults to the first enrolled exam, like the admin selector.
+
 **Navigation:** Dashboard | MCQ Tests | Video Tutor | AI Tutor | Subjective Tests | Results | Profile
 - **MCQ Test:** timer, question+options, palette, submit → immediate result with explanations,
   correct answers, topic/complexity. No retake.
 - **Video Tutor:** watch video, view summary+timeline, ask AI questions.
 - **AI Tutor** (`pages/student/StudentTutor.tsx`, route `/student/tutor`): exam-wide, personalized
-  notes/book tutor (§13.1). Full-page chat; student picks the exam, topic auto-selected; activity-aware.
+  notes/book tutor (§13.1). Full-page chat over the shared selected exam (above), topic auto-selected;
+  activity-aware. Reopening the page restores the prior conversation for that exam (see §13.1).
 - **Subjective Test:** view/download question paper, upload answer sheet, quality feedback, reupload
   up to 2x, see result + checked PDF immediately. A **feedback chatbot** (§12.1) explains the checked
   result (marks/improvement/missing points) — read-only, never re-checks the sheet.
@@ -1338,15 +1375,23 @@ Free tier is rate-limited **per minute**, so `gemini._generate_one_model` waits 
 `GEMINI_RATE_LIMIT_MAX_RETRIES`), instead of the short exponential backoff used for other transient errors.
 A **503 "high demand" overload** is a *capacity* problem on Google's side (NOT quota — billing does not
 fix it, and it is unrelated to the caller's `Semaphore(6)` concurrency, which only produces 429s).
-`_generate_content_with_retry` handles it with a **fast fallback + a process-wide circuit breaker** (the
-key perf fix — a fully-overloaded primary was making a 40-call answer sheet take ~24 min, almost all of it
-in per-call 35 s overload waits): when `MODEL_VISION_FALLBACK` is set (default `gemini-3.1-flash-lite`, a
-lighter model on a much larger capacity pool) the primary gives up on the **first** 503 (`overload_budget=0`,
-no 35 s ladder) and fails over immediately; and once the primary 503s `_OV_TRIP_THRESHOLD` (3) times in a
-row the breaker **opens** and calls skip the primary entirely for `_OV_COOLDOWN_SECONDS` (90 s), going
-straight to the fallback, then probe the primary again (a success closes the breaker). With NO fallback the
-primary keeps its patient escalating-wait budget. Fallback/breaker fire ONLY on 503-overload — 429/quota
-retry normally and never trip the breaker; the audit row records the model that actually answered.
+`_generate_content_with_retry` handles it with an **ordered fallback CHAIN + fast per-model failover +
+a per-model circuit breaker** (the key perf fix — a fully-overloaded primary was making a 40-call answer
+sheet take ~24 min, almost all of it in per-call overload waits). The chain is
+`[MODEL_VISION, *MODEL_VISION_FALLBACK(comma-separated list)]`, quality-ordered — e.g.
+`MODEL_VISION=gemini-3.5-flash`, `MODEL_VISION_FALLBACK=gemini-3.1-pro-preview,gemini-3-flash-preview,gemini-3.1-flash-lite`
+(a different capacity pool answers when the primary is saturated). **Fail-fast per model:** every model
+EXCEPT the last gets `single_attempt=True` — ONE call, **no same-model waits** — so the moment a model is
+unavailable (503 / 429 / 404 / transient) the call advances to the next model immediately, never wasting
+time re-hitting a model that is down right now (`_fallback_chain()` strips blanks / the primary / dupes; a
+single value still works = old format). The LAST model keeps the patient quota-aware behavior (429 waits +
+overload escalating ladder + transient backoff) as the genuine last resort; a fully-exhausted last model
+raises (the sheet-level jittered retry catches it). A **per-model** circuit breaker (`_ov_state` keyed by
+model) OPENS after `_OV_TRIP_THRESHOLD` (3) consecutive 503-overloads on that model and skips it for
+`_OV_COOLDOWN_SECONDS` (90 s) — routing straight to the next tier — then re-probes it. Only 503-overload
+trips the breaker (429/quota/transient don't); the last model is never breaker-skipped. `gemini-2.5-pro`
+is deliberately NOT in the chain (returns 404 "no longer available to new users" for this key). The audit
+row records the model that actually answered (or, on total failure, the chain's last model).
 Malformed Gemini JSON is salvaged best-effort by `_loads_lenient` (retry `strict=False` for raw control
 chars in strings + first-balanced-`{…}` extraction for trailing junk); a genuinely truncated response
 still raises (real data loss, not a formatting quirk).
@@ -1466,8 +1511,11 @@ created_by, created_at
 `subjective_questions`: id, test_id, question_number, question_text, marks, question_order, chapter
 (migration `018`; PRIMARY retrieval dimension, from the topic router), topic,
 subtopic (migration `013`; detected per question)
-`question_specific_checking_skills`: id, test_id, question_id, skill_json (JSONB; rich examiner guide),
-version, is_active, evaluation_status, evaluation_notes, iterations (migration `013`), created_at
+`question_specific_checking_skills`: id, test_id, question_id, skill_json (JSONB; lean examiner guide),
+version, is_active, evaluation_status, evaluation_notes, iterations (migration `013`),
+knowledge_context (JSONB, migration `024`; audit snapshot of the Pinecone chunks fetched for this
+question at skill-generation time — surfaced only in the admin skill-debug endpoint, never sent to
+the checker), created_at
 `student_answer_sheets`: id, test_id, student_id, file_id, upload_attempt_number, current_status,
 checking_job_id, created_at — **unique(test_id, student_id, upload_attempt_number)** (migration `021`;
 makes concurrent uploads race-safe, §11)
@@ -1749,7 +1797,9 @@ MODEL_TRANSCRIPTION=gpt-4o-transcribe
 # ── Google Gemini (VISION ONLY: handwriting extraction, structure, locator) ──
 GEMINI_API_KEY=<google-ai-studio-api-key>   # AQ.* and AIza* key formats are both valid
 MODEL_VISION=gemini-3.5-flash               # vision model id your key can access
-MODEL_VISION_FALLBACK=gemini-3.1-flash-lite # lighter model used ONLY on persistent 503 overload (empty → no fallback)
+# Ordered fallback CHAIN (comma-separated), tried in order on unavailability; fail-fast per model,
+# no same-model retry waits. Quality-first. Empty → no fallback (raise). (gemini-2.5-pro is 404 for this key.)
+MODEL_VISION_FALLBACK=gemini-3.1-pro-preview,gemini-3-flash-preview,gemini-3.1-flash-lite
 
 # ── AI / worker timeouts (seconds) ─────────────────────────────────────────
 AI_REQUEST_TIMEOUT_SECONDS=180        # per Azure OpenAI call

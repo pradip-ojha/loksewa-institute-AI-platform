@@ -240,8 +240,9 @@ async def skill_generation_debug(
 ):
     """Every step's output of the question-paper → checking-skill generation workflow:
     extracted questions + marks, detected topic/subtopic, the locked per-question
-    checking guide with its evaluator verdict + iteration count, and every AI call.
-    Admin-only — exposes internal JSON for tuning the skill-generation pipeline."""
+    checking guide with its evaluator verdict + iteration count + the knowledge chunks
+    fetched from Pinecone for that question, and every AI call. Admin-only — exposes
+    internal JSON for tuning the skill-generation pipeline."""
     debug = await svc.build_skill_debug(db, test_id)
     if debug is None:
         raise AppException(404, "not_found", "Test not found.")
@@ -316,10 +317,11 @@ async def answer_sheet_debug_pdf(
 
 @router.get("/student/subjective/tests", response_model=list[StudentTestListItem])
 async def student_list_tests(
+    exam_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_student),
 ):
-    rows = await svc.list_student_tests(db, current_user.id)
+    rows = await svc.list_student_tests(db, current_user.id, exam_id=exam_id)
     return [StudentTestListItem(**r) for r in rows]
 
 

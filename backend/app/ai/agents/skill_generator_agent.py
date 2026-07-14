@@ -1,19 +1,23 @@
-"""Generate the detailed per-question examiner checking skill for a subjective test.
+"""Generate the lean per-question examiner checking skill for a subjective test.
 
 This is the one place that reads the heavy resources (model answer, rubric, and
 fetched notes/book/rubric chunks for the question's topic/subtopic) and DISTILLS
-them into a focused, practical examiner guide. The per-sheet checker later reuses
-this locked skill and never re-reads the large resources — keeping checking
-consistent and attention-focused.
+them into a short, focused guide. The per-sheet checker later reuses this locked
+skill and never re-reads the large resources — keeping checking consistent and
+attention-focused.
 
 Two modes:
   • generate — first-pass guide from the question + resources.
   • improve  — given the prior guide + evaluator feedback, regenerate just this one
     question's guide (used in iteration 2 for weak/failed skills only).
 
-The skill is a CHECKING GUIDE, not a model answer: it must help mark many different
-student answers fairly. Grounded only in the supplied inputs — never invents a
-marking scheme the admin didn't configure. Marks breakdown must sum to full marks.
+The skill is deliberately LEAN and UNBIASED: neutral reference theory notes for the
+topics involved + section-wise marks distribution + partial-marking / numerical /
+admin-specific guidance — and nothing else. It must NOT contain expected answer
+points, sample answers, acceptable wordings, or pre-listed mistakes: those bias the
+checker into pattern-matching specific phrasings instead of judging each answer
+independently against the theory. The "how to evaluate" lives in the checker's own
+system prompt, not here. Marks breakdown must sum to full marks.
 """
 import logging
 import uuid
@@ -28,63 +32,50 @@ logger = logging.getLogger(__name__)
 
 _SCHEMA = """{{
   "question_number": "{question_number}",
-  "question_intent": "what the question is really asking the student to demonstrate",
+  "question_intent": "one line — what the question really demands the student demonstrate",
   "topic": "{topic}",
   "subtopic": "{subtopic}",
   "max_marks": {marks},
   "answer_type": "theory | numerical | mixed",
-  "expected_answer_points": ["concept/point the answer should contain", "..."],
-  "sample_answer_fragments": ["short example of a mark-worthy phrasing", "..."],
-  "acceptable_alternative_wording": ["valid variations / synonyms students may use", "..."],
-  "marks_breakdown": [{{"point": "what earns marks", "marks": 2}}],
-  "partial_marking_rules": "how to award partial credit fairly",
-  "common_mistakes": ["typical incomplete/imperfect answers", "..."],
-  "serious_wrong_statements": ["clearly wrong claims that must be penalized", "..."],
-  "annotation_worthy_mistakes": ["the kinds of specific wrong written items worth a visual mark"],
-  "feedback_guidance": "tone/length and what to mention in feedback",
-  "strictness_guidance": "how strict to be (reflect admin instruction if any)",
-  "theory_guidance": {{
-    "core_concepts": ["..."],
-    "explanation_depth_expected": "...",
-    "mark_worthy_examples": ["..."],
-    "structure_expectations": "...",
-    "common_incomplete_answers": ["..."],
-    "penalize_worthy_wrong_ideas": ["..."]
-  }},
+  "reference_notes": "neutral theory notes on the topics this question involves — concise study-note style (definitions, key facts, relationships, figures) giving the checker the knowledge to judge ANY answer's correctness",
+  "marks_breakdown": [{{"section": "what this section covers", "marks": 2}}],
+  "partial_marking_rules": "1-3 sentences on fair partial credit for this question",
   "numerical_guidance": {{
-    "expected_formula": "... or null",
+    "expected_formula": "...",
     "required_steps": ["..."],
-    "substitution_calculation_expectations": "...",
-    "final_answer_unit_expectations": "...",
-    "partial_marks": {{"formula": 0, "steps": 0, "calculation": 0, "final_answer": 0}},
-    "common_calculation_mistakes": ["..."],
-    "annotation_worthy_wrong_steps": ["..."]
-  }}
+    "final_answer_unit_expectations": "..."
+  }},
+  "special_instructions": "ONLY question-specific points from the admin instruction / rubric; empty string if none"
 }}"""
 
 GENERATE_PROMPT = EXAM_CONTEXT + """
 
-ROLE: You are a senior Loksewa examiner who writes the marking strategy. Build a detailed,
-PRACTICAL examiner CHECKING GUIDE for ONE subjective question so that a downstream AI checker can
-fairly and consistently mark many different student answers from it alone — without re-reading
-the model answer, rubric, or notes.
+ROLE: You are a senior Loksewa examiner who writes the marking strategy. Build a SHORT, LEAN
+CHECKING GUIDE for ONE subjective question. A downstream AI checker will mark many different
+student answers from this guide alone — it judges each answer INDEPENDENTLY against the guide's
+neutral theory notes, so give it KNOWLEDGE, not answers.
 
 TASK: Produce the checking guide JSON for the question below.
 
 HARD RULES (never violate):
-- Ground the guide ONLY in the question, model answer, rubric, admin instruction, and supporting
-  excerpts below. Do NOT invent a marking scheme the admin did not configure.
+- "reference_notes" must be NEUTRAL topic theory — concise study notes (definitions, key facts,
+  relationships, formulas, figures) covering what this question involves. NEVER include expected
+  answer points, sample answers, mark-worthy phrasings, acceptable wordings, or lists of mistakes
+  to look for — any of those bias the checker into pattern-matching specific wording instead of
+  judging the student's own formulation on its merits.
+- Source priority for "reference_notes": distill the supporting excerpts, model answer, and rubric
+  below when they are relevant; where they are empty or irrelevant, write the notes from your own
+  expert knowledge of the topic — still neutral theory, never a model answer.
+- Keep it SHORT: "reference_notes" at most ~200 words; the whole guide at most ~300 words.
 - "marks_breakdown" MUST sum to exactly the FULL MARKS ({marks}). Never above or below.
-- Make it a GUIDE for marking varied answers, not a single copied model answer. Capture
-  acceptable alternative wordings and the range of correct approaches.
-- Fill "theory_guidance" for theory questions, "numerical_guidance" for numerical (formula →
-  steps → calculation → final answer/units), both for mixed; use null/[] for the inapplicable part.
-- "annotation_worthy_mistakes" = ONLY specific WRONG written items (wrong sentence/formula/step/
-  number/keyword, contradiction, irrelevant line). NEVER list "missing points" or "weak structure".
+- Fill "numerical_guidance" ONLY for numerical/mixed questions (formula → steps → final
+  answer/units); set it to null for pure theory questions.
+- "special_instructions" carries ONLY question-specific points from the admin instruction or
+  rubric; empty string if none. Do NOT invent a marking scheme the admin did not configure.
 
-METHOD: Read the question and decide what it truly demands. Distil the model answer/rubric/notes
-into the marks-worthy points, then design a fair partial-marking scheme and anticipate the common
-imperfect answers and serious wrong claims a real Nepali student would write.
+METHOD: Read the question and decide what it truly demands. Write the neutral theory notes the
+checker needs to judge any answer, then split the full marks into fair sections and state how
+partial credit works.
 
 QUESTION NUMBER: {question_number}
 FULL MARKS: {marks}
@@ -119,7 +110,10 @@ flagged as weak. Fix the flagged weaknesses without breaking what already works.
 HARD RULES (never violate):
 - Fix ONLY the weaknesses the evaluator raised; preserve everything already correct.
 - Keep "marks_breakdown" summing to exactly {marks}.
-- Stay grounded in the supplied question/model answer/rubric/admin instruction/notes; invent nothing.
+- Keep the guide LEAN and UNBIASED: "reference_notes" stays neutral topic theory (~200 words max,
+  whole guide ~300 words max) — never expected answer points, sample answers, acceptable wordings,
+  or mistake lists. Distill the supplied resources where relevant; fill gaps from your own expert
+  knowledge of the topic. "special_instructions" only reflects the admin instruction/rubric.
 
 QUESTION NUMBER: {question_number}
 FULL MARKS: {marks}
@@ -222,4 +216,4 @@ class SkillGeneratorAgent:
             from app.modules.skill_layer.service import get_active_skill_text
             return await get_active_skill_text(self.db, "SkillGeneratorAgent")
         except Exception:
-            return "Make guides concrete enough that a checker never has to guess; spell out acceptable Nepali phrasings and partial-credit thresholds."
+            return "Keep reference notes neutral, concise, and complete enough to judge any correct answer; never embed sample answers or mistake lists."

@@ -13,24 +13,71 @@ import {
   BarChart3,
   Settings,
   LogOut,
+  ChevronsUpDown,
 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { useExam } from "../context/ExamContext";
 
-const NAV_ITEMS = [
-  { to: "/admin/dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { to: "/admin/exams", label: "Exams", icon: GraduationCap },
-  { to: "/admin/syllabus", label: "Syllabus", icon: ListTree },
-  { to: "/admin/knowledge", label: "Knowledge", icon: BookOpen },
-  { to: "/admin/mcq", label: "MCQ System", icon: HelpCircle },
-  { to: "/admin/mcq-tests", label: "MCQ Tests", icon: FileText },
-  { to: "/admin/video-tutor", label: "Video Tutor", icon: Video },
-  { to: "/admin/subjective", label: "Subjective Tests", icon: FileCheck2 },
-  { to: "/admin/skill-layer", label: "Skill Layer", icon: SlidersHorizontal },
-  { to: "/admin/students", label: "Students", icon: Users },
-  { to: "/admin/analytics", label: "Analytics", icon: BarChart3 },
-  { to: "/admin/settings", label: "Settings", icon: Settings },
+type NavItem = { to: string; label: string; icon: typeof LayoutDashboard };
+type NavGroup = { label?: string; items: NavItem[] };
+
+const NAV_GROUPS: NavGroup[] = [
+  { items: [{ to: "/admin/dashboard", label: "Dashboard", icon: LayoutDashboard }] },
+  {
+    label: "Exam Setup",
+    items: [
+      { to: "/admin/exams", label: "Exams", icon: GraduationCap },
+      { to: "/admin/syllabus", label: "Syllabus", icon: ListTree },
+    ],
+  },
+  {
+    label: "Content",
+    items: [
+      { to: "/admin/knowledge", label: "Knowledge", icon: BookOpen },
+      { to: "/admin/mcq", label: "MCQ System", icon: HelpCircle },
+      { to: "/admin/mcq-tests", label: "MCQ Tests", icon: FileText },
+      { to: "/admin/subjective", label: "Subjective Tests", icon: FileCheck2 },
+      { to: "/admin/video-tutor", label: "Video Tutor", icon: Video },
+    ],
+  },
+  {
+    label: "People & Insights",
+    items: [
+      { to: "/admin/skill-layer", label: "Skill Layer", icon: SlidersHorizontal },
+      { to: "/admin/students", label: "Students", icon: Users },
+      { to: "/admin/analytics", label: "Analytics", icon: BarChart3 },
+    ],
+  },
 ];
+
+const SETTINGS_ITEM: NavItem = { to: "/admin/settings", label: "Settings", icon: Settings };
+
+function SidebarLink({ item }: { item: NavItem }) {
+  const Icon = item.icon;
+  return (
+    <NavLink
+      to={item.to}
+      className={({ isActive }) =>
+        `group flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors ${
+          isActive
+            ? "bg-brand-50 font-medium text-brand-700"
+            : "text-gray-600 hover:bg-gray-100 hover:text-gray-900"
+        }`
+      }
+    >
+      {({ isActive }) => (
+        <>
+          <Icon
+            className={`h-4 w-4 flex-shrink-0 ${
+              isActive ? "text-brand-600" : "text-gray-400 group-hover:text-gray-600"
+            }`}
+          />
+          {item.label}
+        </>
+      )}
+    </NavLink>
+  );
+}
 
 export function AdminLayout() {
   const { user, logout } = useAuth();
@@ -54,50 +101,41 @@ export function AdminLayout() {
       {/* Sidebar */}
       <aside className="flex w-60 flex-shrink-0 flex-col border-r border-gray-200 bg-white">
         {/* Logo */}
-        <div className="flex h-16 items-center gap-3 border-b border-gray-100 px-5">
-          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-brand-700 shadow-glow">
-            <span className="text-sm font-bold text-white">N</span>
+        <div className="flex h-14 items-center gap-2.5 border-b border-gray-200 px-4">
+          <div className="flex h-7 w-7 items-center justify-center rounded-md bg-brand-600">
+            <span className="text-sm font-semibold text-white">N</span>
           </div>
           <div className="leading-tight">
-            <div className="font-bold text-gray-900">NeuraFix AI</div>
-            <div className="text-[11px] font-medium text-gray-400">Learning Platform</div>
+            <div className="text-sm font-semibold text-gray-900">NeuraFix AI</div>
+            <div className="text-[11px] text-gray-400">Kirtipur Valley Institute</div>
           </div>
         </div>
 
         {/* Navigation */}
-        <nav className="flex-1 space-y-0.5 overflow-y-auto px-3 py-4 scrollbar-thin">
-          {NAV_ITEMS.map((item) => {
-            const Icon = item.icon;
-            return (
-              <NavLink
-                key={item.to}
-                to={item.to}
-                className={({ isActive }) =>
-                  `group relative flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition-all ${
-                    isActive
-                      ? "bg-brand-50 font-semibold text-brand-700"
-                      : "text-gray-600 hover:bg-gray-50 hover:text-gray-900"
-                  }`
-                }
-              >
-                {({ isActive }) => (
-                  <>
-                    {isActive && (
-                      <span className="absolute left-0 top-1/2 h-6 w-1 -translate-y-1/2 rounded-r-full bg-brand-500" />
-                    )}
-                    <Icon className={`h-[18px] w-[18px] ${isActive ? "text-brand-600" : "text-gray-400 group-hover:text-gray-600"}`} />
-                    {item.label}
-                  </>
-                )}
-              </NavLink>
-            );
-          })}
+        <nav className="flex-1 overflow-y-auto px-3 py-3 scrollbar-thin">
+          {NAV_GROUPS.map((group, i) => (
+            <div key={group.label ?? i} className={group.label ? "mt-1" : ""}>
+              {group.label && (
+                <div className="px-2.5 pb-1 pt-4 text-[11px] font-medium uppercase tracking-wider text-gray-400">
+                  {group.label}
+                </div>
+              )}
+              <div className="space-y-0.5">
+                {group.items.map((item) => (
+                  <SidebarLink key={item.to} item={item} />
+                ))}
+              </div>
+            </div>
+          ))}
         </nav>
 
-        {/* User footer */}
-        <div className="border-t border-gray-100 p-3">
-          <div className="flex items-center gap-3 rounded-xl px-2 py-2">
-            <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-brand-100 text-sm font-semibold text-brand-700">
+        {/* Settings + user footer */}
+        <div className="border-t border-gray-200 p-3">
+          <div className="mb-2">
+            <SidebarLink item={SETTINGS_ITEM} />
+          </div>
+          <div className="flex items-center gap-2.5 rounded-md px-2 py-1.5">
+            <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full bg-brand-50 text-xs font-semibold text-brand-700">
               {initials}
             </div>
             <div className="min-w-0 flex-1">
@@ -106,11 +144,11 @@ export function AdminLayout() {
             </div>
             <button
               onClick={handleLogout}
-              className="rounded-lg p-1.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-danger-600"
+              className="rounded-md p-1.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-danger-600"
               aria-label="Sign out"
               title="Sign out"
             >
-              <LogOut className="h-[18px] w-[18px]" />
+              <LogOut className="h-4 w-4" />
             </button>
           </div>
         </div>
@@ -119,32 +157,26 @@ export function AdminLayout() {
       {/* Main content */}
       <div className="flex flex-1 flex-col overflow-hidden">
         {/* Top bar */}
-        <header className="flex h-16 flex-shrink-0 items-center justify-between border-b border-gray-200 bg-white/80 px-6 backdrop-blur-sm">
-          <div className="text-sm font-medium text-gray-600">
-            Welcome back, <span className="font-semibold text-gray-900">{user?.full_name}</span>
+        <header className="flex h-14 flex-shrink-0 items-center justify-end gap-3 border-b border-gray-200 bg-white px-6">
+          {/* Active exam — the universal scope for every admin workspace. */}
+          <div className="relative inline-flex h-8 items-center gap-2 rounded-md border border-gray-300 bg-white pl-2.5 pr-2 text-sm focus-within:border-brand-600 focus-within:ring-2 focus-within:ring-brand-600/20">
+            <GraduationCap className="h-4 w-4 flex-shrink-0 text-gray-400" />
+            <select
+              value={selectedExamId ?? ""}
+              onChange={(e) => setSelectedExamId(e.target.value)}
+              className="cursor-pointer appearance-none bg-transparent pr-5 text-sm font-medium text-gray-700 focus:outline-none"
+              title="Active exam"
+            >
+              {exams.length === 0 && <option value="">No exams — create one</option>}
+              {exams.map((e) => (
+                <option key={e.id} value={e.id}>
+                  {e.name} ({e.exam_type})
+                </option>
+              ))}
+            </select>
+            <ChevronsUpDown className="pointer-events-none absolute right-2 h-3.5 w-3.5 text-gray-400" />
           </div>
-          <div className="flex items-center gap-3">
-            {/* Active exam — the universal scope for every admin workspace. */}
-            <div className="flex items-center gap-2">
-              <GraduationCap className="h-4 w-4 text-gray-400" />
-              <select
-                value={selectedExamId ?? ""}
-                onChange={(e) => setSelectedExamId(e.target.value)}
-                className="cursor-pointer rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-xs font-medium text-gray-700 focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-100"
-                title="Active exam"
-              >
-                {exams.length === 0 && <option value="">No exams — create one</option>}
-                {exams.map((e) => (
-                  <option key={e.id} value={e.id}>
-                    {e.name} ({e.exam_type})
-                  </option>
-                ))}
-              </select>
-            </div>
-            <span className="rounded-full bg-brand-50 px-3 py-1 text-xs font-semibold text-brand-700 ring-1 ring-brand-100">
-              Institute Admin
-            </span>
-          </div>
+          <span className="text-xs font-medium text-gray-500">Institute Admin</span>
         </header>
 
         <main className="flex-1 overflow-y-auto p-6 scrollbar-thin">

@@ -64,6 +64,21 @@ async def get_history(db: AsyncSession, student_id: uuid.UUID, session_id: uuid.
     return list(r.scalars().all())
 
 
+async def get_history_by_exam(
+    db: AsyncSession, student_id: uuid.UUID, exam_id: uuid.UUID,
+) -> list[TutorChatMessage]:
+    """All of this student's tutor turns for the exam, merged across sessions
+    (mirrors the video tutor's per-video history) so re-opening the AI Tutor page
+    shows the full prior conversation instead of starting blank."""
+    r = await db.execute(
+        select(TutorChatMessage)
+        .join(TutorChatSession, TutorChatSession.id == TutorChatMessage.session_id)
+        .where(TutorChatSession.exam_id == exam_id, TutorChatMessage.student_id == student_id)
+        .order_by(TutorChatMessage.created_at.asc())
+    )
+    return list(r.scalars().all())
+
+
 async def _recent_history_text(db: AsyncSession, session_id: uuid.UUID) -> str:
     r = await db.execute(
         select(TutorChatMessage)
