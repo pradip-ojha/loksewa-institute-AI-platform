@@ -19,12 +19,6 @@ class Settings(BaseSettings):
     # local runs convenient.
     ENVIRONMENT: str = "development"
 
-    # TEMPORARY DEBUG: when true, the knowledge ingestion pipeline dumps each stage's
-    # output (raw OCR text, sections, raw extraction JSON, final chunks) to
-    # backend/debug_dumps/<document_id>/. Set KNOWLEDGE_DEBUG_DUMP=1 in backend/.env.
-    # Remove this field once the model_qa ingestion issue is diagnosed.
-    KNOWLEDGE_DEBUG_DUMP: bool = False
-
     # Database
     # Either set DATABASE_URL directly (asyncpg driver), or provide the discrete
     # PG* components below (e.g. Azure Postgres connection info) and DATABASE_URL

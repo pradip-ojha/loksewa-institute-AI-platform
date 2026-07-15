@@ -20,7 +20,6 @@ class TutorAskResponse(BaseModel):
     answer: str
     language: str
     chat_session_id: uuid.UUID
-    related_mode: str | None = None
     detected_topic: str | None = None
     detected_subtopic_ids: list[str] = []
     supporting_knowledge_used: list[SupportingKnowledge] = []
@@ -35,7 +34,6 @@ class TutorChatMessageOut(BaseModel):
     question: str
     answer: str
     language: str | None = None
-    related_mode: str | None = None
     detected_topic: str | None = None
     follow_up_suggestions: list[str] = []
     created_at: datetime

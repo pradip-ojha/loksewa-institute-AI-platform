@@ -1,6 +1,8 @@
 // Shared NDJSON streaming client. axios can't expose a streaming response body in
 // the browser, so streamed tutor endpoints use native fetch + ReadableStream and
 // parse one JSON event per line ({type: "meta"|"delta"|"done"|"error", ...}).
+// The server may emit {type: "ping"} keep-alives before meta (ignored below) so the
+// idle timer isn't tripped by slow pre-answer routing.
 
 const API_BASE = (import.meta.env.VITE_API_URL as string | undefined) ?? "http://localhost:8000";
 

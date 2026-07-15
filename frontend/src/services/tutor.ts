@@ -11,7 +11,6 @@ export interface TutorAskResponse {
   answer: string;
   language: string;
   chat_session_id: string;
-  related_mode: string | null;
   detected_topic: string | null;
   detected_subtopic_ids: string[];
   supporting_knowledge_used: SupportingKnowledge[];
@@ -32,7 +31,6 @@ export interface TutorHistoryItem {
   question: string;
   answer: string;
   language: string | null;
-  related_mode: string | null;
   detected_topic: string | null;
   follow_up_suggestions: string[];
   created_at: string;

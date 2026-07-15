@@ -71,6 +71,10 @@ SELECTED LECTURE SEGMENT(S):
 APPROVED KNOWLEDGE CHUNKS (secondary support; may be 'none'):
 {knowledge}
 
+CONVERSATION SO FAR (this video's chat session — use it to resolve follow-ups like
+"explain that again" or pronouns referring to a previous answer; may be 'none'):
+{history}
+
 STUDENT QUESTION:
 {question}
 """
@@ -101,7 +105,7 @@ class VideoTutorAgent:
         self.db = db
         self.provider = get_provider("reasoning")
 
-    async def answer(self, *, question: str, lecture_summary: str, segment_content: str, knowledge_text: str, video_id: uuid.UUID, personalization: str = "") -> dict:
+    async def answer(self, *, question: str, lecture_summary: str, segment_content: str, knowledge_text: str, video_id: uuid.UUID, personalization: str = "", history: str = "") -> dict:
         skill = await self._get_skill()
         prompt = TUTOR_PROMPT.format(
             skill_instructions=skill,
@@ -109,6 +113,7 @@ class VideoTutorAgent:
             lecture_summary=lecture_summary[:10000],
             segment_content=segment_content[:30000],
             knowledge=knowledge_text[:12000] or "none",
+            history=history[:6000] or "none",
             question=question[:2000],
         )
         audit_ctx = {
@@ -132,7 +137,7 @@ class VideoTutorAgent:
             "follow_up_suggestions": [str(s) for s in fu][:4] if isinstance(fu, list) else [],
         }
 
-    async def answer_stream(self, *, question: str, lecture_summary: str, segment_content: str, knowledge_text: str, video_id: uuid.UUID, personalization: str = "", meta_sink: dict):
+    async def answer_stream(self, *, question: str, lecture_summary: str, segment_content: str, knowledge_text: str, video_id: uuid.UUID, personalization: str = "", history: str = "", meta_sink: dict):
         """Stream the answer markdown as plain-text deltas; parsed metadata
         (follow_up_suggestions / language / confidence) lands in ``meta_sink``."""
         from app.ai.agents.streaming import stream_answer_with_meta
@@ -144,6 +149,7 @@ class VideoTutorAgent:
             lecture_summary=lecture_summary[:10000],
             segment_content=segment_content[:30000],
             knowledge=knowledge_text[:12000] or "none",
+            history=history[:6000] or "none",
             question=question[:2000],
         )
         audit_ctx = {

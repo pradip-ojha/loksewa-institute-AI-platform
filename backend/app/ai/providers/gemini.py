@@ -164,7 +164,7 @@ def _loads_lenient(cleaned: str) -> dict | None:
 
 
 def _parse_json(text: str, *, agent_type: str | None, task_type: str | None,
-                finish_reason: str | None = None) -> dict:
+                finish_reason: str | None = None, list_key: str | None = None) -> dict:
     cleaned = _strip_code_fences(text)
     if not cleaned:
         raise AIResponseError(
@@ -185,6 +185,14 @@ def _parse_json(text: str, *, agent_type: str | None, task_type: str | None,
             raise AIResponseError(f"invalid JSON in Gemini response: {exc}") from exc
         logger.warning("Gemini JSON recovered via lenient parse (agent=%s task=%s finish_reason=%s)",
                        agent_type, task_type, finish_reason)
+    # A fallback model sometimes drops the wrapper and returns a BARE ARRAY (valid JSON,
+    # but not the expected object — the "Gemini JSON was not an object" failure). When the
+    # caller names the wrapper key it expects (e.g. "answers"/"blocks"), wrap the list back
+    # into that object instead of failing the whole call.
+    if isinstance(data, list) and list_key:
+        logger.warning("Gemini returned a bare array (agent=%s task=%s) — wrapping under %r",
+                       agent_type, task_type, list_key)
+        data = {list_key: data}
     if not isinstance(data, dict):
         raise AIResponseError("Gemini JSON was not an object")
     return data
@@ -468,7 +476,8 @@ def _finish_reason(response) -> str | None:
 
 
 class GeminiProvider(AIModelProvider):
-    async def _run(self, contents, schema: dict | None, audit_ctx: dict | None) -> dict:
+    async def _run(self, contents, schema: dict | None, audit_ctx: dict | None,
+                   list_key: str | None = None) -> dict:
         t0 = time.monotonic()
         try:
             response, model_used = await _generate_content_with_retry(contents=contents)
@@ -490,33 +499,36 @@ class GeminiProvider(AIModelProvider):
         if schema is not None:
             return _parse_json(text, agent_type=(audit_ctx or {}).get("agent_type"),
                                task_type=(audit_ctx or {}).get("task_type"),
-                               finish_reason=_finish_reason(response))
+                               finish_reason=_finish_reason(response), list_key=list_key)
         return {"text": text}
 
     async def _vision(self, prompt: str, image_bytes: bytes, mime_type: str,
-                      schema: dict | None, audit_ctx: dict | None) -> dict:
+                      schema: dict | None, audit_ctx: dict | None,
+                      list_key: str | None = None) -> dict:
         from google.genai import types
 
         contents = [
             types.Part.from_bytes(data=image_bytes, mime_type=mime_type or "image/png"),
             prompt,
         ]
-        return await self._run(contents, schema, audit_ctx)
+        return await self._run(contents, schema, audit_ctx, list_key=list_key)
 
     async def generate_with_image(self, prompt: str, image_bytes: bytes,
-                                  schema: dict | None = None, audit_ctx: dict | None = None) -> dict:
-        return await self._vision(prompt, image_bytes, "image/png", schema, audit_ctx)
+                                  schema: dict | None = None, audit_ctx: dict | None = None,
+                                  list_key: str | None = None) -> dict:
+        return await self._vision(prompt, image_bytes, "image/png", schema, audit_ctx, list_key=list_key)
 
     async def generate_with_images(self, prompt: str, images: list[bytes],
                                    schema: dict | None = None, audit_ctx: dict | None = None,
-                                   mime_type: str = "image/png") -> dict:
+                                   mime_type: str = "image/png", list_key: str | None = None) -> dict:
         """Vision over MULTIPLE images in one call (e.g. the whole-sheet structure pass).
-        Not part of the base interface — only the Gemini vision provider supports it."""
+        Not part of the base interface — only the Gemini vision provider supports it.
+        `list_key`: if the model returns a bare array, wrap it under this key (see _parse_json)."""
         from google.genai import types
 
         contents = [types.Part.from_bytes(data=b, mime_type=mime_type) for b in images]
         contents.append(prompt)
-        return await self._run(contents, schema, audit_ctx)
+        return await self._run(contents, schema, audit_ctx, list_key=list_key)
 
     async def generate_with_file(self, prompt: str, file_bytes: bytes, mime_type: str,
                                  schema: dict | None = None, audit_ctx: dict | None = None) -> dict:

@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import re
@@ -26,30 +25,6 @@ from app.modules.knowledge.models import KnowledgeChunk, KnowledgeDocument
 from app.modules.exams.models import Exam
 
 logger = logging.getLogger(__name__)
-
-# ── TEMPORARY DEBUG INSTRUMENTATION ────────────────────────────────────────
-# Dumps each stage of knowledge ingestion (raw OCR text, section boundaries,
-# raw AI extraction JSON, final chunks) to files so a bad model_qa run can be
-# inspected step-by-step. Enable by setting KNOWLEDGE_DEBUG_DUMP=1 in backend/.env
-# (read via Settings, since pydantic-settings loads .env into the config object,
-# NOT into os.environ); files land under backend/debug_dumps/<document_id>/.
-# REMOVE THIS BLOCK (and its call sites) once the model_qa issue is diagnosed.
-_DEBUG_DIR = Path(__file__).resolve().parents[3] / "debug_dumps"
-
-
-def _debug_dump(document_id: str, filename: str, content: str) -> None:
-    """Best-effort write of a pipeline-stage artifact for debugging. Never raises."""
-    from app.core.config import get_settings
-
-    if not get_settings().KNOWLEDGE_DEBUG_DUMP:
-        return
-    try:
-        out_dir = _DEBUG_DIR / str(document_id)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / filename).write_text(content, encoding="utf-8")
-        logger.info("[DEBUG DUMP] wrote %s", out_dir / filename)
-    except Exception as exc:  # pragma: no cover - debug only
-        logger.warning("[DEBUG DUMP] failed to write %s: %s", filename, exc)
 
 # Connection-level errors that mean "the DB connection died" rather than "the SQL
 # was wrong". On a flaky network a pooled asyncpg connection can be dropped by the
@@ -297,9 +272,10 @@ def _classify_page_text(text: str) -> str:
 # Rationale: the source documents are all either scanned or written in legacy Nepali
 # fonts (Preeti/Kantipur), whose PDF text layer is unusable ASCII garbage even when the
 # page "parses". Re-OCR'ing every page is the safe default for this corpus. The
-# per-page classification below is still computed — it drives the fallback chain
-# (Preeti-decode / raw text) when a vision call fails. Flip this to False to restore
-# the cost-saving behavior that trusts clean Unicode text layers.
+# per-page classification below is still computed but only annotates logs — a failed
+# vision region is retried then skipped (never backfilled from the raw text layer).
+# Flip this to False to restore the cost-saving behavior that trusts clean Unicode
+# text layers.
 FORCE_OCR_ALL_PAGES = True
 
 
@@ -877,10 +853,6 @@ class KnowledgeProcessingAgent:
                     "and that the vision model deployment supports image inputs."
                 )
 
-            # [DEBUG] Stage 2 — full transcribed text as it leaves OCR (before any
-            # sectioning/extraction). Compare against the source PDF to spot rephrasing.
-            _debug_dump(document_id, "01_raw_ocr.txt", raw_text)
-
             # `model_qa` documents (question papers with model answers) are split STRUCTURALLY on
             # question-number markers — cut between whole Q&A pairs, zero overlap (no pair straddles
             # a boundary → no lost/duplicated pairs). Prose keeps the paragraph-split + ~20% overlap.
@@ -891,18 +863,6 @@ class KnowledgeProcessingAgent:
                 else _split_into_sections(raw_text, max_chars=8000)
             )
 
-            # [DEBUG] Stage 3 — how the raw text was split into sections. For model_qa these are
-            # NON-overlapping, cut on question boundaries; for prose they overlap by ~20% (a prose
-            # concept straddling a boundary is recovered from the next section's overlap). Each
-            # section is delimited with its index + char count.
-            _debug_dump(
-                document_id,
-                "02_sections.txt",
-                "\n".join(
-                    f"\n{'=' * 70}\n=== SECTION {i} ({len(s)} chars) ===\n{'=' * 70}\n{s}"
-                    for i, s in enumerate(sections)
-                ),
-            )
             # Semantic chunking tier is configurable via settings.CHUNKING_MODEL_TIER
             # (.env): default gpt-5 ("thinking") for best Nepali segmentation/verbatim
             # fidelity since chunking is a one-time per-document cost, or gpt-5-mini
@@ -937,14 +897,6 @@ class KnowledgeProcessingAgent:
                             "subtopic": doc_subtopic or None,
                             "language": "nepali_english_mixed",
                         }]
-                    # [DEBUG] Stage 4 — raw model output for THIS section (includes the
-                    # leading `section_analysis` with `form`/`chapters_involved` and every
-                    # chunk's assigned chapter/topic before syllabus validation).
-                    _debug_dump(
-                        document_id,
-                        f"03_extract_section_{i:02d}_raw.json",
-                        json.dumps(result_json, ensure_ascii=False, indent=2),
-                    )
                     # Preferred shape: {"section_analysis": {...}, "chunks": [...]}. Fall back to
                     # a bare array or any dict-with-list-value so a model that omits the wrapper
                     # (or emits the old shape) still works.
@@ -979,16 +931,7 @@ class KnowledgeProcessingAgent:
                         result_json = await provider.generate_text(prompt, schema={"type": "object"})
                     except Exception as exc:
                         logger.warning("AI Q&A extraction failed for section %d: %s", i, exc)
-                        _debug_dump(document_id, f"03_extract_section_{i:02d}_ERROR.txt", str(exc))
                         return []
-                    # [DEBUG] Stage 4 — raw model output for THIS section, before any
-                    # filtering. Shows exactly what the extractor returned (rephrased text,
-                    # dropped/partial pairs, missing question fields) per section.
-                    _debug_dump(
-                        document_id,
-                        f"03_extract_section_{i:02d}_raw.json",
-                        json.dumps(result_json, ensure_ascii=False, indent=2),
-                    )
                     pairs = result_json.get("pairs") if isinstance(result_json, dict) else None
                     if not isinstance(pairs, list):
                         return []
@@ -1020,6 +963,17 @@ class KnowledgeProcessingAgent:
             )
             all_chunks: list[dict] = [chunk for sr in section_results for chunk in sr]
 
+            # Zero-chunk guard: OCR produced text but no usable chunks came out of
+            # chunking / Q&A-pair extraction. Fail honestly — a document marked
+            # 'completed' with chunk_count=0 would look ingested while contributing
+            # nothing to retrieval (silent green failure).
+            if not all_chunks:
+                raise RuntimeError(
+                    "Text was extracted but no knowledge chunks could be produced "
+                    f"({'Q&A pair extraction' if is_model_qa else 'semantic chunking'} "
+                    "returned nothing). Check the document type/format and retry."
+                )
+
             await _step(JobStatus.processing, 55, f"Embedding {len(all_chunks)} chunks…")
 
             # Post-validate every chunk's AI-assigned (chapter, topic, subtopic) against the
@@ -1041,16 +995,6 @@ class KnowledgeProcessingAgent:
                 _c["topic"] = _t
                 _c["subtopic"] = _sub
                 _c["chapter"] = _ch
-
-            # [DEBUG] Stage 5 — the final chunk set after syllabus validation, exactly as it
-            # will be embedded/saved. For model_qa: `question` + `embed_text` (what gets
-            # embedded) + `content` (the answer stored in knowledge_chunks). This is where you
-            # confirm whether each chunk is a COMPLETE question with its question preserved.
-            _debug_dump(
-                document_id,
-                "04_final_chunks.json",
-                json.dumps(all_chunks, ensure_ascii=False, indent=2),
-            )
 
             # For model_qa chunks embed question+answer (embed_text) so retrieval matches on the
             # question; prose chunks have no embed_text and embed their content as before.

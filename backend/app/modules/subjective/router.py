@@ -338,6 +338,13 @@ async def student_get_test(
         if not t or not existing:
             raise AppException(404, "not_found", "Test is not available.")
     sheet = await svc.get_latest_sheet(db, test_id, current_user.id)
+    if sheet is None:
+        # Enrollment is an access boundary, not just a listing filter — without it any
+        # student with the test UUID could read the question-paper signed URL for an
+        # exam they aren't enrolled in. A student with an existing sheet keeps access
+        # to their own work even if later un-enrolled.
+        from app.modules.exams.service import ensure_enrolled
+        await ensure_enrolled(db, student_id=current_user.id, exam_id=t.exam_id)
     return StudentTestDetailOut(
         test_id=t.id,
         display_name=t.display_name,
@@ -361,6 +368,9 @@ async def upload_answer(
     t = await svc.get_test(db, test_id)
     if not t or t.status != "active":
         raise AppException(404, "not_found", "Test is not available.")
+    # A new submission consumes the full AI checking pipeline — enrolled students only.
+    from app.modules.exams.service import ensure_enrolled
+    await ensure_enrolled(db, student_id=current_user.id, exam_id=t.exam_id)
 
     previous = await svc.get_latest_sheet(db, test_id, current_user.id)
     if previous:

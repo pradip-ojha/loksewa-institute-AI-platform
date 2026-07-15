@@ -386,6 +386,8 @@ function TutorTab({
     setTurns((t) => [...t, { question: text, loading: true }]);
     const controller = new AbortController();
     abortRef.current = controller;
+    let streamed = false;
+    let failedMsg: string | null = null;
     try {
     await videoTutorService.askStream(
       videoId,
@@ -397,6 +399,7 @@ function TutorTab({
           setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, segments: segs } : turn)));
         },
         onDelta: (delta) => {
+          streamed = true;
           setTurns((t) =>
             t.map((turn, i) =>
               i === idx ? { ...turn, loading: false, answer: (turn.answer ?? "") + delta } : turn,
@@ -413,11 +416,45 @@ function TutorTab({
           );
         },
         onError: (message) => {
-          setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, error: message } : turn)));
+          failedMsg = message;
         },
       },
       controller.signal,
     );
+    // Stream failed before any answer text arrived → retry once via the plain
+    // (non-stream) endpoint before surfacing the error.
+    if (failedMsg !== null) {
+      if (!streamed && !controller.signal.aborted) {
+        try {
+          const res = await videoTutorService.ask(videoId, {
+            question: text,
+            current_video_time: getCurrentTime(),
+            chat_session_id: sessionId,
+          });
+          setSessionId(res.chat_session_id);
+          setTurns((t) =>
+            t.map((turn, i) =>
+              i === idx
+                ? {
+                    ...turn,
+                    loading: false,
+                    answer: res.answer,
+                    segments: res.selected_segments ?? [],
+                    followUps: res.follow_up_suggestions ?? [],
+                  }
+                : turn,
+            ),
+          );
+          failedMsg = null;
+        } catch {
+          /* fall through to the stream's error message */
+        }
+      }
+      if (failedMsg !== null) {
+        const message = failedMsg;
+        setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, error: message } : turn)));
+      }
+    }
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
       setBusy(false);

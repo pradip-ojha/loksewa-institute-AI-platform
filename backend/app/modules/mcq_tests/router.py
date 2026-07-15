@@ -271,6 +271,12 @@ async def start_test(
     # already-started attempt even if the admin later deactivated the set.
     if not existing and s.status != "active":
         raise AppException(404, "not_found", "Test is not available.")
+    if not existing:
+        # Enrollment is an access boundary, not just a listing filter — a NEW attempt
+        # requires enrollment in the set's exam (an existing attempt stays resumable,
+        # matching the deactivated-set resume rule above).
+        from app.modules.exams.service import ensure_enrolled
+        await ensure_enrolled(db, student_id=current_user.id, exam_id=s.exam_id)
 
     # Race-safe: concurrent/duplicate start requests resume the same attempt
     # instead of violating the unique constraint and 500ing.

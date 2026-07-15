@@ -280,6 +280,27 @@ async def get_chat_history(db: AsyncSession, video_id: uuid.UUID, student_id: uu
     return list(r.scalars().all())
 
 
+# In-session conversational memory for the answer agent (mirrors the main tutor's
+# _recent_history_text) so follow-ups like "explain that again" have prior-turn context.
+MAX_VIDEO_CHAT_HISTORY = 6
+
+
+async def _recent_history_text(db: AsyncSession, session_id: uuid.UUID) -> str:
+    r = await db.execute(
+        select(VideoChatMessage)
+        .where(VideoChatMessage.session_id == session_id)
+        .order_by(VideoChatMessage.created_at.desc())
+        .limit(MAX_VIDEO_CHAT_HISTORY)
+    )
+    msgs = list(r.scalars().all())[::-1]
+    parts: list[str] = []
+    for m in msgs:
+        parts.append(f"STUDENT: {m.question}")
+        if m.answer:
+            parts.append(f"TUTOR: {m.answer}")
+    return "\n".join(parts)
+
+
 # ── Syllabus tree (per exam) ──────────────────────────────────────────────────
 
 async def get_chapter_tree(
@@ -451,9 +472,10 @@ async def _prepare_qa_turn(
             topic=detected_topic, subtopic_ids=detected_subtopics, question=question,
         )
 
-    # ── Step 5 prefix: personalization context (the answer itself runs in the caller) ─
+    # ── Step 5 prefix: personalization + in-session history (the answer itself runs in the caller) ─
     from app.modules.personalization import service as pers
     personalization = await pers.build_video_tutor_context(db, session.student_id)
+    history_text = await _recent_history_text(db, session.id)
 
     selected_out = [{
         "segment_id": _seg_id(s.segment_index),
@@ -472,6 +494,7 @@ async def _prepare_qa_turn(
         "detected_subtopics": detected_subtopics,
         "selected_out": selected_out,
         "personalization": personalization,
+        "history_text": history_text,
     }
 
 
@@ -525,7 +548,7 @@ async def run_qa_chain(
     answer = await VideoTutorAgent(db).answer(
         question=question, lecture_summary=prep["lecture_summary_text"],
         segment_content=prep["segment_content"], knowledge_text=prep["knowledge_text"],
-        video_id=video.id, personalization=prep["personalization"],
+        video_id=video.id, personalization=prep["personalization"], history=prep["history_text"],
     )
 
     await _persist_qa_turn(
@@ -556,6 +579,10 @@ async def run_qa_chain_stream(
     then a ``done`` event with follow-ups once persisted. Errors yield an ``error`` event."""
     from app.ai.agents.video_tutor_agent import VideoTutorAgent
 
+    # First byte immediately: segment/topic routing below runs two model calls before
+    # the meta event, and the frontend aborts the stream after 60s of silence.
+    yield {"type": "ping"}
+
     prep = await _prepare_qa_turn(db, video=video, question=question, current_video_time=current_video_time, session=session)
 
     yield {
@@ -572,7 +599,8 @@ async def run_qa_chain_stream(
     async for delta in VideoTutorAgent(db).answer_stream(
         question=question, lecture_summary=prep["lecture_summary_text"],
         segment_content=prep["segment_content"], knowledge_text=prep["knowledge_text"],
-        video_id=video.id, personalization=prep["personalization"], meta_sink=meta_sink,
+        video_id=video.id, personalization=prep["personalization"], history=prep["history_text"],
+        meta_sink=meta_sink,
     ):
         parts.append(delta)
         yield {"type": "delta", "text": delta}

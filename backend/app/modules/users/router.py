@@ -103,7 +103,8 @@ async def create_student(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    existing = await db.execute(select(User).where(User.email == payload.email))
+    email = payload.email.strip().lower()
+    existing = await db.execute(select(User).where(func.lower(User.email) == email))
     if existing.scalar_one_or_none():
         raise AppException(409, "email_taken", "A user with this email already exists.")
     if len(payload.password) < 6:
@@ -111,7 +112,7 @@ async def create_student(
 
     student = User(
         full_name=payload.full_name,
-        email=payload.email,
+        email=email,
         password_hash=hash_password(payload.password),
         phone=payload.phone,
         role=UserRole.student,
@@ -257,11 +258,12 @@ async def change_admin_email(
     # Require the current password to change the login email (security-sensitive).
     if not verify_password(payload.current_password, current_admin.password_hash):
         raise AppException(400, "wrong_password", "Current password is incorrect.")
-    new_email = payload.new_email.strip()
-    if new_email == current_admin.email:
+    new_email = payload.new_email.strip().lower()
+    if new_email == current_admin.email.lower():
         raise AppException(422, "same_email", "The new email is the same as the current one.")
     existing = await db.execute(
-        select(User).where(User.email.ilike(new_email), User.id != current_admin.id)
+        # func.lower ==, not ilike — a legitimate '_' in an email is an ilike wildcard.
+        select(User).where(func.lower(User.email) == new_email, User.id != current_admin.id)
     )
     if existing.scalar_one_or_none():
         raise AppException(409, "email_taken", "A user with this email already exists.")

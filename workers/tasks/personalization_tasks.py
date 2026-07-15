@@ -12,6 +12,7 @@ Triggers:
   • pers_nightly_compress    — beat: expire prior-day raw activity detail
   • pers_weekly              — beat: weekly summary + intro refresh for active students
 """
+import asyncio
 import logging
 import uuid
 
@@ -20,15 +21,25 @@ from workers.runtime import get_loop, run_async
 
 logger = logging.getLogger(__name__)
 
+# Bound on waiting for a roll-up submitted to an already-running loop. Generous —
+# the weekly refresh makes one AI call per student. On timeout only the WAIT is
+# abandoned; the coroutine itself keeps running on the loop.
+_PERS_WAIT_SECONDS = 600
+
 
 def _run(coro_factory) -> None:
-    """Run a best-effort personalization coroutine on the persistent loop, skipping
-    the tick if the loop is busy with another task (the nightly/weekly beat will catch up)."""
-    if get_loop().is_running():
-        logger.info("worker loop busy; skipping personalization tick")
-        return
+    """Run a best-effort personalization coroutine on the persistent loop.
+
+    If the loop is already running (another thread is driving it), submit the
+    coroutine thread-safely and wait bounded instead of dropping the tick — the old
+    unconditional skip silently lost per-turn/per-activity roll-ups under load, so
+    summaries drifted stale until the nightly beat."""
     try:
-        run_async(coro_factory())
+        loop = get_loop()
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(coro_factory(), loop).result(timeout=_PERS_WAIT_SECONDS)
+        else:
+            run_async(coro_factory())
     except Exception as exc:  # never let personalization crash a worker
         logger.warning("personalization task failed: %s", exc)
 

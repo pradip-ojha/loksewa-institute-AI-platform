@@ -431,6 +431,13 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
             sheet = (await db.execute(select(StudentAnswerSheet).where(StudentAnswerSheet.id == sid))).scalar_one_or_none()
             if not sheet:
                 raise ValueError(f"StudentAnswerSheet {sheet_id} not found")
+            if sheet.current_status == "checked":
+                # This sheet already settled fully (results + checked PDF). A retry can
+                # land here when only the final job-completion write failed after the
+                # sheet was done — re-running every AI phase would only re-spend.
+                await update_job(db, jid, status=JobStatus.completed, progress=100,
+                                 step="Sheet already checked — nothing to redo")
+                return
             test = (await db.execute(select(SubjectiveTest).where(SubjectiveTest.id == sheet.test_id))).scalar_one()
             questions = await svc.get_test_questions(db, test.id)
             file_record = (await db.execute(select(File).where(File.id == sheet.file_id))).scalar_one_or_none()

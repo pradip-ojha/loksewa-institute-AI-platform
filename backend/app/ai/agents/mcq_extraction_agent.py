@@ -118,6 +118,51 @@ def _require_questions_list(result: object) -> list:
     return questions
 
 
+def _align_replacements(
+    rejected_ids: list, questions_data: list,
+) -> tuple[list[tuple], list[str]]:
+    """Match regenerated replacements to the rejected questions they fix.
+
+    Primary key is the echoed "replaces_ref" ("R<n>", 1-based over the prompt order).
+    Positional order is trusted ONLY when no item echoed a ref AND the counts match
+    exactly — a count/order mismatch must never silently overwrite the wrong question.
+    Returns (matched [(question_id, payload)], skip_reasons).
+    """
+    skipped: list[str] = []
+    ref_to_qid = {f"R{i + 1}": qid for i, qid in enumerate(rejected_ids)}
+
+    refs: list[str | None] = []
+    for item in questions_data:
+        ref = item.get("replaces_ref") if isinstance(item, dict) else None
+        refs.append(str(ref).strip().upper() if isinstance(ref, (str, int)) and str(ref).strip() else None)
+
+    if not any(refs):
+        if len(questions_data) == len(rejected_ids):
+            return list(zip(rejected_ids, questions_data)), skipped
+        skipped.append(
+            f"no replaces_ref echoed and count mismatch ({len(questions_data)} returned "
+            f"for {len(rejected_ids)} rejected) — cannot align safely"
+        )
+        return [], skipped
+
+    matched: list[tuple] = []
+    seen: set[str] = set()
+    for ref, item in zip(refs, questions_data):
+        if ref is None:
+            skipped.append("replacement missing replaces_ref")
+            continue
+        qid = ref_to_qid.get(ref)
+        if qid is None:
+            skipped.append(f"unknown replaces_ref '{ref}'")
+            continue
+        if ref in seen:
+            skipped.append(f"duplicate replaces_ref '{ref}'")
+            continue
+        seen.add(ref)
+        matched.append((qid, item))
+    return matched, skipped
+
+
 def _normalize_question(q_data: object) -> tuple[dict | None, str | None]:
     """Validate and normalize one question entry.
 
@@ -453,6 +498,9 @@ HARD RULES (never violate):
   document/passage/text/material. Write direct standalone exam questions.
 - Exactly 4 options (A, B, C, D), one correct, with a clear explanation. Do NOT reuse a rejected
   question's wording.
+- Produce EXACTLY ONE replacement per rejected question, and echo that question's "Ref" code
+  (e.g. "R1") verbatim in the replacement's "replaces_ref" field — never invent, merge, or reuse
+  a Ref.
 
 DISTRACTOR DESIGN (critical to quality):
 - The 3 wrong options must be EXPERT TRAPS like a human Loksewa paper-setter writes — same TYPE,
@@ -499,6 +547,7 @@ Return ONLY valid JSON in exactly this structure — options MUST be a list, nev
 {{
   "questions": [
     {{
+      "replaces_ref": "R1",
       "question_text": "...",
       "options": [
         {{"id": "A", "label": "A", "text": "..."}},
@@ -951,8 +1000,11 @@ class MCQRegenerationAgent:
             skill_instructions = await self._get_skill(db)
 
         rejected_text = ""
-        for q in rejected:
-            rejected_text += f"Question: {q['question_text']}\nTopic: {q['topic']}\nFeedback: {q['review_feedback']}\n\n"
+        for i, q in enumerate(rejected):
+            rejected_text += (
+                f"Ref: R{i + 1}\nQuestion: {q['question_text']}\nTopic: {q['topic']}\n"
+                f"Feedback: {q['review_feedback']}\n\n"
+            )
 
         await _job(progress=55, step="Regenerating with AI")
         prompt = REGENERATION_PROMPT.format(
@@ -985,10 +1037,10 @@ class MCQRegenerationAgent:
                 select(MCQQuestion).where(MCQQuestion.id.in_(rejected_ids))
             )).scalars().all()}
 
+            aligned, skipped = _align_replacements(rejected_ids, questions_data)
             replaced = 0
-            skipped: list[str] = []
             replaced_questions: list = []
-            for qid, new_q_data in zip(rejected_ids, questions_data):
+            for qid, new_q_data in aligned:
                 old_q = rows_by_id.get(qid)
                 if old_q is None:
                     continue

@@ -25,9 +25,17 @@ def client_ip_key(request: Request) -> str:
 def user_or_ip_key(request: Request) -> str:
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
-        # The access token identifies the user for its lifetime; truncate to keep the
-        # rate-limit key bounded. Falls back to IP for any unauthenticated reach.
-        return auth[7:][:64]
+        # Key on the signature-verified user id — a raw token prefix is mostly the
+        # constant JWT header, so prefixes could collide across users (shared bucket).
+        # Cheap (no DB); an invalid/expired token falls through to the IP key.
+        from app.core.security import decode_token
+
+        try:
+            sub = decode_token(auth[7:]).get("sub")
+            if sub:
+                return f"user:{sub}"
+        except Exception:
+            pass
     return get_remote_address(request)
 
 

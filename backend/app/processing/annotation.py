@@ -100,7 +100,7 @@ def _draw_note_card(
     avail_w = min(avail_w, W - x1 - 6)
 
     ink = text_render.render_text_rgba(
-        text, size=size, color=RED, max_width=avail_w, max_lines=max_lines,
+        text, size=size, color=RED, max_width=avail_w, max_lines=max_lines, bold=True,
     )
     if ink.width <= 1:
         return
@@ -176,9 +176,10 @@ def draw_annotations(page_png: bytes, commands: list[dict]) -> bytes:
     img = Image.open(io.BytesIO(page_png)).convert("RGBA")
     w, h = img.size
     base = max(16, int(h * 0.016))
+    comment_size = int(base * 1.5)     # red-pen feedback text — 1.5× for legibility (drawn bold)
     mark_size = int(base * 1.4)        # circled per-question total (teacher-scale)
     banner_size = int(base * 1.2)
-    tick_size = int(base * 1.8)        # correct-point tick beside the line (real-pen scale)
+    tick_size = int(base * 3.6)        # correct-point tick beside the line (2× real-pen scale)
     rng = random.Random((w * 73856093) ^ (h * 19349663) ^ len(commands or []))
 
     # Underlines + ticks first (on the writing), then text on top so it's never covered.
@@ -201,7 +202,7 @@ def draw_annotations(page_png: bytes, commands: list[dict]) -> bytes:
             text = (cmd.get("text") or "").strip()
             box = cmd.get("box")
             if text and isinstance(box, (list, tuple)) and len(box) >= 4:
-                _draw_note_card(img, text[:240], tuple(int(v) for v in box[:4]), base, rng)
+                _draw_note_card(img, text[:240], tuple(int(v) for v in box[:4]), comment_size, rng)
         elif ctype == "mark":
             text = (cmd.get("text") or "").strip()
             if text:

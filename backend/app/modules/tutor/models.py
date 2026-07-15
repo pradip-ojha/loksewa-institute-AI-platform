@@ -32,6 +32,8 @@ class TutorChatMessage(Base):
     answer: Mapped[str] = mapped_column(Text, nullable=False, default="")
     language: Mapped[str | None] = mapped_column(String(30), nullable=True)
     # The topic-selector's routed demo mode: objective | subjective | shared.
+    # Legacy column from an earlier design — never populated and no longer exposed via
+    # the API; retained only to avoid a needless migration.
     related_mode: Mapped[str | None] = mapped_column(String(20), nullable=True)
     detected_topic: Mapped[str | None] = mapped_column(String(500), nullable=True)
     detected_subtopic_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)

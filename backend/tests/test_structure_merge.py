@@ -76,6 +76,32 @@ class TestMergeInferredUnclear:
         assert [q["question_number"] for q in m["questions"]] == ["1"]
 
 
+class TestClearLabelOverrideAudit:
+    def test_overridden_clear_label_gets_backstop_note(self):
+        # Call 2 changed a CLEAR label 6 → 4 but forgot the note; merge must record it.
+        blocks = [_block(1, [1], "६", "clear")]
+        labels = {1: {"block_id": 1, "final_number": "4", "source": "content", "confidence": 0.7, "note": ""}}
+        m = _merge_blocks_to_structure_map(blocks, labels, ["4", "6"])
+        assert [q["question_number"] for q in m["questions"]] == ["4"]
+        note = m["questions"][0]["note"]
+        assert "overridden" in note and "6" in note
+        assert m["uncertainty_notes"]  # bubbled up to the sheet-level notes
+
+    def test_model_supplied_override_note_not_duplicated(self):
+        blocks = [_block(1, [1], "6", "clear")]
+        labels = {1: {"block_id": 1, "final_number": "4", "source": "content", "confidence": 0.7,
+                      "note": "clear label 6 overridden → 4 by whole answer"}}
+        m = _merge_blocks_to_structure_map(blocks, labels, ["4", "6"])
+        # backstop must NOT append a second "overridden" phrase when one already exists.
+        assert m["questions"][0]["note"].lower().count("overridden") == 1
+
+    def test_kept_clear_label_has_no_override_note(self):
+        blocks = [_block(1, [1], "2", "clear")]
+        labels = {1: {"block_id": 1, "final_number": "2", "source": "label", "confidence": 1.0, "note": ""}}
+        m = _merge_blocks_to_structure_map(blocks, labels, ["1", "2"])
+        assert "overridden" not in (m["questions"][0]["note"] or "")
+
+
 class TestMergeDegradation:
     def test_empty_label_map_uses_clear_labels_only(self):
         # Call 2 failed (empty map): clear labels survive, unclear/none blocks dropped.

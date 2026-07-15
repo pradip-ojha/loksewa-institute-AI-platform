@@ -8,7 +8,6 @@ import { RichText } from "../../components/content/RichText";
 interface ChatTurn {
   question: string;
   answer?: string;
-  mode?: string | null;
   topic?: string | null;
   followUps?: string[];
   loading: boolean;
@@ -20,12 +19,6 @@ const STARTER_QUESTIONS = [
   "यो विषय परीक्षाको लागि कसरी सोधिन्छ?",
   "महत्त्वपूर्ण शब्दहरू र तिनको अर्थ बताउनुहोस्।",
 ];
-
-const MODE_LABEL: Record<string, string> = {
-  objective: "वस्तुगत",
-  subjective: "विषयगत",
-  shared: "साझा",
-};
 
 export function StudentTutor() {
   const { exams, selectedExamId: examId, isLoading: examsLoading } = useStudentExam();
@@ -62,7 +55,6 @@ export function StudentTutor() {
           items.map((m) => ({
             question: m.question,
             answer: m.answer,
-            mode: m.related_mode,
             topic: m.detected_topic,
             followUps: m.follow_up_suggestions,
             loading: false,
@@ -96,6 +88,8 @@ export function StudentTutor() {
     setTurns((t) => [...t, { question: text, loading: true }]);
     const controller = new AbortController();
     abortRef.current = controller;
+    let streamed = false;
+    let failedMsg: string | null = null;
     try {
     await tutorService.askStream(
       { question: text, exam_id: examId, chat_session_id: sessionId },
@@ -110,6 +104,7 @@ export function StudentTutor() {
         },
         onDelta: (delta) => {
           // First delta clears the loading dots; subsequent deltas append live.
+          streamed = true;
           setTurns((t) =>
             t.map((turn, i) =>
               i === idx ? { ...turn, loading: false, answer: (turn.answer ?? "") + delta } : turn,
@@ -126,11 +121,41 @@ export function StudentTutor() {
           );
         },
         onError: (message) => {
-          setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, error: message } : turn)));
+          failedMsg = message;
         },
       },
       controller.signal,
     );
+    // Stream failed before any answer text arrived → retry once via the plain
+    // (non-stream) endpoint before surfacing the error.
+    if (failedMsg !== null) {
+      if (!streamed && !controller.signal.aborted) {
+        try {
+          const res = await tutorService.ask({ question: text, exam_id: examId, chat_session_id: sessionId });
+          setSessionId(res.chat_session_id);
+          setTurns((t) =>
+            t.map((turn, i) =>
+              i === idx
+                ? {
+                    ...turn,
+                    loading: false,
+                    answer: res.answer,
+                    topic: res.detected_topic,
+                    followUps: res.follow_up_suggestions ?? [],
+                  }
+                : turn,
+            ),
+          );
+          failedMsg = null;
+        } catch {
+          /* fall through to the stream's error message */
+        }
+      }
+      if (failedMsg !== null) {
+        const message = failedMsg;
+        setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, error: message } : turn)));
+      }
+    }
     } finally {
       // Always re-enable input, even if a handler threw or the stream rejected.
       if (abortRef.current === controller) abortRef.current = null;
@@ -203,9 +228,6 @@ export function StudentTutor() {
                       <div className="mb-2 inline-flex items-center gap-1.5 rounded-full bg-brand-50 px-2.5 py-0.5 text-xs font-medium text-brand-700 ring-1 ring-brand-100">
                         <BookOpen className="h-3 w-3" />
                         <span className="font-deva">{turn.topic}</span>
-                        {turn.mode && MODE_LABEL[turn.mode] && (
-                          <span className="text-brand-400">· {MODE_LABEL[turn.mode]}</span>
-                        )}
                       </div>
                     )}
                     <RichText size="sm">{turn.answer}</RichText>

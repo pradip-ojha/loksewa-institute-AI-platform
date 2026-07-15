@@ -113,6 +113,14 @@ async def accept_question(db: AsyncSession, question_id: uuid.UUID) -> MCQQuesti
     if q and q.status != "approved":
         q.status = "approved"
         q.updated_at = datetime.utcnow()
+        # Keep the batch counters in sync with per-question reviews too — not
+        # only the bulk paths (autoflush makes the change above visible).
+        if q.review_batch_id:
+            batch_r = await db.execute(select(MCQReviewBatch).where(MCQReviewBatch.id == q.review_batch_id))
+            batch = batch_r.scalar_one_or_none()
+            if batch:
+                batch.accepted_count = await _count_in_batch(db, q.review_batch_id, "approved")
+                batch.rejected_count = await _count_in_batch(db, q.review_batch_id, "rejected")
         await db.commit()
         await db.refresh(q)
     return q
@@ -133,6 +141,12 @@ async def reject_question(
         q.status = "rejected"
         q.review_feedback = feedback
         q.updated_at = datetime.utcnow()
+        if changed and q.review_batch_id:
+            batch_r = await db.execute(select(MCQReviewBatch).where(MCQReviewBatch.id == q.review_batch_id))
+            batch = batch_r.scalar_one_or_none()
+            if batch:
+                batch.accepted_count = await _count_in_batch(db, q.review_batch_id, "approved")
+                batch.rejected_count = await _count_in_batch(db, q.review_batch_id, "rejected")
         await db.commit()
         await db.refresh(q)
     return q, changed

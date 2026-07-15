@@ -58,12 +58,18 @@ number: a number written to START a new question, typically
   • in or near the LEFT MARGIN, on its own line or followed by the restated question / the answer,
   • often larger, circled, or underlined, written like "1.", "Q1", "1)", "१.", "१)",
     "प्रश्न नं. १", "प्र.सं. १", "प्रश्न १".
+  • Nepali-medium students often write a full ANSWER-HEADER phrase naming the question number to start
+    an answer (it looks professional), e.g. "प्रश्न नं. ६ को उत्तर", "प्रश्न ६ को उत्तर", "६ को उत्तर",
+    "उत्तर नं. ६", "उत्तर ६ :". A "…को उत्तर" / "उत्तर …" phrase that names a question number is a NEW
+    top-level question boundary — START a new block there; it is NOT part of the previous answer.
 
 DO NOT start a new block for numbering INSIDE an answer. Sub-parts and steps written within one
 answer — "क) ख) ग)", "(अ) (आ)", "a) b) c)", "i) ii) iii)", or numbered points/steps "1. 2. 3." used
 as list items — stay in the SAME block. When unsure whether a marker is a new question or a sub-part,
 use POSITION and LENGTH: a left-margin number followed by a substantial answer = a new question; a
-small inline or indented marker inside a running answer = a sub-part (same block).
+small inline or indented marker inside a running answer = a sub-part (same block). Also READ the answer
+CONTENT you can see on the pages to confirm boundaries — a clear shift to a new topic marks a new
+question, while continued discussion of the same topic stays the same block.
 
 The test's official question numbers are: {valid_numbers}
 Use this list ONLY to recognize the numbering style and sanity-check a reading — never to force an
@@ -115,29 +121,37 @@ student's handwritten Loksewa answer sheet (image 1 = page 1, ...). Below are th
 found on the sheet (with the number the student wrote and how legible it was) and the official
 questions WITH their text.
 
-YOUR JOB: for each block, output the single official question number it answers, following the rules
-below EXACTLY.
+YOUR JOB: for each block, output the single official question number it answers. VALIDATE EVERY block
+— even one with a clearly written number — against the question texts and the block's actual writing,
+because a "clear" reading can still be a MISREAD digit (३ vs ४, ५ vs ६, ८ vs ५). But how easily you may
+CHANGE a number depends on how clear the written label was.
 
-THE MOST IMPORTANT RULE — trust a clearly written number:
-- If a block's "label_clarity" is "clear", the student clearly wrote that number. USE IT as
-  "final_number". Do NOT change it because the content looks like a different question — a student
-  who writes the wrong number still owns that choice, and re-labeling it would silently change their
-  marks. Set "source":"label".
-- ONLY exception: if that clearly-written number is NOT in the official list, treat the block as if
-  it were "unclear" and infer from content.
+VALIDATE-AND-DECIDE, by label clarity:
+- "clear": start from the written number and KEEP it, UNLESS there is overwhelming, unambiguous
+  evidence it was misread — i.e. the block's WHOLE answer clearly matches exactly ONE OTHER question
+  AND does NOT match the labeled question at all. Only then change it (this catches a misread digit).
+  If there is ANY doubt, KEEP the clear label. When you DO change a clear label, set "source":"content"
+  and a "note" like "clear label ६ looks misread; whole answer matches Q4 → 4".
+  (Exception unchanged: a clear number NOT in the official list is treated as "unclear".)
+- "unclear": use the written mark as a STRONG prior and disambiguate with content — pick the official
+  question whose text best matches, preferring a reading consistent with the ambiguous mark. Example:
+  the mark could be "३" or "४"; the whole answer is about the central bank = question 4 → choose 4.
+  Set "source":"content".
+- "none": pick the official question whose text best matches the block's whole writing/content.
+  Set "source":"content".
 
-When "label_clarity" is "unclear" — a number IS written but its value is uncertain:
-- Use the written mark as a STRONG prior and DISAMBIGUATE it with content. Read the block's actual
-  writing on its pages (don't rely on the summary alone), then pick the official question whose text
-  best matches — preferring a reading consistent with the ambiguous mark.
-  Example: the mark could be "३" or "४"; the answer is about the role of the central bank, which is
-  question 4 → choose 4. Set "source":"content".
+GUARDRAILS (they keep a clear label from being flipped wrongly):
+- WHOLE-ANSWER, NOT FRAGMENTS: match the block's ENTIRE answer to a question — never a single
+  overlapping sentence or a shared keyword. Topics overlap between questions, so a passing mention is
+  NOT a match; the whole answer addressing that question IS. This is why you are given the full sheet.
+- UNAMBIGUOUS ONLY: if the answer plausibly fits TWO near-duplicate questions, do NOT override a clear
+  label — keep it. Override only when exactly ONE other question fits and the labeled one clearly does not.
+- NO RESHUFFLE: do not move a clear label onto a question that another clear-labeled block already
+  clearly answers. Each question should have at most one primary block (a start + its continuation
+  aside). When in doubt, prefer keeping the written labels over creating conflicts.
 
-When "label_clarity" is "none" — no number was written:
-- Pick the official question whose text best matches the block's writing/content. Set "source":"content".
-
-SIGNAL PRIORITY (highest first): (1) a CLEAR written label — absolute, never overruled; (2) CONTENT
-match between the block's writing and a question's text — this is DECISIVE for unclear/none blocks.
+SIGNAL PRIORITY (highest first): (1) a CLEAR written label — strongly trusted, overruled ONLY by the
+overwhelming whole-answer test above; (2) CONTENT (whole-answer) match — DECISIVE for unclear/none blocks.
 
 DO NOT ASSUME THE ANSWERS ARE IN ORDER. Students very often answer OUT OF SEQUENCE — they attempt the
 questions that feel easiest first — so the blocks are frequently NOT in question-number order, and a
@@ -161,10 +175,11 @@ Blocks found on the sheet:
 For EACH block return:
 - "block_id": the same id from the block list.
 - "final_number": the official question number this block answers.
-- "source": "label" if you took a clearly written number, "content" if you inferred it.
-- "confidence": 0.0–1.0 — your certainty (a clear label ≈ 1.0; a content inference lower).
-- "note": short note ONLY when you inferred a number, or when a written label and the content
-  disagree (e.g. "label unclear (३/४), matched Q4 by content"); otherwise "".
+- "source": "label" if you kept a clearly written number, "content" if you inferred or overrode it.
+- "confidence": 0.0–1.0 — your certainty (a kept clear label ≈ 1.0; a content inference/override lower).
+- "note": short note WHENEVER you inferred a number, CHANGED a clear written label, or a written label
+  and the content disagree (e.g. "label unclear (३/४), matched Q4 by content"; "clear label ६ misread →
+  4 by whole answer"); otherwise "".
 
 Return ONLY valid JSON (no prose, no markdown fences) in exactly this structure:
 {{
@@ -220,7 +235,7 @@ class AnswerStructureAgent:
         }
         try:
             result = await self.provider.generate_with_images(
-                prompt, page_pngs, schema={}, audit_ctx=audit_ctx,
+                prompt, page_pngs, schema={}, audit_ctx=audit_ctx, list_key="blocks",
             )
         except Exception as exc:
             # Structure is guidance only — never block checking if it fails.
@@ -262,7 +277,7 @@ class AnswerStructureAgent:
         }
         try:
             result = await self.provider.generate_with_images(
-                prompt, page_pngs, schema={}, audit_ctx=audit_ctx,
+                prompt, page_pngs, schema={}, audit_ctx=audit_ctx, list_key="blocks",
             )
         except Exception as exc:
             logger.warning("structure labeling failed (degrading to clear labels): %s", exc)
@@ -351,6 +366,16 @@ def _merge_blocks_to_structure_map(
         qnum = _match_question_number(raw_num, valid_numbers)
         if not qnum:
             continue
+
+        # Audit backstop: when Call 2 CHANGED a clearly-written label (a suspected misread),
+        # always record the override in the note — even if the model omitted one — so a
+        # grading-affecting relabel is never silent (surfaced via structure_map notes → the
+        # admin skill-debug / coordinate-debug views).
+        if decision is not None and (b.get("label_clarity") or "") == "clear":
+            written = _match_question_number(str(b.get("written_label") or "").strip(), valid_numbers)
+            if written and written != qnum and "overrid" not in note.lower():
+                override = f"clear label {b.get('written_label')} ({written}) overridden -> {qnum} (suspected misread)"
+                note = " ".join(filter(None, [note, override]))
 
         pages = sorted({int(x) for x in (b.get("pages") or []) if str(x).isdigit()})
         try:

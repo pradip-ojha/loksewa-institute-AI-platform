@@ -186,15 +186,15 @@ def _ink_fraction_in_box(mask, box: list[int]) -> float:
 
 def _comment_dims(comment_text: str, w: int, h: int) -> tuple[int, int]:
     """Estimated (width, height) of the rendered comment using real HarfBuzz shaping —
-    mirrors the renderer's font size (`base = h*0.016`) and 4-line wrap so the box
+    mirrors the renderer's comment font size (`base*1.5`, bold) and 4-line wrap so the box
     actually fits what `annotation._draw_note_card` will draw."""
-    size = max(16, int(h * 0.016))  # must match annotation.draw_annotations `base`
+    size = int(max(16, int(h * 0.016)) * 1.5)  # must match annotation.draw_annotations `comment_size`
     try:
         from app.processing.text_render import measure_text
-        line_w, line_h = measure_text(comment_text or "", size)
+        line_w, line_h = measure_text(comment_text or "", size, bold=True)
     except Exception:
-        line_w, line_h = len(comment_text or "") * 9, int(size * 1.35)
-    max_w = int(w * 0.32)
+        line_w, line_h = len(comment_text or "") * 13, int(size * 1.35)
+    max_w = int(w * 0.40)
     cw = int(_clamp(line_w + 24, 140, max_w))
     lines = min(4, max(1, -(-line_w // max(1, cw - 24))))  # ceil-div over usable width
     ch = int(line_h * 1.15) * lines + 10

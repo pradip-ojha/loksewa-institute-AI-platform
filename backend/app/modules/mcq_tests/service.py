@@ -71,8 +71,17 @@ def _build_buckets(blueprint: MCQTestBlueprint) -> list[dict]:
     return buckets
 
 
-async def _approved_ids(db: AsyncSession, bucket: dict, exclude: set[uuid.UUID], exam_id) -> list[uuid.UUID]:
-    q = select(MCQQuestion.id).where(
+def _eligible_single_correct(correct_ids: object) -> bool:
+    """Set generation uses only single-correct questions — the student test UI is
+    single-select, so a multi-correct question could never be answered correctly."""
+    return isinstance(correct_ids, list) and len(correct_ids) == 1
+
+
+async def _approved_ids(
+    db: AsyncSession, bucket: dict, exclude: set[uuid.UUID], exam_id,
+) -> tuple[list[uuid.UUID], int]:
+    """Eligible approved question ids for a bucket + how many were excluded as multi-correct."""
+    q = select(MCQQuestion.id, MCQQuestion.correct_option_ids).where(
         MCQQuestion.status == "approved",
         MCQQuestion.exam_id == exam_id,
     )
@@ -84,10 +93,11 @@ async def _approved_ids(db: AsyncSession, bucket: dict, exclude: set[uuid.UUID],
         q = q.where(MCQQuestion.subtopic == bucket["subtopic"])
     if bucket["complexity"]:
         q = q.where(MCQQuestion.complexity == bucket["complexity"])
-    rows = await db.execute(q)
-    ids = [r for r in rows.scalars().all() if r not in exclude]
+    rows = (await db.execute(q)).all()
+    excluded = sum(1 for _, cids in rows if not _eligible_single_correct(cids))
+    ids = [qid for qid, cids in rows if _eligible_single_correct(cids) and qid not in exclude]
     random.shuffle(ids)
-    return ids
+    return ids, excluded
 
 
 async def generate_sets(db: AsyncSession, blueprint: MCQTestBlueprint) -> dict:
@@ -111,11 +121,13 @@ async def generate_sets(db: AsyncSession, blueprint: MCQTestBlueprint) -> dict:
     # plan[set_index] = list of (question_id, complexity)
     plan: dict[int, list[tuple[uuid.UUID, str | None]]] = {i: [] for i in range(num_sets)}
     shortages: list[dict] = []
+    multi_correct_excluded = 0
 
     for bucket in buckets:
         per_set = bucket["per_set"]
         required_total = per_set * num_sets
-        ids = await _approved_ids(db, bucket, used, blueprint.exam_id)
+        ids, excluded = await _approved_ids(db, bucket, used, blueprint.exam_id)
+        multi_correct_excluded += excluded
         take = ids[:required_total]
         # Reserve whatever is available so later buckets don't double-count it,
         # keeping the shortage report internally consistent.
@@ -137,6 +149,8 @@ async def generate_sets(db: AsyncSession, blueprint: MCQTestBlueprint) -> dict:
 
     if shortages:
         result = {"generated": False, "reason": "insufficient_questions", "shortages": shortages}
+        if multi_correct_excluded:
+            result["multi_correct_excluded"] = multi_correct_excluded
         blueprint.status = "shortage"
         blueprint.generation_result = result
         await db.commit()
@@ -171,10 +185,13 @@ async def generate_sets(db: AsyncSession, blueprint: MCQTestBlueprint) -> dict:
         created += 1
 
     blueprint.status = "generated"
-    blueprint.generation_result = {"generated": True, "sets_created": created, "shortages": []}
+    result = {"generated": True, "sets_created": created, "shortages": []}
+    if multi_correct_excluded:
+        result["multi_correct_excluded"] = multi_correct_excluded
+    blueprint.generation_result = result
     await db.commit()
 
-    return {"generated": True, "sets_created": num_sets, "shortages": []}
+    return result
 
 
 # ── Admin queries ─────────────────────────────────────────────────────────────

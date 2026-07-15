@@ -162,6 +162,9 @@ project-root/
 ## 6. Auth & Users
 
 Roles: `institute_admin`, `student`. Login: email + password (both roles), JWT access tokens.
+**Emails are case-insensitive everywhere**: stored lowercased on write (student creation, admin
+email change) and compared via `func.lower()` on login + uniqueness checks (never `ilike` — a
+legitimate `_` in an email is an ilike wildcard), so pre-existing mixed-case rows still match.
 Admin creates students manually (name, email, password, phone optional). Student views profile +
 changes own password. Admin manages own account from **Settings** (`pages/admin/Settings.tsx`,
 `/admin/settings`): change own login email (requires current password; case-insensitive uniqueness)
@@ -225,6 +228,11 @@ external resources a DB cascade can't reach — the exam's **Pinecone vectors**,
 the now-orphaned **`files` rows** — best-effort (a storage hiccup never blocks/rolls back the DB
 delete). `personalization.student_activity_logs.exam_id` is a plain (non-FK) column and is left as-is.
 Student listing endpoints (MCQ tests, subjective tests, videos) filter to the student's enrolled exams.
+**Enrollment is also an ACCESS BOUNDARY, not just a listing filter** (`exams/service.ensure_enrolled`,
+403 `not_enrolled`): direct-by-UUID student endpoints enforce it — video detail/ask/stream/history,
+tutor ask, **MCQ-test start (new attempts)**, and **subjective test detail + answer upload**. An
+already-started attempt / already-uploaded sheet stays accessible (resume + own results survive a
+later un-enrollment), so `submit` and `result` gate on ownership of that existing work.
 
 ---
 
@@ -280,7 +288,10 @@ annotates logs. **No garbage fallback:** a region that fails OCR is RETRIED (`VI
 and then SKIPPED (empty) — the pipeline NEVER backfills with the raw text layer or an LLM "Preeti decode"
 (both removed), because that would only poison the vector store. If every region fails (e.g. the
 deployment can't accept images → 404) the OCR text is empty and the job fails honestly rather than
-ingesting nothing/garbage.
+ingesting nothing/garbage. **Zero-chunk guard:** the same honesty applies one stage later — if OCR
+produced text but chunking / model_qa pair-extraction yields ZERO chunks, the job FAILS with a clear
+message instead of marking the document `completed` with `chunk_count=0` (a silent green failure
+that contributes nothing to retrieval).
 **Column-split rendering (OCR fidelity, spec — dense two-column Nepali).** A vision model reads a full
 page at a fixed resolution budget (~768 px on the short side), so a dense two-column page leaves too few
 pixels per glyph and the model starts guessing/confabulating. Each page is therefore rendered as one or
@@ -416,13 +427,20 @@ uses: source content + admin feedback + style examples + active MCQ skill.
 
 Hardening:
 - Accept/reject idempotent: a retry doesn't double-apply or re-fire side effects; batch
-  accepted/rejected counts derived from actual question states (never reset to 0 on re-run).
+  accepted/rejected counts derived from actual question states (never reset to 0 on re-run) — and
+  kept in sync by BOTH the bulk paths and per-question accept/reject.
 - Rejection queues a **tracked** `skill_builder_update` job on `kvi_ai_skill` (not an untracked web
   background task); a failed refinement surfaces on that job.
 - Extraction/generation/regeneration validate the AI `questions` payload shape and report
   `saved`/`skipped` (with reasons) in the job's `output_reference`; malformed questions are not
   silently dropped. A generation/regeneration yielding zero usable questions FAILS the job (never
   completes empty). `GET /api/jobs/{id}` returns `output_reference`.
+- **Regeneration replacements are KEY-ALIGNED, never blindly positional:** each rejected question is
+  prompted with a `Ref: R<n>` code the model must echo back as `replaces_ref`;
+  `_align_replacements` (`mcq_extraction_agent.py`) matches by that key (unknown/duplicate/missing
+  refs are skipped + reported in `skip_reasons`), falling back to positional order ONLY when no item
+  echoed a ref AND the counts match exactly — a count/order drift can no longer overwrite the wrong
+  question.
 
 ### 9.4 Manual Management
 Add/edit/delete/approve/unapprove manually. Complexity: easy/medium/hard. Status:
@@ -472,6 +490,10 @@ Mirrors `mcq/` (`models/schemas/service/router`); tables in migration `009_mcq_t
 - **Cross-set uniqueness:** per leaf bucket `(chapter, topic, subtopic, complexity)` pull `count ×
   num_sets` distinct approved questions (filtered by `MCQQuestion.chapter` first), shuffle, deal
   round-robin → no repeats across sets. Questions claimed by an earlier bucket excluded from later ones.
+- **Single-correct only:** the student test UI is single-select, so multi-correct questions
+  (possible via extraction) are EXCLUDED from the eligible pool (`_eligible_single_correct`) — they
+  could never be graded correct. The excluded count is surfaced as
+  `generation_result.multi_correct_excluded` (shortage and success alike).
 - **Shortage:** any bucket short of `count × num_sets` → NOTHING created, status `shortage`,
   `generation_result.shortages` = `{chapter, topic, subtopic, complexity, required, available, shortage}`.
   Job still completes (valid outcome). No auto-borrow.
@@ -596,7 +618,7 @@ Student uploads handwritten answer-sheet PDF/image
 → Quality check (blur, brightness, tilt, resolution, orientation)
 → Low quality: ask reupload (max 2 attempts), then continue with warning
 → Convert pages to HIGH-QUALITY images
-→ Whole-sheet STRUCTURE pass (Gemini vision, all pages, TWO calls: segment → label): page→question map, continuations, unclear-numbering notes (guidance). Call 1 finds answer BLOCKS + reads the written label content-blind; Call 2 assigns each block its question number from the question TEXTS — a CLEARLY written label is never overridden, only unclear/missing labels are resolved by content
+→ Whole-sheet STRUCTURE pass (Gemini vision, all pages, TWO calls: segment → label): page→question map, continuations, unclear-numbering notes (guidance). Call 1 finds answer BLOCKS + reads the written label content-blind (recognizing Nepali answer-headers like `प्रश्न नं. ६ को उत्तर` / `६ को उत्तर` as new-question boundaries); Call 2 VALIDATES every block's number against the question TEXTS + whole answer with a CLARITY-SCALED override bar — an unclear/missing label is resolved by content, and a CLEARLY written label is changed ONLY on an overwhelming, unambiguous WHOLE-ANSWER match to exactly one other question (catches misread digits like ३/४), never on partial/topic overlap; every such override is recorded in the map notes (audit)
 → Question-level extraction (Gemini vision, structure-aware + prev/next-page hints): per-question text + question bbox + page size + continuation
 → Backend assembles whole-question answers across pages
 → Load admin test config + LOCKED checking skills (NO large notes re-sent — skill already distilled them)
@@ -803,10 +825,16 @@ kvi_ai_subjective`):
   the ORIGINAL capture dims, not the capped render; **poor + attempt<2 ⇒ `needs_reupload`, no AI
   spent**) → **whole-sheet structure pass** (`AnswerStructureAgent`, Gemini vision over all pages, **TWO
   sequential calls + an AI-free merge** — Call 1 `_segment` finds answer BLOCKS + page spans and
-  reads each written label content-blind (`written_label`/`label_clarity`/`content_summary`), Call 2
-  `_label` gets the question TEXTS and assigns each block its `final_number` (a `clear` label is
-  trusted as-is and NEVER overridden; only `unclear`/`none` labels are inferred from content),
-  `_merge_blocks_to_structure_map` folds them back into the legacy map shape; **Call 2 failing
+  reads each written label content-blind (`written_label`/`label_clarity`/`content_summary`; Nepali
+  answer-headers like `प्रश्न नं. ६ को उत्तर` are recognized as new-question boundaries), Call 2
+  `_label` gets the question TEXTS and assigns each block its `final_number` by **validating every
+  block with a CLARITY-SCALED override bar**: `unclear`/`none` labels are inferred from the whole
+  answer; a `clear` label is kept unless the block's WHOLE answer overwhelmingly + unambiguously
+  matches exactly ONE OTHER question and not the labeled one (catches misread digits ३/४), never
+  flipped on partial/topic overlap, and guarded against reshuffling onto a question another clear
+  block already answers. `_merge_blocks_to_structure_map` folds them back into the legacy map shape
+  and **records every clear-label override in the map notes (grading-affecting relabels are never
+  silent — surfaced in the admin skill-debug / coordinate-debug views)**; **Call 2 failing
   degrades to Call 1's clearly-written labels**, Call 1 failing → empty map (extraction runs
   hint-free) — always best-effort, never blocks checking; labels normalized to exact known question
   numbers via `svc.validate_structure_map` — unknown labels dropped — then stored under
@@ -963,14 +991,22 @@ Mirrors `subjective/`; tables in migration `011_video` (§19). Segment/chunk tim
   Response: `{answer, language, chat_session_id,
   selected_segments, detected_topic, detected_subtopic_ids, supporting_knowledge_used, confidence,
   follow_up_suggestions}`.
-  **Streaming variant** (`POST /student/videos/{id}/ask/stream` → `service.run_qa_chain_stream`): same
+  **In-session conversational memory:** `_prepare_qa_turn` loads the last `MAX_VIDEO_CHAT_HISTORY=6`
+  turns of the session (`_recent_history_text`, mirroring the main tutor) and passes them to
+  `VideoTutorAgent.answer`/`answer_stream` as a CONVERSATION SO FAR block — so follow-ups like
+  "explain that again" resolve against the prior turn instead of arriving context-free.
+  **Streaming variant** (`POST /student/videos/{id}/ask/stream` → `service.run_qa_chain_stream`): an
+  immediate `{"type":"ping"}` event FIRST (first byte before any AI work — the pre-answer routing can
+  be tens of silent seconds and the frontend aborts a stream after 60s without a chunk), then the same
   pre-steps (segment/topic routing + retrieval run first, non-streamed), then NDJSON events — a `meta`
   event (`chat_session_id` + `selected_segments` + detected topic), `delta` events as the answer streams
   (`VideoTutorAgent.answer_stream` → `provider.stream_text`, plain markdown, NO json_object), then a
   `done` event with `follow_up_suggestions`/`language`/`confidence`. The agent emits the answer, then a
   `<<<META>>>` sentinel, then a one-line JSON tail parsed server-side (fail-open) — see
   `app/ai/agents/streaming.py`. The turn is persisted only after the stream completes; the non-stream
-  endpoint stays as a fallback.
+  endpoint stays as a fallback (the frontend actually uses it: a stream that fails before any answer
+  text arrived is retried once via the plain `ask` endpoint before an error is shown — same in
+  `StudentTutor.tsx`).
 - **Agents** (`backend/app/ai/agents/video_*`, `audit_ctx` `entity_type="video"`, `get_active_skill_text`):
   `video_timeline_agent`, `video_summary_agent`, `video_tutor_agent` on `get_provider("reasoning")`
   (gpt-5.5); the simpler `video_transcript_cleaner_agent`, `video_segment_topic_mapper_agent`,
@@ -1010,8 +1046,11 @@ still answers from scope).
   `detected_topic`/`detected_subtopic_ids`/`supporting_knowledge_used`/confidences/follow-ups),
   `POST /api/student/tutor/ask/stream` (streaming NDJSON variant → `service.run_tutor_chain_stream`:
   `meta` event with `chat_session_id`+detected topic, `delta` events as the answer streams via
-  `TutorAgent.answer_stream`, then a `done` event with follow-ups; sentinel-tail metadata parsing per
-  `app/ai/agents/streaming.py`; non-stream endpoint retained as fallback),
+  `TutorAgent.answer_stream`, then a `done` event with follow-ups; an immediate `{"type":"ping"}` is
+  emitted BEFORE the routing pre-steps so the frontend's 60s idle timer isn't tripped by slow
+  pre-answer routing; sentinel-tail metadata parsing per `app/ai/agents/streaming.py`; non-stream
+  endpoint retained as fallback — the frontend retries a stream that failed before any answer text
+  once via the plain `ask` endpoint),
   `GET /api/student/tutor/history?session_id=` (one session) or `?exam_id=` (this student's full
   tutor conversation for that exam, merged across sessions via `service.get_history_by_exam` — mirrors
   the video tutor's per-video history and is what `StudentTutor.tsx` loads on mount/exam-switch to
@@ -1368,6 +1407,8 @@ its roll-up on a genuinely new log; the video pipeline already clears its childr
 sheet is terminal-for-marks:** once it reaches `feedback_ready`, the best-effort annotation phase runs
 under its own `ANNOTATION_BUDGET_SECONDS` and `_mark_sheet_failed` refuses to downgrade a
 `feedback_ready`/`checked` sheet — a slow/failed annotation settles to `checked`, never `failed`.
+And a retry that finds the sheet ALREADY `checked` short-circuits at LOAD (marks the job completed,
+returns) — so a failure in only the final job-completion write can't re-spend every AI phase.
 
 ### Gemini rate-limit + overload retry / model fallback
 Free tier is rate-limited **per minute**, so `gemini._generate_one_model` waits a full
@@ -1431,7 +1472,10 @@ job `video_processing` (all pipeline steps, incremental progress). Student Q&A i
 multi-agent chat in the router), NOT a tracked job. The **subjective feedback chatbot** (§12.1) and the
 **standalone AI Tutor** (§13.1) are likewise synchronous in-request multi-agent chats, NOT tracked jobs.
 **Personalization roll-ups** (§14A, `personalization_tasks.*`) are fire-and-forget Celery tasks with NO
-`processing_jobs` row — best-effort, run directly on the worker loop like the reaper.
+`processing_jobs` row — best-effort, run directly on the worker loop like the reaper. A tick that finds
+the loop already running (another thread driving it) is SUBMITTED thread-safely
+(`asyncio.run_coroutine_threadsafe`, bounded wait) instead of being dropped — the old unconditional
+skip silently lost per-turn roll-ups under load and summaries drifted stale until the nightly beat.
 
 ### Job Fields
 job_id, job_type, status (queued/processing/completed/failed/retrying/cancelled), progress_percent,
@@ -1537,7 +1581,8 @@ CASCADE), status (open|closed), created_at, updated_at  (explains a checked shee
 (student|assistant), content, created_at
 `tutor_chat_sessions`: id, student_id (FK users CASCADE), created_at, updated_at  (standalone AI Tutor — §13.1)
 `tutor_chat_messages`: id, session_id (FK tutor_chat_sessions CASCADE), student_id (FK users), question,
-answer, language, related_mode, detected_topic, detected_subtopic_ids (JSONB), query_rewrite,
+answer, language, related_mode (legacy — never populated, not exposed via API), detected_topic,
+detected_subtopic_ids (JSONB), query_rewrite,
 supporting_knowledge_json (JSONB), confidence, follow_up_suggestions (JSONB), created_at
 
 ### Video (migration `011_video`; segment/chunk times in seconds)
@@ -1719,8 +1764,10 @@ are unchanged. Fields that must stay PLAIN TEXT are explicitly excluded in the p
   In `ENVIRONMENT=production` startup **fails closed** on a placeholder `JWT_SECRET` or the weak default
   `DEFAULT_ADMIN_PASSWORD`. `/health/ready` returns booleans only (no dependency error detail).
 - **Rate limiting (`app/core/ratelimit.py`, slowapi + `SlowAPIMiddleware`):** login 10/min/IP
-  (brute-force guard, keyed by IP), AI chat/stream endpoints 30/min/user (cost guard, keyed by bearer
-  token → falls back to IP). Optional shared storage via `RATELIMIT_STORAGE_URI` for multi-process APIs.
+  (brute-force guard, keyed by IP), AI chat/stream endpoints 30/min/user (cost guard, keyed by the
+  signature-verified JWT `sub` = user id — NOT a raw token prefix, which is mostly the constant JWT
+  header and could collide across users; invalid/expired token → falls back to IP). Optional shared
+  storage via `RATELIMIT_STORAGE_URI` for multi-process APIs.
 - Security headers on every response (`SecurityHeadersMiddleware`: nosniff, `X-Frame-Options: DENY`,
   `Referrer-Policy`, a strict CSP, HSTS). CORS locked to `FRONTEND_URL` with pinned methods/headers
   (not credentialed wildcards). Sanitize AI-generated text before returning. HTTPS in deployment.

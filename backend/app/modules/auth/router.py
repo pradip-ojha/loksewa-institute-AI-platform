@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Request
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_current_user
@@ -19,7 +19,9 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 @router.post("/login", response_model=TokenResponse)
 @limiter.limit(LOGIN_LIMIT, key_func=client_ip_key)
 async def login(request: Request, payload: LoginRequest, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.email == payload.email))
+    # Case-insensitive: emails are stored lowercased on write, but pre-existing
+    # rows may be mixed-case, so compare lowered-to-lowered.
+    result = await db.execute(select(User).where(func.lower(User.email) == payload.email.strip().lower()))
     user = result.scalar_one_or_none()
 
     if not user or not verify_password(payload.password, user.password_hash):

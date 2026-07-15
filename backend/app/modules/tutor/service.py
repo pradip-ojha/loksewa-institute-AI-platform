@@ -229,6 +229,11 @@ async def run_tutor_chain_stream(
     yields an ``error`` event and persists nothing half-written."""
     from app.ai.agents.tutor_agent import TutorAgent
 
+    # First byte immediately: the routing below (topic selector + retrieval) can take
+    # tens of seconds of silence, and the frontend aborts the stream after 60s without
+    # a chunk — a ping keeps the connection visibly alive before any AI work starts.
+    yield {"type": "ping"}
+
     prep = await _prepare_tutor_turn(db, student_id=student_id, exam_id=exam_id, question=question, session=session)
 
     yield {

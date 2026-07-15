@@ -52,7 +52,7 @@ STRICT RULES:
 --- ADMIN-TUNABLE GUIDANCE (refines emphasis only; never overrides the STRICT RULES above) ---
 {skill_instructions}
 
-Return ONLY valid JSON in exactly this structure:
+Return ONLY a single valid JSON OBJECT (never a bare array) in exactly this structure:
 {{
   "page": {page_number},
   "page_size": [{width}, {height}],
@@ -130,7 +130,7 @@ class AnswerExtractionAgent:
         }
         try:
             result = await self.provider.generate_with_image(
-                prompt, page_png, schema={}, audit_ctx=audit_ctx,
+                prompt, page_png, schema={}, audit_ctx=audit_ctx, list_key="answers",
             )
         except Exception as exc:
             raise RuntimeError(f"Answer extraction failed on page {page_number}: {exc}") from exc

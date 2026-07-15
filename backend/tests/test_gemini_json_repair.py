@@ -3,7 +3,10 @@ No network/DB. Covers the real production failure: a preview vision model stoppi
 mid-response (unterminated Devanagari string / unclosed array/object), which the old
 lenient parser could not recover. Run from `backend/`: python -m pytest
 """
-from app.ai.providers.gemini import _loads_lenient, _repair_truncated
+import pytest
+
+from app.ai.providers.gemini import _loads_lenient, _parse_json, _repair_truncated
+from app.core.exceptions import AIResponseError
 
 
 class TestRepairTruncated:
@@ -54,3 +57,25 @@ class TestLenientLadder:
         # Step 2 (first balanced object) path.
         data = _loads_lenient('{"a": 1}\nHere is your JSON.')
         assert data == {"a": 1}
+
+
+class TestBareArrayCoercion:
+    def test_bare_array_wrapped_with_list_key(self):
+        # The page-18 failure: model dropped the wrapper and returned just the answers list.
+        out = _parse_json('[{"question_number": "Q1", "answer_text": "x"}]',
+                          agent_type=None, task_type=None, list_key="answers")
+        assert out == {"answers": [{"question_number": "Q1", "answer_text": "x"}]}
+
+    def test_bare_array_without_list_key_still_raises(self):
+        with pytest.raises(AIResponseError):
+            _parse_json('[{"a": 1}]', agent_type=None, task_type=None)
+
+    def test_object_response_unaffected_by_list_key(self):
+        out = _parse_json('{"answers": [{"a": 1}]}',
+                          agent_type=None, task_type=None, list_key="answers")
+        assert out == {"answers": [{"a": 1}]}
+
+    def test_fenced_bare_array_wrapped(self):
+        # code-fenced bare array (fences stripped, then coerced).
+        out = _parse_json('```json\n[1, 2, 3]\n```', agent_type=None, task_type=None, list_key="blocks")
+        assert out == {"blocks": [1, 2, 3]}

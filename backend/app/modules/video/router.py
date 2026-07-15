@@ -314,5 +314,11 @@ async def student_chat_history(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_student),
 ):
+    # Own-data only (filtered by student_id), but keep the enrollment boundary
+    # uniform across every student video endpoint.
+    v = await svc.get_video(db, video_id)
+    if v:
+        from app.modules.exams.service import ensure_enrolled
+        await ensure_enrolled(db, student_id=current_user.id, exam_id=v.exam_id)
     msgs = await svc.get_chat_history(db, video_id, current_user.id)
     return [ChatMessageOut.model_validate(m) for m in msgs]
