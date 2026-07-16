@@ -107,8 +107,10 @@ Nepali/Devanagari → Gemini.* `get_provider(task_type)` selects both provider A
   `VideoSegmentRouterAgent`, `VideoSlideLabelAgent`, `VideoSegmentTopicMapperAgent`,
   `VideoTranscriptCleanerAgent` (these call `get_provider("thinking")`) — PLUS the feedback-chat
   question selector `AnswerFeedbackSelectorAgent` §12.1 (moved to gpt-5 for more accurate routing).
-- **Azure `gpt-5-mini` (fast)** — the `get_provider("routing")` tier (cheap routing/selection;
-  retained for future cheap-routing use). `get_provider("chunking")` (semantic chunking) is
+- **Azure `gpt-5-mini` (fast)** — the `get_provider("routing")` tier (cheap routing/selection) —
+  used by the **per-page column-layout classifier** for AMBIGUOUS typed pages
+  (`ai/agents/page_layout_classifier.py`, §8; a 404 = deployment can't take images falls back to
+  gpt-5 with a per-job memo). `get_provider("chunking")` (semantic chunking) is
   **configurable** via `CHUNKING_MODEL_TIER` (.env): default `thinking` = **gpt-5** (chunking is a
   one-time per-document cost whose segmentation + verbatim-Devanagari fidelity underpins all
   downstream retrieval, so it defaults to the better tier), or `fast` = gpt-5-mini for the cheaper
@@ -145,8 +147,8 @@ project-root/
 │   │   ├── ai/          (providers/[base, azure_openai, gemini], agents/, prompts/,
 │   │   │                schemas/, model_router.py)
 │   │   ├── integrations/(r2_client, pinecone_client, redis_client)
-│   │   ├── processing/  (pdf_tools, image_quality, annotation, audio_tools,
-│   │   │                document_text, chunking, file_validation)
+│   │   ├── processing/  (pdf_tools, image_quality, page_layout, annotation,
+│   │   │                audio_tools, document_text, chunking, file_validation)
 │   │   └── seeds/
 ├── workers/
 │   ├── celery_app.py     (worker app: shared conf + beat schedule + task includes)
@@ -193,7 +195,8 @@ extraction runs after the exam is created, poller shown) and on the Syllabus pag
 button, replaces the current tree after a confirm). The agent reuses the Knowledge Layer OCR/render
 helpers (`knowledge_processing_agent`) but with its OWN vision prompt that KEEPS syllabus pages (the
 knowledge OCR prompt rejects them), uses the PDF text layer when it is clean Unicode else OCRs every
-page (`get_provider("vision_typed")`), then a `get_provider("thinking")` structuring call emits
+page (`get_provider("vision_typed")`, with the same hybrid per-page column-layout detection as the
+Knowledge Layer — §8), then a `get_provider("thinking")` structuring call emits
 `{chapters:[{chapter, topics:[{topic, subtopics:[…]}]}]}`. `syllabus.service.replace_syllabus_tree`
 bulk-writes it (idempotent: clears the exam's existing `syllabus_items` first). It is structural
 extraction — NOT skill-tunable. Everything stays fully editable afterward.
@@ -292,16 +295,31 @@ ingesting nothing/garbage. **Zero-chunk guard:** the same honesty applies one st
 produced text but chunking / model_qa pair-extraction yields ZERO chunks, the job FAILS with a clear
 message instead of marking the document `completed` with `chunk_count=0` (a silent green failure
 that contributes nothing to retrieval).
-**Column-split rendering (OCR fidelity, spec — dense two-column Nepali).** A vision model reads a full
-page at a fixed resolution budget (~768 px on the short side), so a dense two-column page leaves too few
-pixels per glyph and the model starts guessing/confabulating. Each page is therefore rendered as one or
-more **column regions**: `_detect_column_gutter` (deterministic cv2/numpy — a central vertical
-whitespace band that is ink-free over ≥85% of the height with real content on BOTH sides) finds the
-gutter; `_render_page_regions` then splits exactly on that empty gutter into **left then right** PNG
-crops (no glyph cut, no overlap, correct reading order — this is what fixed the two-column reading-order
-scramble) — each column now fills the model's budget (~2× pixels/glyph). A page with **no** clean gutter
-(single-column notes/books) is rendered whole, so single-column docs are never split mid-line. Cost:
-~2× typed-vision calls on two-column pages (quality-first). Regions are OCR'd in parallel
+**Column-split rendering — HYBRID per-page layout detection (OCR fidelity, spec — dense two-column
+Nepali).** A vision model reads a full page at a fixed resolution budget (~768 px on the short side), so
+a dense two-column page leaves too few pixels per glyph and the model starts guessing/confabulating.
+Each page is therefore rendered as one or more **column regions**, decided per page by a hybrid
+detector shared by ALL typed-document ingestion (knowledge, syllabus import, MCQ — NOT the handwritten
+answer-sheet or question-paper paths): the deterministic core (`processing/page_layout.py`,
+cv2/numpy ink analysis, thresholds as module constants — no env vars) returns a three-way
+`LayoutVerdict` — **`split`** (a clean central whitespace gutter, ink-free over ≥85% of the height,
+≥15% of ink on BOTH sides, and NO content row crossing the gutter — the crossing check stops
+borderless tables being cut in half), **`whole`** (clearly single-column / blank / one-sided), or
+**`ambiguous`** (near-miss gutter 60–85% clear, unbalanced 5–15% side ink, table rules through the
+candidate gutter, off-center gutter in the 30–70% band). **Only ambiguous pages** go to a cheap AI
+layout classifier (`ai/agents/page_layout_classifier.py::resolve_pdf_layouts`, NOT skill-tunable):
+**gpt-5-mini** (`get_provider("routing")`) sees the already-rendered ≤768px analysis raster and returns
+`{layout, gutter_x}`; a 404 (mini deployment can't take images) falls back to **gpt-5**
+(`vision_typed`) with a per-job memo so the 404 is hit once; if AI is unavailable the page renders
+**whole** — bias is deliberate: a false split scrambles reading order and poisons chunks, a missed
+split only lowers fidelity. When the AI says two_column, the deterministic candidate gutter is
+preferred over the AI's coordinate (measured whitespace never cuts glyphs). `render_regions_for_decisions`
+then splits exactly on the decided gutter into **left then right** PNG crops (no glyph cut, no overlap,
+correct reading order) — each column fills the model's budget (~2× pixels/glyph); whole-decided pages
+are never split mid-line. Cost: ~2× typed-vision calls on two-column pages (quality-first) + one cheap
+mini call per ambiguous page. A one-line `Layout: N page(s) — X split, Y whole, Z AI-classified`
+summary is emitted to the Processing Logs and the per-page `signals` are logged; the knowledge job's
+completion `output_reference` carries the `layout` stats. Regions are OCR'd in parallel
 (`asyncio.Semaphore(6)`) and reassembled in `(page, region)` order.
 **Strict transcription prompt (the ONE thing that stopped the rewriting).** `VISION_EXTRACT_PROMPT` is a
 pure **OCR-transcription** prompt: transcribe EXACTLY as printed, character for character; never
@@ -320,7 +338,10 @@ to PDF via **headless LibreOffice** (`_docx_to_pdf_bytes`, `soffice --headless -
 isolated per-job LO profile) and run through the same OCR path. **LibreOffice (`soffice`) is therefore
 a worker dependency** for Preeti/scanned DOCX; missing it fails such a job with a clear "install
 LibreOffice or re-upload as PDF" message (Unicode DOCX still works without it). The shared OCR routine
-is `_ocr_pdf_bytes(file_bytes, step_cb)`, used by both the PDF path and the converted-DOCX path.
+is `_ocr_pdf_bytes(file_bytes, step_cb, audit_ctx=…)` (returns `(text, layout_stats)`), used by both
+the PDF path and the converted-DOCX path; its per-page core `_ocr_pdf_pages(file_bytes, page_indices,
+step_cb)` OCRs only the requested pages and also powers `extract_typed_document_text` (the layout-aware
+MCQ ingestion helper, §9.1).
 
 **CHAPTER IS THE PRIMARY RETRIEVAL DIMENSION (topic/subtopic are secondary within it), and is mapped
 PER CHUNK to the OFFICIAL syllabus — the source's own headings/numbering are used as EVIDENCE, but the
@@ -401,6 +422,20 @@ Extract: question text, options, correct option, explanation. Correct-answer for
 documents → Azure gpt-5 typed extraction** (`MCQExtractionAgent` uses `get_provider("text_extraction")`,
 spec §6.2), not gpt-5.5/Gemini. Upload fields: display name, **Exam**, **Chapter (required)**, PDF/Word
 file, topic (opt), subtopic (opt), custom extraction instruction.
+
+**MCQ document ingestion is LAYOUT-AWARE** (all three paths — upload extraction, generation,
+regeneration — read the source file via
+`knowledge_processing_agent.extract_typed_document_text(file_bytes, mime, step_cb)`): each PDF page's
+text layer is classified (`_classify_page_text`) — **every page `valid_unicode` → the free text layer
+is used directly** (the common born-digital case, zero AI cost, old behavior); any garbage/legacy-
+Preeti/empty pages are instead **column-aware vision-OCR'd** (gpt-5 typed vision through the §8 hybrid
+layout detector) and reassembled with the clean pages in page order — a scanned/Preeti MCQ document no
+longer silently feeds ASCII garbage to the model. DOCX: whole-text classify → LibreOffice→PDF→OCR when
+not clean Unicode (same as §8). A document from which NO text can be extracted **fails the job
+honestly** (extraction + generation; regeneration degrades to feedback+knowledge-only since its source
+file is optional context); partial page failures continue with a `Warning: N page(s) unreadable` step.
+Note: a pure-English typed document has no Devanagari so it classifies `legacy_font` and gets OCR'd —
+costs vision calls but still extracts correctly (conservative by design).
 
 **Chapter is required on every MCQ creation path (upload / generation / manual add) and is propagated
 to every produced `MCQQuestion.chapter`** — exams hold multiple chapters now, so chapter tagging is
@@ -1942,7 +1977,8 @@ pip install -r requirements.txt
 
 # Unit tests (backend/tests — pure functions only: question matching/assembly/clamping,
 # annotation geometry ladder + ink/echo guards, locator coordinate denorm, crop guards,
-# text matching). No DB/network needed. Run from backend/.
+# text matching, page-layout verdicts + column-region rendering + mixed-page reassembly).
+# No DB/network needed. Run from backend/.
 python -m pytest
 
 # Wipe processing-job log rows (failed noise + stuck pending). Run from backend/.

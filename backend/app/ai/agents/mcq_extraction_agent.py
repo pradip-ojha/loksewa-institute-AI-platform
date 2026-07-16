@@ -580,15 +580,18 @@ class MCQExtractionAgent:
         self.provider = get_provider("text_extraction")
 
     async def process(self) -> MCQReviewBatch:
+        from app.ai.agents.knowledge_processing_agent import extract_typed_document_text
         from app.core.database import AsyncSessionLocal
         from app.integrations.r2_client import get_r2
         from app.modules.files.models import File
-        from app.processing.document_text import extract_text_from_bytes
         from sqlalchemy import select
 
         async def _job(**kw) -> None:
             async with AsyncSessionLocal() as db:
                 await update_job(db, self.job_id, **kw)
+
+        async def _ocr_step(progress: int, msg: str) -> None:
+            await _job(progress=progress, step=msg)
 
         await _job(progress=5, step="Downloading source document")
 
@@ -604,7 +607,18 @@ class MCQExtractionAgent:
         file_bytes = await asyncio.to_thread(get_r2().download_fileobj, r2_key)
 
         await _job(progress=20, step="Extracting text from document")
-        document_text = extract_text_from_bytes(file_bytes, mime_type)
+        # Layout-aware extraction (CLAUDE.md §8/§9): a clean-Unicode text layer is used
+        # for free; scanned/Preeti pages are column-aware vision-OCR'd instead of feeding
+        # the model ASCII garbage. Raises when nothing could be extracted (fail honestly).
+        document_text = await extract_typed_document_text(
+            file_bytes, mime_type, _ocr_step,
+            audit_ctx={
+                "agent_type": "PageLayoutClassifier",
+                "task_type": "page_layout_classification",
+                "entity_type": "mcq_document",
+                "entity_id": self.document.id,
+            },
+        )
 
         await _job(progress=35, step="Retrieving active skill")
         async with AsyncSessionLocal() as db:
@@ -684,15 +698,18 @@ class MCQGenerationAgent:
         self.provider = get_provider("reasoning")
 
     async def process(self) -> MCQReviewBatch:
+        from app.ai.agents.knowledge_processing_agent import extract_typed_document_text
         from app.core.database import AsyncSessionLocal
         from app.integrations.r2_client import get_r2
         from app.modules.files.models import File
-        from app.processing.document_text import extract_text_from_bytes
         from sqlalchemy import select
 
         async def _job(**kw) -> None:
             async with AsyncSessionLocal() as db:
                 await update_job(db, self.job_id, **kw)
+
+        async def _ocr_step(progress: int, msg: str) -> None:
+            await _job(progress=progress, step=msg)
 
         await _job(progress=5, step="Downloading source content")
 
@@ -708,7 +725,17 @@ class MCQGenerationAgent:
         file_bytes = await asyncio.to_thread(get_r2().download_fileobj, r2_key)
 
         await _job(progress=20, step="Extracting text from content")
-        document_text = extract_text_from_bytes(file_bytes, mime_type)
+        # Layout-aware extraction — the file IS the requested source content, so a totally
+        # unreadable file fails the job honestly (see extract_typed_document_text).
+        document_text = await extract_typed_document_text(
+            file_bytes, mime_type, _ocr_step,
+            audit_ctx={
+                "agent_type": "PageLayoutClassifier",
+                "task_type": "page_layout_classification",
+                "entity_type": "mcq_document",
+                "entity_id": self.document.id,
+            },
+        )
 
         await _job(progress=30, step="Detecting covered topics")
         async with AsyncSessionLocal() as db:
@@ -921,16 +948,19 @@ class MCQRegenerationAgent:
         self.provider = get_provider("reasoning")
 
     async def process(self) -> None:
+        from app.ai.agents.knowledge_processing_agent import extract_typed_document_text
         from app.core.database import AsyncSessionLocal
         from app.integrations.r2_client import get_r2
         from app.modules.files.models import File
         from app.modules.jobs.models import JobStatus
-        from app.processing.document_text import extract_text_from_bytes
         from sqlalchemy import select
 
         async def _job(**kw) -> None:
             async with AsyncSessionLocal() as db:
                 await update_job(db, self.job_id, **kw)
+
+        async def _ocr_step(progress: int, msg: str) -> None:
+            await _job(progress=progress, step=msg)
 
         await _job(progress=10, step="Collecting rejected questions")
 
@@ -979,8 +1009,26 @@ class MCQRegenerationAgent:
         await _job(progress=20, step="Loading source document")
         document_text = ""
         if file_meta:
-            file_bytes = await asyncio.to_thread(get_r2().download_fileobj, file_meta[0])
-            document_text = extract_text_from_bytes(file_bytes, file_meta[1])[:20000]
+            # The source document is OPTIONAL context for regeneration (the path already
+            # tolerates a missing file), so an extraction failure degrades to
+            # feedback+knowledge-only instead of failing the whole regeneration.
+            try:
+                file_bytes = await asyncio.to_thread(get_r2().download_fileobj, file_meta[0])
+                document_text = (await extract_typed_document_text(
+                    file_bytes, file_meta[1], _ocr_step,
+                    audit_ctx={
+                        "agent_type": "PageLayoutClassifier",
+                        "task_type": "page_layout_classification",
+                        "entity_type": "mcq_review_batch",
+                        "entity_id": self._batch_id,
+                    },
+                ))[:20000]
+            except Exception as exc:
+                logger.warning(
+                    "Regeneration: could not extract source document text (%s) — "
+                    "continuing without it", exc,
+                )
+                document_text = ""
 
         await _job(progress=35, step="Fetching knowledge enrichment")
         async with AsyncSessionLocal() as db:

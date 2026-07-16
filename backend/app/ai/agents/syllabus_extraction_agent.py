@@ -24,9 +24,10 @@ from app.ai.agents.knowledge_processing_agent import (
     _docx_to_pdf_bytes,
     _extract_pdf_pages_text,
     _extract_text_from_docx,
-    _render_all_regions,
 )
+from app.ai.agents.page_layout_classifier import layout_summary, resolve_pdf_layouts
 from app.ai.model_router import get_provider
+from app.processing.page_layout import render_regions_for_decisions
 from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.database import AsyncSessionLocal
 from app.core.exceptions import AIResponseError
@@ -136,7 +137,7 @@ class SyllabusExtractionAgent:
         file_bytes = await asyncio.to_thread(get_r2().download_fileobj, r2_key)
 
         await _step(25, "Reading syllabus text…")
-        syllabus_text = await self._extract_text(file_bytes, mime, _step)
+        syllabus_text = await self._extract_text(file_bytes, mime, _step, exam_uuid)
         if not syllabus_text.strip():
             raise RuntimeError(
                 "No text could be read from the syllabus file. Check that the PDF/Word file is "
@@ -168,9 +169,11 @@ class SyllabusExtractionAgent:
 
     # ── text acquisition ──────────────────────────────────────────────────────────
 
-    async def _extract_text(self, file_bytes: bytes, mime: str, step_cb) -> str:
+    async def _extract_text(
+        self, file_bytes: bytes, mime: str, step_cb, exam_uuid: uuid.UUID | None = None
+    ) -> str:
         if "pdf" in mime:
-            return await self._ocr_or_textlayer_pdf(file_bytes, step_cb)
+            return await self._ocr_or_textlayer_pdf(file_bytes, step_cb, exam_uuid)
         if "word" in mime or "docx" in mime or "msword" in mime:
             raw = await asyncio.to_thread(_extract_text_from_docx, file_bytes)
             if _classify_page_text(raw) == "valid_unicode":
@@ -179,10 +182,12 @@ class SyllabusExtractionAgent:
             logger.info("Syllabus DOCX not valid Unicode → converting to PDF for OCR")
             await step_cb(30, "Converting Word document to PDF for OCR…")
             pdf_bytes = await asyncio.to_thread(_docx_to_pdf_bytes, file_bytes)
-            return await self._ocr_or_textlayer_pdf(pdf_bytes, step_cb)
+            return await self._ocr_or_textlayer_pdf(pdf_bytes, step_cb, exam_uuid)
         raise RuntimeError(f"Unsupported file type for syllabus extraction: {mime}")
 
-    async def _ocr_or_textlayer_pdf(self, file_bytes: bytes, step_cb) -> str:
+    async def _ocr_or_textlayer_pdf(
+        self, file_bytes: bytes, step_cb, exam_uuid: uuid.UUID | None = None
+    ) -> str:
         """Use the PDF text layer when it's clean Unicode; otherwise OCR every page."""
         page_texts = await asyncio.to_thread(_extract_pdf_pages_text, file_bytes)
         joined = "\n\n".join(page_texts)
@@ -193,9 +198,20 @@ class SyllabusExtractionAgent:
         total = len(page_texts)
         await step_cb(35, f"Vision OCR — reading {total} page(s)…")
         provider = get_provider("vision_typed")
-        # High-fidelity 300-DPI PNG, auto column-split (same helper as the Knowledge Layer):
-        # dense two-column syllabus pages are read one column at a time in reading order.
-        units = await asyncio.to_thread(_render_all_regions, file_bytes, list(range(total)), 300)
+        # High-fidelity 300-DPI PNG regions via the shared HYBRID layout resolver (same as
+        # the Knowledge Layer): dense two-column syllabus pages are read one column at a
+        # time in reading order; ambiguous pages get a cheap AI layout classification.
+        decisions, layout_stats = await resolve_pdf_layouts(
+            file_bytes, list(range(total)),
+            audit_ctx={
+                "agent_type": "PageLayoutClassifier",
+                "task_type": "page_layout_classification",
+                "entity_type": "exam",
+                "entity_id": exam_uuid,
+            },
+        )
+        await step_cb(36, layout_summary(layout_stats))
+        units = await asyncio.to_thread(render_regions_for_decisions, file_bytes, decisions, 300)
 
         sem = asyncio.Semaphore(6)
         ATTEMPTS = 3

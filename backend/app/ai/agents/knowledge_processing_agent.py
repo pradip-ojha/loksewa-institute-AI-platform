@@ -13,7 +13,9 @@ from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.agents.page_layout_classifier import layout_summary, resolve_pdf_layouts
 from app.ai.model_router import get_provider
+from app.processing.page_layout import render_regions_for_decisions
 from app.ai.prompts.shared import EXAM_CONTEXT
 from app.core.database import AsyncSessionLocal
 from app.integrations.pinecone_client import get_pinecone
@@ -297,113 +299,11 @@ def _extract_pdf_pages_text(data: bytes) -> list[str]:
 
 
 # ── Column-aware page rendering (OCR fidelity) ──────────────────────────────────
-# Vision OCR reads a full page at a fixed resolution budget (~768px on the short side),
-# so a dense two-column Nepali page leaves too few pixels per glyph and the model starts
-# guessing. We therefore split each page at its central whitespace gutter and OCR each
-# column separately (≈2× pixels/glyph, and correct left→right reading order). Single-column
-# pages have no gutter → rendered whole (never split mid-line).
-
-# Fraction of page width searched for the gutter (a two-column layout gutters near centre).
-_GUTTER_BAND = (0.40, 0.60)
-# A column x is a gutter only if it is ink-free over at least this fraction of the page
-# height (below 1.0 so a full-width running header/footer band does not disqualify it)…
-_GUTTER_MIN_CLEAR_ROWS = 0.85
-# …and each side must carry at least this fraction of the page's total ink (real content
-# on BOTH sides — guards against splitting an off-centre single column).
-_GUTTER_MIN_SIDE_INK = 0.15
-
-
-def _detect_column_gutter(page, analysis_dpi: int = 120) -> float | None:
-    """Return the x of a clean vertical column gutter as a fraction of page width, or None.
-
-    Renders the page to a cheap grayscale raster, thresholds it to an ink mask, and looks in
-    the central band for a column that is ink-free down (almost) the whole height with real
-    content on both sides. Deterministic; works for vector and scanned pages alike.
-    """
-    import fitz
-    import cv2
-    import numpy as np
-
-    try:
-        mat = fitz.Matrix(analysis_dpi / 72, analysis_dpi / 72)
-        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
-        # Ink = dark pixels. Otsu picks the page-specific text/background split.
-        _, ink = cv2.threshold(img, 0, 1, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-        h, w = ink.shape
-        if w < 40 or h < 40:
-            return None
-
-        total_ink = int(ink.sum())
-        if total_ink <= 0:
-            return None
-
-        col_ink = ink.sum(axis=0)                       # ink pixels per column x
-        clear_rows_frac = 1.0 - (col_ink / float(h))    # fraction of rows empty at each x
-
-        x0 = int(w * _GUTTER_BAND[0])
-        x1 = int(w * _GUTTER_BAND[1])
-        if x1 <= x0:
-            return None
-        band = clear_rows_frac[x0:x1]
-        best_local = int(band.argmax())
-        best_x = x0 + best_local
-        if clear_rows_frac[best_x] < _GUTTER_MIN_CLEAR_ROWS:
-            return None
-
-        left_ink = int(ink[:, :best_x].sum())
-        right_ink = int(ink[:, best_x:].sum())
-        if left_ink < total_ink * _GUTTER_MIN_SIDE_INK:
-            return None
-        if right_ink < total_ink * _GUTTER_MIN_SIDE_INK:
-            return None
-
-        return best_x / float(w)
-    except Exception as exc:  # never let detection break ingestion — fall back to whole page
-        logger.warning("column-gutter detection failed (using whole page): %s", exc)
-        return None
-
-
-def _render_page_regions(data: bytes, page_index: int, dpi: int = 300) -> list[bytes]:
-    """Render one PDF page to high-fidelity PNG region(s) in reading order.
-
-    Two-column page → [left_png, right_png] split exactly on the empty gutter (no glyph cut,
-    no overlap, no duplication). Single-column page → [whole_page_png]. PNG is lossless so
-    thin Devanagari strokes are not smeared by JPEG compression.
-    """
-    import fitz
-    doc = fitz.open(stream=data, filetype="pdf")
-    try:
-        page = doc[page_index]
-        rect = page.rect
-        mat = fitz.Matrix(dpi / 72, dpi / 72)
-        gutter = _detect_column_gutter(page)
-        if gutter is None:
-            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-            return [pix.tobytes("png")]
-        gx = rect.width * gutter
-        clips = [
-            fitz.Rect(rect.x0, rect.y0, rect.x0 + gx, rect.y1),   # left column
-            fitz.Rect(rect.x0 + gx, rect.y0, rect.x1, rect.y1),   # right column
-        ]
-        out: list[bytes] = []
-        for clip in clips:
-            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, clip=clip)
-            out.append(pix.tobytes("png"))
-        return out
-    finally:
-        doc.close()
-
-
-def _render_all_regions(data: bytes, page_indices: list[int], dpi: int = 300) -> list[tuple[int, int, bytes]]:
-    """Render every requested page into its column region(s). Returns work-units
-    (page_index, region_index, png_bytes) in reading order."""
-    units: list[tuple[int, int, bytes]] = []
-    for i in page_indices:
-        regions = _render_page_regions(data, i, dpi)
-        for r_idx, png in enumerate(regions):
-            units.append((i, r_idx, png))
-    return units
+# The per-page layout decision (split at the column gutter vs render whole) lives in
+# app/processing/page_layout.py (deterministic cv2 verdict) + the HYBRID resolver in
+# app/ai/agents/page_layout_classifier.py (ambiguous pages → cheap gpt-5-mini vision
+# classify, gpt-5 fallback on 404, whole-page when AI is unavailable). This module only
+# consumes the resolved decisions via `render_regions_for_decisions`.
 
 
 def _extract_text_from_docx(data: bytes) -> str:
@@ -474,41 +374,37 @@ def _docx_to_pdf_bytes(data: bytes) -> bytes:
             return fh.read()
 
 
-async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> str:
-    """OCR every page of a PDF (given as bytes) with the typed-vision model and return the
-    concatenated text. A page that cannot be read is SKIPPED — never backfilled with the raw
-    text layer / a Preeti decode (that content is garbage for this corpus). The vision model's
-    only manipulation of a real page is stripping running headers/footers/watermarks; it never
-    rejects, rewords, or summarises content.
+async def _ocr_pdf_pages(
+    file_bytes: bytes,
+    page_indices: list[int],
+    step_cb,
+    *,
+    audit_ctx: dict | None = None,
+) -> tuple[dict[int, str], dict]:
+    """Layout-resolve + render + vision-OCR ONLY the given pages of a PDF.
 
-    `step_cb(progress:int, msg:str)` is an async progress callback. Shared by direct-PDF
-    uploads and by Preeti/scanned DOCX after the DOCX → PDF conversion.
+    Returns ({page_index: ocr_text}, layout_stats). Every requested page appears as a key;
+    a page whose every region failed maps to "". A region that cannot be read is SKIPPED —
+    never backfilled with the raw text layer / a Preeti decode (that content is garbage for
+    this corpus). `step_cb(progress:int, msg:str)` is an async progress callback.
     """
-    page_texts_raw: list[str] = await asyncio.to_thread(_extract_pdf_pages_text, file_bytes)
-    total_pages = len(page_texts_raw)
     # Scanned/legacy-font knowledge PDFs are TYPED text → Azure gpt-5 typed vision OCR
     # (not Gemini, which is reserved for handwriting; not gpt-5.5).
     provider = get_provider("vision_typed")
 
-    # Classification still runs (cheap) — only to annotate logs; FORCE_OCR_ALL_PAGES makes
-    # _needs_vision() true for every page, so all pages are OCR'd.
-    classifications: list[str] = [_classify_page_text(t) for t in page_texts_raw]
-    vision_pages: list[int] = [i for i, cls in enumerate(classifications) if _needs_vision(cls)]
+    if not page_indices:
+        return {}, {"pages": 0, "split": 0, "whole": 0, "ambiguous": 0,
+                    "ai_split": 0, "ai_whole": 0, "ai_fallback_whole": 0, "mini_404": False}
 
-    # Render each page into high-fidelity PNG region(s): dense two-column pages are split at
-    # their whitespace gutter (≈2× pixels/glyph + correct left→right order); single-column pages
-    # stay whole. One work-unit per region: (page_index, region_index, png_bytes).
-    units: list[tuple[int, int, bytes]] = []
-    if vision_pages:
-        summary = ", ".join(f"p{i+1}={classifications[i]}" for i in vision_pages)
-        await step_cb(22, f"Vision OCR — rendering {len(vision_pages)}/{total_pages} pages ({summary[:80]})…")
-        units = await asyncio.to_thread(_render_all_regions, file_bytes, vision_pages, 300)
-        split_pages = sorted({p for p, r, _ in units if r > 0})
-        if split_pages:
-            logger.info(
-                "Column-split fired on %d page(s): %s",
-                len(split_pages), ", ".join(f"p{p+1}" for p in split_pages),
-            )
+    # HYBRID per-page layout resolution (deterministic verdicts + AI for ambiguous pages),
+    # then render each page into high-fidelity PNG region(s): two-column pages are split at
+    # their whitespace gutter (≈2× pixels/glyph + correct left→right order); single-column
+    # pages stay whole. One work-unit per region: (page_index, region_index, png_bytes).
+    decisions, layout_stats = await resolve_pdf_layouts(
+        file_bytes, page_indices, audit_ctx=audit_ctx
+    )
+    await step_cb(22, layout_summary(layout_stats))
+    units = await asyncio.to_thread(render_regions_for_decisions, file_bytes, decisions, 300)
 
     total_regions = len(units)
     ocr_sem = asyncio.Semaphore(6)
@@ -557,31 +453,150 @@ async def _ocr_pdf_bytes(file_bytes: bytes, step_cb) -> str:
             failed_regions.append((page_i, region_i))
             return (page_i, region_i, "")
 
-    await step_cb(23, f"Vision OCR — processing {total_regions} region(s) of {len(vision_pages)} page(s) in parallel…")
+    await step_cb(23, f"Vision OCR — processing {total_regions} region(s) of {len(page_indices)} page(s) in parallel…")
     region_results = await asyncio.gather(
         *[_process_one_region(p, r, png) for p, r, png in units]
     )
     # Regions left→right within a page, pages in order.
     region_results = sorted(region_results, key=lambda x: (x[0], x[1]))
-    text = "\n\n".join(t for _, _, t in region_results if t)
+    page_texts: dict[int, str] = {i: "" for i in page_indices}
+    for p, _, t in region_results:
+        if t:
+            page_texts[p] = f"{page_texts[p]}\n\n{t}".strip() if page_texts[p] else t
 
     # A page is unreadable only if ALL its regions failed.
-    regions_by_page: dict[int, list[int]] = {}
-    for p, r, _ in units:
-        regions_by_page.setdefault(p, []).append(r)
-    failed_by_page: dict[int, set[int]] = {}
-    for p, r in failed_regions:
-        failed_by_page.setdefault(p, set()).add(r)
-    unreadable_pages = [p for p, regs in regions_by_page.items() if failed_by_page.get(p, set()) >= set(regs)]
+    unreadable_pages = [p for p in page_indices if not page_texts[p]]
 
     extracted_regions = total_regions - len(failed_regions)
     summary = (
         f"OCR complete — {extracted_regions}/{total_regions} region(s) extracted, "
-        f"{len(unreadable_pages)} unreadable page(s) of {total_pages}."
+        f"{len(unreadable_pages)} unreadable page(s) of {len(page_indices)}."
     )
     logger.info(summary)
     await step_cb(24, summary)
-    return text
+    return page_texts, layout_stats
+
+
+async def _ocr_pdf_bytes(
+    file_bytes: bytes, step_cb, *, audit_ctx: dict | None = None
+) -> tuple[str, dict | None]:
+    """OCR every page of a PDF (given as bytes) with the typed-vision model and return
+    (concatenated_text, layout_stats). A page that cannot be read is SKIPPED — never
+    backfilled with the raw text layer / a Preeti decode. The vision model's only
+    manipulation of a real page is stripping running headers/footers/watermarks; it never
+    rejects, rewords, or summarises content.
+
+    Shared by direct-PDF uploads and by Preeti/scanned DOCX after the DOCX → PDF conversion.
+    """
+    page_texts_raw: list[str] = await asyncio.to_thread(_extract_pdf_pages_text, file_bytes)
+    total_pages = len(page_texts_raw)
+
+    # Classification still runs (cheap) — only to annotate logs; FORCE_OCR_ALL_PAGES makes
+    # _needs_vision() true for every page, so all pages are OCR'd.
+    classifications: list[str] = [_classify_page_text(t) for t in page_texts_raw]
+    vision_pages: list[int] = [i for i, cls in enumerate(classifications) if _needs_vision(cls)]
+
+    if not vision_pages:
+        return "", None
+
+    cls_summary = ", ".join(f"p{i+1}={classifications[i]}" for i in vision_pages)
+    await step_cb(21, f"Vision OCR — analysing {len(vision_pages)}/{total_pages} pages ({cls_summary[:80]})…")
+    page_texts, layout_stats = await _ocr_pdf_pages(
+        file_bytes, vision_pages, step_cb, audit_ctx=audit_ctx
+    )
+    text = "\n\n".join(page_texts[i] for i in sorted(page_texts) if page_texts[i])
+    return text, layout_stats
+
+
+def _assemble_page_texts(
+    page_texts: list[str], classifications: list[str], ocr_by_page: dict[int, str]
+) -> str:
+    """Reassemble a mixed document in page order: a `valid_unicode` page keeps its free
+    text-layer text; any other page uses its OCR result (skipped when OCR failed/empty)."""
+    parts: list[str] = []
+    for i, raw in enumerate(page_texts):
+        if classifications[i] == "valid_unicode":
+            text = raw.strip()
+        else:
+            text = (ocr_by_page.get(i) or "").strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+async def extract_typed_document_text(
+    file_bytes: bytes,
+    mime_type: str,
+    step_cb,
+    *,
+    audit_ctx: dict | None = None,
+) -> str:
+    """Layout-aware text extraction for TYPED documents (MCQ upload/generation sources).
+
+    PDF: classify each page's text layer — every page `valid_unicode` → join the free text
+    layer (zero AI cost, the common born-digital case). Otherwise ONLY the garbage/legacy/
+    empty pages are vision-OCR'd through the hybrid column-layout path (`_ocr_pdf_pages`)
+    and reassembled with the clean text-layer pages in page order. An `empty` text layer is
+    OCR'd too (it usually means a scanned page); a truly blank page OCRs to empty and is
+    skipped. DOCX: whole-text classify — `valid_unicode` → text layer; else LibreOffice →
+    PDF → the PDF branch. Other mime types fall back to the plain text-layer extractor.
+
+    Raises RuntimeError when NO text could be extracted at all (the job should fail
+    honestly rather than feed the model nothing/garbage). Partial OCR failure on a document
+    that still produced text elsewhere continues with a warning.
+
+    `step_cb(progress:int, msg:str)` — emits progress only within [20, 29] so it slots
+    under every MCQ caller's next progress step.
+    """
+    if "pdf" in mime_type:
+        page_texts = await asyncio.to_thread(_extract_pdf_pages_text, file_bytes)
+        classifications = [_classify_page_text(t) for t in page_texts]
+        ocr_pages = [i for i, c in enumerate(classifications) if c != "valid_unicode"]
+
+        if not ocr_pages:
+            text = "\n\n".join(t.strip() for t in page_texts if t.strip())
+            if not text:
+                raise RuntimeError("No text could be extracted from the document.")
+            return text
+
+        cls_summary = ", ".join(f"p{i+1}={classifications[i]}" for i in ocr_pages)
+        await step_cb(
+            21,
+            f"Vision OCR — {len(ocr_pages)}/{len(page_texts)} page(s) have no usable text "
+            f"layer ({cls_summary[:80]})…",
+        )
+        ocr_by_page, _ = await _ocr_pdf_pages(file_bytes, ocr_pages, step_cb, audit_ctx=audit_ctx)
+
+        text = _assemble_page_texts(page_texts, classifications, ocr_by_page)
+        if not text.strip():
+            raise RuntimeError(
+                "No text could be extracted from the document. Check that the file is "
+                "readable and not password-protected, and that the vision model deployment "
+                "supports image inputs."
+            )
+        failed_pages = [i for i in ocr_pages if not (ocr_by_page.get(i) or "").strip()]
+        if failed_pages:
+            msg = (
+                f"Warning: {len(failed_pages)} page(s) unreadable "
+                f"({', '.join(f'p{i+1}' for i in failed_pages[:8])}) — continuing with the "
+                f"remaining pages"
+            )
+            logger.warning(msg)
+            await step_cb(29, msg)
+        return text
+
+    if "word" in mime_type or "docx" in mime_type or "msword" in mime_type:
+        raw = await asyncio.to_thread(_extract_text_from_docx, file_bytes)
+        if _classify_page_text(raw) == "valid_unicode":
+            return raw
+        await step_cb(20, "Converting Word document to PDF for OCR…")
+        pdf_bytes = await asyncio.to_thread(_docx_to_pdf_bytes, file_bytes)
+        return await extract_typed_document_text(
+            pdf_bytes, "application/pdf", step_cb, audit_ctx=audit_ctx
+        )
+
+    from app.processing.document_text import extract_text_from_bytes
+    return extract_text_from_bytes(file_bytes, mime_type)
 
 
 def _split_into_sections(text: str, max_chars: int = 8000) -> list[str]:
@@ -819,10 +834,22 @@ class KnowledgeProcessingAgent:
             async def _ocr_step(progress: int, msg: str) -> None:
                 await _step(JobStatus.processing, progress, msg)
 
+            # Audit context for the hybrid layout classifier's AI calls (no `db` key —
+            # the provider's _audit opens its own short session).
+            layout_audit_ctx = {
+                "agent_type": "PageLayoutClassifier",
+                "task_type": "page_layout_classification",
+                "entity_type": "knowledge_document",
+                "entity_id": doc_uuid,
+            }
+            layout_stats: dict | None = None
+
             if "pdf" in mime:
                 # OCR every page (FORCE_OCR_ALL_PAGES) — this corpus is all scanned or
                 # Preeti-font, so the text layer is unusable. See `_ocr_pdf_bytes`.
-                raw_text = await _ocr_pdf_bytes(file_bytes, _ocr_step)
+                raw_text, layout_stats = await _ocr_pdf_bytes(
+                    file_bytes, _ocr_step, audit_ctx=layout_audit_ctx
+                )
 
             elif "word" in mime or "docx" in mime or "msword" in mime:
                 # A Word document may be real Unicode OR legacy Preeti-encoded. Extract the
@@ -842,7 +869,9 @@ class KnowledgeProcessingAgent:
                     )
                     await _step(JobStatus.processing, 18, "Converting Word document to PDF for OCR…")
                     pdf_bytes = await asyncio.to_thread(_docx_to_pdf_bytes, file_bytes)
-                    raw_text = await _ocr_pdf_bytes(pdf_bytes, _ocr_step)
+                    raw_text, layout_stats = await _ocr_pdf_bytes(
+                        pdf_bytes, _ocr_step, audit_ctx=layout_audit_ctx
+                    )
             else:
                 raise RuntimeError(f"Unsupported file type for text extraction: {mime}")
 
@@ -1165,7 +1194,11 @@ class KnowledgeProcessingAgent:
                         status=JobStatus.completed,
                         progress=100,
                         step="Processing complete",
-                        output={"document_id": str(doc_uuid), "chunk_count": len(chunk_payloads)},
+                        output={
+                            "document_id": str(doc_uuid),
+                            "chunk_count": len(chunk_payloads),
+                            **({"layout": layout_stats} if layout_stats else {}),
+                        },
                     )
 
             await _db_op_with_retry(_mark_done, label="mark job done")
