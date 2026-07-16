@@ -561,13 +561,13 @@ function TutorTab({
 
       <form
         onSubmit={(e) => { e.preventDefault(); void ask(question); }}
-        className="sticky bottom-16 mt-4 flex items-center gap-2 rounded-full bg-white p-1.5 shadow-md ring-1 ring-gray-200"
+        className="sticky bottom-[calc(4.5rem+env(safe-area-inset-bottom))] mt-4 flex items-center gap-2 rounded-full bg-white p-1.5 shadow-md ring-1 ring-gray-200"
       >
         <input
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
           placeholder="प्रश्न सोध्नुहोस्…"
-          className="flex-1 rounded-full border-0 bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-0 font-deva"
+          className="flex-1 rounded-full border-0 bg-transparent px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-0 font-deva"
         />
         <button
           type="submit"

@@ -511,14 +511,22 @@ async def _ocr_pdf_bytes(
 def _assemble_page_texts(
     page_texts: list[str], classifications: list[str], ocr_by_page: dict[int, str]
 ) -> str:
-    """Reassemble a mixed document in page order: a `valid_unicode` page keeps its free
-    text-layer text; any other page uses its OCR result (skipped when OCR failed/empty)."""
+    """Reassemble a document in page order: a page that was OCR'd uses its OCR result
+    (skipped when OCR failed/empty — never backfilled from the raw text layer, which is
+    garbage for this corpus); only a page that was never sent to OCR keeps its free
+    text-layer text.
+
+    OCR wins whenever the page was OCR'd, so under `FORCE_OCR_ALL_PAGES` (every page is
+    OCR'd) the raw text layer is never trusted — matching the knowledge-layer pipeline.
+    The classification is still consulted for a page absent from `ocr_by_page`, so a
+    caller that OCRs selectively still skips a garbage page whose OCR produced nothing.
+    """
     parts: list[str] = []
     for i, raw in enumerate(page_texts):
-        if classifications[i] == "valid_unicode":
-            text = raw.strip()
-        else:
+        if i in ocr_by_page or classifications[i] != "valid_unicode":
             text = (ocr_by_page.get(i) or "").strip()
+        else:
+            text = raw.strip()
         if text:
             parts.append(text)
     return "\n\n".join(parts)
@@ -530,16 +538,25 @@ async def extract_typed_document_text(
     step_cb,
     *,
     audit_ctx: dict | None = None,
-) -> str:
+) -> tuple[str, dict | None]:
     """Layout-aware text extraction for TYPED documents (MCQ upload/generation sources).
 
-    PDF: classify each page's text layer — every page `valid_unicode` → join the free text
-    layer (zero AI cost, the common born-digital case). Otherwise ONLY the garbage/legacy/
-    empty pages are vision-OCR'd through the hybrid column-layout path (`_ocr_pdf_pages`)
-    and reassembled with the clean text-layer pages in page order. An `empty` text layer is
-    OCR'd too (it usually means a scanned page); a truly blank page OCRs to empty and is
-    skipped. DOCX: whole-text classify — `valid_unicode` → text layer; else LibreOffice →
-    PDF → the PDF branch. Other mime types fall back to the plain text-layer extractor.
+    Returns `(text, layout_stats)` — mirroring `_ocr_pdf_bytes`. `layout_stats` is the
+    per-page column-layout breakdown (split/whole/AI-classified counts) for the caller to
+    persist in its job `output_reference`; it is None when no OCR ran (clean text layer /
+    non-PDF fallback).
+
+    PDF: page selection goes through `_needs_vision()`, so this honours
+    `FORCE_OCR_ALL_PAGES` exactly like the knowledge-layer pipeline (CLAUDE.md §8). With it
+    True — the default for this corpus — EVERY page is vision-OCR'd through the hybrid
+    column-layout path (`_ocr_pdf_pages`) and the PDF text layer is never trusted. This is
+    deliberate: legacy Preeti/Kantipur pages extract as ASCII garbage, and a page-level text
+    check cannot be relied on to spot them (a Preeti body under a single Unicode Devanagari
+    heading still "parses"). A region that fails OCR is skipped, never backfilled from the
+    text layer. With `FORCE_OCR_ALL_PAGES` False, only garbage/legacy/empty pages are OCR'd
+    and clean `valid_unicode` pages keep their free text layer (the zero-AI-cost path).
+    DOCX: whole-text classify — `valid_unicode` → text layer; else LibreOffice → PDF → the
+    PDF branch. Other mime types fall back to the plain text-layer extractor.
 
     Raises RuntimeError when NO text could be extracted at all (the job should fail
     honestly rather than feed the model nothing/garbage). Partial OCR failure on a document
@@ -551,21 +568,23 @@ async def extract_typed_document_text(
     if "pdf" in mime_type:
         page_texts = await asyncio.to_thread(_extract_pdf_pages_text, file_bytes)
         classifications = [_classify_page_text(t) for t in page_texts]
-        ocr_pages = [i for i, c in enumerate(classifications) if c != "valid_unicode"]
+        ocr_pages = [i for i, c in enumerate(classifications) if _needs_vision(c)]
 
         if not ocr_pages:
             text = "\n\n".join(t.strip() for t in page_texts if t.strip())
             if not text:
                 raise RuntimeError("No text could be extracted from the document.")
-            return text
+            return text, None
 
         cls_summary = ", ".join(f"p{i+1}={classifications[i]}" for i in ocr_pages)
         await step_cb(
             21,
-            f"Vision OCR — {len(ocr_pages)}/{len(page_texts)} page(s) have no usable text "
-            f"layer ({cls_summary[:80]})…",
+            f"Vision OCR — reading {len(ocr_pages)}/{len(page_texts)} page(s) "
+            f"({cls_summary[:80]})…",
         )
-        ocr_by_page, _ = await _ocr_pdf_pages(file_bytes, ocr_pages, step_cb, audit_ctx=audit_ctx)
+        ocr_by_page, layout_stats = await _ocr_pdf_pages(
+            file_bytes, ocr_pages, step_cb, audit_ctx=audit_ctx
+        )
 
         text = _assemble_page_texts(page_texts, classifications, ocr_by_page)
         if not text.strip():
@@ -583,12 +602,14 @@ async def extract_typed_document_text(
             )
             logger.warning(msg)
             await step_cb(29, msg)
-        return text
+            if layout_stats is not None:
+                layout_stats = {**layout_stats, "unreadable_pages": len(failed_pages)}
+        return text, layout_stats
 
     if "word" in mime_type or "docx" in mime_type or "msword" in mime_type:
         raw = await asyncio.to_thread(_extract_text_from_docx, file_bytes)
         if _classify_page_text(raw) == "valid_unicode":
-            return raw
+            return raw, None
         await step_cb(20, "Converting Word document to PDF for OCR…")
         pdf_bytes = await asyncio.to_thread(_docx_to_pdf_bytes, file_bytes)
         return await extract_typed_document_text(
@@ -596,7 +617,7 @@ async def extract_typed_document_text(
         )
 
     from app.processing.document_text import extract_text_from_bytes
-    return extract_text_from_bytes(file_bytes, mime_type)
+    return extract_text_from_bytes(file_bytes, mime_type), None
 
 
 def _split_into_sections(text: str, max_chars: int = 8000) -> list[str]:

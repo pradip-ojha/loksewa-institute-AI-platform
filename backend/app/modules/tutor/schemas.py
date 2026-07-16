@@ -28,6 +28,15 @@ class TutorAskResponse(BaseModel):
     follow_up_suggestions: list[str] = []
 
 
+class TutorSessionOut(BaseModel):
+    """Sidebar entry for one tutor chat session (ChatGPT-style session list)."""
+    id: uuid.UUID
+    title: str
+    message_count: int
+    created_at: datetime
+    last_message_at: datetime
+
+
 class TutorChatMessageOut(BaseModel):
     id: uuid.UUID
     session_id: uuid.UUID

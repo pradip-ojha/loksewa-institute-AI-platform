@@ -185,3 +185,24 @@ class TestAssemblePageTexts:
             {0: "", 1: ""},
         )
         assert out == ""
+
+    def test_ocr_wins_over_text_layer_on_a_valid_unicode_page(self):
+        """FORCE_OCR_ALL_PAGES OCRs every page, including `valid_unicode` ones. The OCR
+        text must win: a Preeti body under a single Unicode Devanagari heading classifies
+        `valid_unicode`, so trusting the text layer there would ingest ASCII garbage."""
+        out = self._assemble(
+            ["नेपाल k[jf/L garbage-body", "clean2"],
+            ["valid_unicode", "valid_unicode"],
+            {0: "OCR1", 1: "OCR2"},
+        )
+        assert out == "OCR1\n\nOCR2"
+
+    def test_ocr_failure_on_an_ocrd_page_skips_it(self):
+        """An OCR'd page whose OCR came back empty is skipped — never backfilled from the
+        raw text layer (garbage for this corpus)."""
+        out = self._assemble(
+            ["नेपाल k[jf/L garbage-body", "clean2"],
+            ["valid_unicode", "valid_unicode"],
+            {0: "", 1: "OCR2"},
+        )
+        assert out == "OCR2"

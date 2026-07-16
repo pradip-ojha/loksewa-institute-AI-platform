@@ -10,7 +10,7 @@ ChatGPT-style — one session per ongoing conversation, scoped to the chosen exa
 import logging
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.tutor.models import TutorChatMessage, TutorChatSession
@@ -36,7 +36,13 @@ async def get_or_create_session(
             return existing
     session = TutorChatSession(student_id=student_id, exam_id=exam_id)
     db.add(session)
-    await db.flush()
+    # COMMIT (not just flush): the streaming endpoint resolves the session before
+    # returning its StreamingResponse, and FastAPI ≥0.106 tears down the get_db
+    # dependency (rolling back the open transaction) as soon as the endpoint
+    # returns — BEFORE the stream generator runs. A merely-flushed row would be
+    # rolled back there, and the turn's final message insert would then violate
+    # the session FK. expire_on_commit=False keeps the object usable after commit.
+    await db.commit()
     return session
 
 
@@ -53,6 +59,58 @@ async def get_owned_session(
         )
     )
     return r.scalar_one_or_none()
+
+
+async def list_sessions(db: AsyncSession, student_id: uuid.UUID, exam_id: uuid.UUID) -> list[dict]:
+    """The student's tutor sessions for one exam, for the ChatGPT-style sidebar:
+    newest activity first, titled by the session's first question. Sessions with
+    zero messages (created but never used, e.g. an aborted first turn) are hidden."""
+    agg = (
+        select(
+            TutorChatMessage.session_id,
+            func.count().label("message_count"),
+            func.max(TutorChatMessage.created_at).label("last_message_at"),
+        )
+        .group_by(TutorChatMessage.session_id)
+        .subquery()
+    )
+    rows = (await db.execute(
+        select(TutorChatSession, agg.c.message_count, agg.c.last_message_at)
+        .join(agg, agg.c.session_id == TutorChatSession.id)
+        .where(TutorChatSession.student_id == student_id, TutorChatSession.exam_id == exam_id)
+        .order_by(agg.c.last_message_at.desc())
+    )).all()
+    if not rows:
+        return []
+    ids = [s.id for s, _, _ in rows]
+    # First question per session = the sidebar title (PG DISTINCT ON, earliest message wins).
+    firsts = (await db.execute(
+        select(TutorChatMessage.session_id, TutorChatMessage.question)
+        .distinct(TutorChatMessage.session_id)
+        .where(TutorChatMessage.session_id.in_(ids))
+        .order_by(TutorChatMessage.session_id, TutorChatMessage.created_at.asc())
+    )).all()
+    title_by = {sid: q for sid, q in firsts}
+    return [
+        {
+            "id": s.id,
+            "title": (title_by.get(s.id) or "नयाँ कुराकानी").strip()[:80],
+            "message_count": count,
+            "created_at": s.created_at,
+            "last_message_at": last_at,
+        }
+        for s, count, last_at in rows
+    ]
+
+
+async def delete_session(db: AsyncSession, student_id: uuid.UUID, session_id: uuid.UUID) -> bool:
+    """Delete an owned session (messages cascade via the DB FK). False if not found/owned."""
+    session = await get_owned_session(db, student_id, session_id)
+    if not session:
+        return False
+    await db.delete(session)
+    await db.commit()
+    return True
 
 
 async def get_history(db: AsyncSession, student_id: uuid.UUID, session_id: uuid.UUID) -> list[TutorChatMessage]:

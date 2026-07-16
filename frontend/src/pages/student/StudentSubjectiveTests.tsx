@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft, FileCheck2, FileText, Upload, ExternalLink, AlertTriangle, Loader2, CheckCircle2,
-  GraduationCap, Send, MessageCircleQuestion,
+  GraduationCap, Send, MessageCircleQuestion, X,
 } from "lucide-react";
 import { JobStatusPoller } from "../../components/JobStatusPoller";
 import type { JobState } from "../../components/JobStatusPoller";
@@ -240,6 +240,9 @@ function ReuploadHint({ jobId, onReupload }: { jobId: string; onReupload: () => 
 
 function ResultView({ testId, onBack }: { testId: string; onBack: () => void }) {
   const [result, setResult] = useState<AnswerResult | null>(null);
+  // Desktop: opening the chat splits the page 65/35 (results | chat); closed by
+  // default so results get the full width. Mobile: the chat opens at the bottom.
+  const [chatOpen, setChatOpen] = useState(false);
   const [error, setError] = useState("");
 
   const load = useCallback(async () => {
@@ -319,61 +322,88 @@ function ResultView({ testId, onBack }: { testId: string; onBack: () => void }) 
               तपाईंको नतिजा तयार छ। जाँचिएको PDF (रातो कलमको टिप्पणीसहित) तयार हुँदैछ…
             </Alert>
           )}
-          <div className={`my-4 overflow-hidden rounded-lg ${toneGrad[tone]} p-6 text-center text-white`}>
-            <p className="text-sm font-medium text-white/80">Total Marks</p>
-            <p className="mt-1 text-4xl font-bold tracking-tight">
-              {result.total_marks_awarded}
-              <span className="text-xl font-medium text-white/70"> / {result.total_marks_possible}</span>
-            </p>
-            {pct != null && <p className="mt-1 text-sm font-medium text-white/80">{pct}%</p>}
-            {result.checked_pdf_url && (
-              <a
-                href={result.checked_pdf_url}
-                target="_blank"
-                rel="noreferrer"
-                className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-white/20 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-white/30"
-              >
-                <ExternalLink className="h-4 w-4" /> View Checked PDF
-              </a>
+
+          {/* Desktop: results 65% | chat 35% side by side (chat toggleable, closed by
+              default so results get the full width). Mobile: normal column flow — the
+              chat panel naturally sits at the bottom, as before. */}
+          <div className="lg:flex lg:items-start lg:gap-4">
+            <div className={`min-w-0 ${chatOpen ? "lg:w-[65%]" : "lg:w-full"}`}>
+              <div className={`my-4 overflow-hidden rounded-lg ${toneGrad[tone]} p-6 text-center text-white`}>
+                <p className="text-sm font-medium text-white/80">Total Marks</p>
+                <p className="mt-1 text-4xl font-bold tracking-tight">
+                  {result.total_marks_awarded}
+                  <span className="text-xl font-medium text-white/70"> / {result.total_marks_possible}</span>
+                </p>
+                {pct != null && <p className="mt-1 text-sm font-medium text-white/80">{pct}%</p>}
+                {result.checked_pdf_url && (
+                  <a
+                    href={result.checked_pdf_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-white/20 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-white/30"
+                  >
+                    <ExternalLink className="h-4 w-4" /> View Checked PDF
+                  </a>
+                )}
+              </div>
+
+              <div className="space-y-3">
+                {result.questions.map((q) => (
+                  <Card key={q.question_number}>
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-gray-800">प्रश्न {q.question_number}</span>
+                      <Badge tone="brand" className="text-sm">{q.marks_awarded} / {q.marks_possible}</Badge>
+                    </div>
+                    {q.question_text && <p className="mt-1 text-xs text-gray-500 font-deva">{q.question_text}</p>}
+                    {q.sections && q.sections.length > 0 && (
+                      <div className="mt-3">
+                        <SectionBreakdown sections={q.sections} />
+                      </div>
+                    )}
+                    {q.feedback && (
+                      <div className="mt-3 rounded-xl bg-gray-50/70 p-3">
+                        <RichText size="sm">{q.feedback}</RichText>
+                      </div>
+                    )}
+                    {q.mistakes.length > 0 && (
+                      <div className="mt-2">
+                        <p className="mb-1 text-xs font-semibold text-danger-600">सुधार्नुपर्ने बुँदा</p>
+                        <ul className="space-y-1">
+                          {q.mistakes.map((m, i) => (
+                            <li key={i} className="flex gap-1.5 text-xs text-danger-600 font-deva">
+                              <span className="mt-1 h-1 w-1 flex-shrink-0 rounded-full bg-danger-400" />
+                              {m}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </Card>
+                ))}
+              </div>
+
+              {!chatOpen && result.sheet_id && (
+                <button
+                  onClick={() => setChatOpen(true)}
+                  className="mt-4 flex w-full items-center gap-3 rounded-lg border border-gray-200 bg-white p-4 text-left transition-colors hover:bg-gray-50"
+                >
+                  <span className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-brand-50 text-brand-600">
+                    <MessageCircleQuestion className="h-5 w-5" />
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block text-sm font-semibold text-gray-800">नतिजाबारे प्रश्न सोध्नुहोस्</span>
+                    <span className="block text-xs text-gray-500 font-deva">अंक, सुधार र छुटेका बुँदाबारे शिक्षकसँग जस्तै सोध्नुहोस्</span>
+                  </span>
+                </button>
+              )}
+            </div>
+
+            {chatOpen && result.sheet_id && (
+              <div className="mt-4 lg:sticky lg:top-4 lg:mt-4 lg:w-[35%] lg:flex-shrink-0">
+                <FeedbackChat sheetId={result.sheet_id} onClose={() => setChatOpen(false)} />
+              </div>
             )}
           </div>
-
-          <div className="space-y-3">
-            {result.questions.map((q) => (
-              <Card key={q.question_number}>
-                <div className="flex items-center justify-between">
-                  <span className="font-semibold text-gray-800">प्रश्न {q.question_number}</span>
-                  <Badge tone="brand" className="text-sm">{q.marks_awarded} / {q.marks_possible}</Badge>
-                </div>
-                {q.question_text && <p className="mt-1 text-xs text-gray-500 font-deva">{q.question_text}</p>}
-                {q.sections && q.sections.length > 0 && (
-                  <div className="mt-3">
-                    <SectionBreakdown sections={q.sections} />
-                  </div>
-                )}
-                {q.feedback && (
-                  <div className="mt-3 rounded-xl bg-gray-50/70 p-3">
-                    <RichText size="sm">{q.feedback}</RichText>
-                  </div>
-                )}
-                {q.mistakes.length > 0 && (
-                  <div className="mt-2">
-                    <p className="mb-1 text-xs font-semibold text-danger-600">सुधार्नुपर्ने बुँदा</p>
-                    <ul className="space-y-1">
-                      {q.mistakes.map((m, i) => (
-                        <li key={i} className="flex gap-1.5 text-xs text-danger-600 font-deva">
-                          <span className="mt-1 h-1 w-1 flex-shrink-0 rounded-full bg-danger-400" />
-                          {m}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-              </Card>
-            ))}
-          </div>
-
-          {result.sheet_id && <FeedbackChat sheetId={result.sheet_id} />}
         </>
       )}
     </div>
@@ -397,8 +427,7 @@ const FEEDBACK_STARTERS = [
   "कुन बुँदाहरू छुटे?",
 ];
 
-function FeedbackChat({ sheetId }: { sheetId: string }) {
-  const [open, setOpen] = useState(false);
+function FeedbackChat({ sheetId, onClose }: { sheetId: string; onClose: () => void }) {
   const [turns, setTurns] = useState<FeedbackTurn[]>([]);
   const [question, setQuestion] = useState("");
   const [chatId, setChatId] = useState<string | null>(null);
@@ -428,25 +457,33 @@ function FeedbackChat({ sheetId }: { sheetId: string }) {
     return out;
   };
 
-  async function handleOpen() {
-    setOpen(true);
-    if (chatId || starting) return;
-    setStarting(true);
-    setStartError("");
-    try {
-      const chat = await subjectiveTestsService.startFeedbackChat(sheetId);
-      setChatId(chat.chat_id);
-      setTurns(toTurns(chat.messages));
-    } catch (err) {
-      setStartError(getErrorMessage(err, "Could not start the chat."));
-    } finally {
-      setStarting(false);
-    }
-  }
+  // The parent renders this panel only when the chat is open, so start (or resume)
+  // the chat as soon as it mounts.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setStarting(true);
+      setStartError("");
+      try {
+        const chat = await subjectiveTestsService.startFeedbackChat(sheetId);
+        if (cancelled) return;
+        setChatId(chat.chat_id);
+        setTurns(toTurns(chat.messages));
+      } catch (err) {
+        if (!cancelled) setStartError(getErrorMessage(err, "Could not start the chat."));
+      } finally {
+        if (!cancelled) setStarting(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sheetId]);
 
   useEffect(() => {
-    if (open) endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [turns, open]);
+    endRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [turns]);
 
   async function ask(q: string) {
     const text = q.trim();
@@ -472,33 +509,23 @@ function FeedbackChat({ sheetId }: { sheetId: string }) {
     }
   }
 
-  if (!open) {
-    return (
-      <button
-        onClick={handleOpen}
-        className="mt-4 flex w-full items-center gap-3 rounded-lg border border-gray-200 bg-white p-4 text-left transition-colors hover:bg-gray-50"
-      >
-        <span className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-brand-50 text-brand-600">
-          <MessageCircleQuestion className="h-5 w-5" />
-        </span>
-        <span className="min-w-0">
-          <span className="block text-sm font-semibold text-gray-800">नतिजाबारे प्रश्न सोध्नुहोस्</span>
-          <span className="block text-xs text-gray-500 font-deva">अंक, सुधार र छुटेका बुँदाबारे शिक्षकसँग जस्तै सोध्नुहोस्</span>
-        </span>
-      </button>
-    );
-  }
-
   return (
-    <Card className="mt-4" padded={false}>
+    <Card padded={false} className="lg:flex lg:max-h-[calc(100vh-3rem)] lg:flex-col">
       <div className="flex items-center gap-2 border-b border-gray-100 px-4 py-3">
         <span className="flex h-7 w-7 items-center justify-center rounded-full bg-brand-100 text-brand-700">
           <MessageCircleQuestion className="h-4 w-4" />
         </span>
         <span className="text-sm font-semibold text-gray-800">नतिजाबारे प्रश्नोत्तर</span>
+        <button
+          onClick={onClose}
+          className="ml-auto flex h-7 w-7 items-center justify-center rounded-md text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600"
+          aria-label="Close chat"
+        >
+          <X className="h-4 w-4" />
+        </button>
       </div>
 
-      <div className="p-4">
+      <div className="p-4 lg:flex lg:min-h-0 lg:flex-1 lg:flex-col">
         {starting ? (
           <div className="flex items-center gap-2 py-6 text-sm text-gray-500">
             <Loader2 className="h-4 w-4 animate-spin" /> Loading…
@@ -507,7 +534,7 @@ function FeedbackChat({ sheetId }: { sheetId: string }) {
           <Alert>{startError}</Alert>
         ) : (
           <>
-            <div className="min-h-[20vh] space-y-4">
+            <div className="min-h-[20vh] space-y-4 lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:pr-1">
               {turns.map((turn, i) => (
                 <div key={i} className="space-y-2">
                   {turn.question && (
@@ -580,7 +607,7 @@ function FeedbackChat({ sheetId }: { sheetId: string }) {
                 value={question}
                 onChange={(e) => setQuestion(e.target.value)}
                 placeholder="प्रश्न सोध्नुहोस्…"
-                className="flex-1 rounded-full border-0 bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-0 font-deva"
+                className="flex-1 rounded-full border-0 bg-transparent px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-0 font-deva"
               />
               <button
                 type="submit"

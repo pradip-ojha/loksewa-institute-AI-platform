@@ -11,7 +11,9 @@ from app.core.database import get_db
 from app.core.exceptions import AppException
 from app.core.ratelimit import AI_CHAT_LIMIT, limiter
 from app.modules.tutor import service as svc
-from app.modules.tutor.schemas import TutorAskRequest, TutorAskResponse, TutorChatMessageOut
+from app.modules.tutor.schemas import (
+    TutorAskRequest, TutorAskResponse, TutorChatMessageOut, TutorSessionOut,
+)
 from app.modules.users.models import User
 
 logger = logging.getLogger(__name__)
@@ -84,6 +86,28 @@ async def ask_tutor_stream(
             yield json.dumps({"type": "error", "message": "उत्तर ल्याउन सकिएन।"}, ensure_ascii=False) + "\n"
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+@router.get("/student/tutor/sessions", response_model=list[TutorSessionOut])
+async def tutor_sessions(
+    exam_id: uuid.UUID = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_student),
+):
+    """The student's chat sessions for one exam (sidebar list): newest activity
+    first, titled by each session's first question. Empty sessions are hidden."""
+    return [TutorSessionOut(**s) for s in await svc.list_sessions(db, current_user.id, exam_id)]
+
+
+@router.delete("/student/tutor/sessions/{session_id}", status_code=204)
+async def delete_tutor_session(
+    session_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_student),
+):
+    """Delete one of the student's own chat sessions (messages cascade)."""
+    if not await svc.delete_session(db, current_user.id, session_id):
+        raise AppException(404, "session_not_found", "Chat session not found.")
 
 
 @router.get("/student/tutor/history", response_model=list[TutorChatMessageOut])

@@ -423,19 +423,32 @@ documents → Azure gpt-5 typed extraction** (`MCQExtractionAgent` uses `get_pro
 spec §6.2), not gpt-5.5/Gemini. Upload fields: display name, **Exam**, **Chapter (required)**, PDF/Word
 file, topic (opt), subtopic (opt), custom extraction instruction.
 
-**MCQ document ingestion is LAYOUT-AWARE** (all three paths — upload extraction, generation,
-regeneration — read the source file via
-`knowledge_processing_agent.extract_typed_document_text(file_bytes, mime, step_cb)`): each PDF page's
-text layer is classified (`_classify_page_text`) — **every page `valid_unicode` → the free text layer
-is used directly** (the common born-digital case, zero AI cost, old behavior); any garbage/legacy-
-Preeti/empty pages are instead **column-aware vision-OCR'd** (gpt-5 typed vision through the §8 hybrid
-layout detector) and reassembled with the clean pages in page order — a scanned/Preeti MCQ document no
-longer silently feeds ASCII garbage to the model. DOCX: whole-text classify → LibreOffice→PDF→OCR when
-not clean Unicode (same as §8). A document from which NO text can be extracted **fails the job
+**MCQ document ingestion is LAYOUT-AWARE and OCR-ONLY, exactly like the Knowledge Layer** (all three
+paths — upload extraction, generation, regeneration — read the source file via
+`knowledge_processing_agent.extract_typed_document_text(file_bytes, mime, step_cb)`). Page selection
+goes through the SHARED `_needs_vision()`, so MCQ honours **`FORCE_OCR_ALL_PAGES`** (§8) rather than
+carrying its own rule: with it True (the default) **EVERY PDF page is column-aware vision-OCR'd**
+(gpt-5 typed vision through the §8 hybrid layout detector) and **the PDF text layer is never trusted**.
+This is deliberate — a page-level text check CANNOT be relied on to spot legacy Preeti: the corpus is
+largely Preeti/Kantipur-typed, and `_classify_page_text` returns `valid_unicode` on the mere PRESENCE
+of one Devanagari character (`_has_devanagari` is an `any()` over the U+0900–U+097F block), so a Preeti
+body under a single Unicode Devanagari heading/page-number would "parse" and pass ASCII garbage
+straight to the model. OCR'ing every page removes that class of silent failure. `_assemble_page_texts`
+enforces it: **a page that was OCR'd always uses its OCR text**, and an OCR failure SKIPS the page —
+never backfilled from the raw text layer. Flipping `FORCE_OCR_ALL_PAGES` to False restores the
+cost-saving path (only garbage/legacy/empty pages OCR'd, clean `valid_unicode` pages keep their free
+text layer) — and re-exposes the `any()` weakness above, so it is not the default.
+DOCX: whole-text classify → LibreOffice→PDF→OCR when not clean Unicode (same as §8) — this branch
+still trusts the classification, so a Preeti DOCX carrying a Unicode heading is the one residual
+exposure (upload such papers as PDF). A document from which NO text can be extracted **fails the job
 honestly** (extraction + generation; regeneration degrades to feedback+knowledge-only since its source
 file is optional context); partial page failures continue with a `Warning: N page(s) unreadable` step.
-Note: a pure-English typed document has no Devanagari so it classifies `legacy_font` and gets OCR'd —
-costs vision calls but still extracts correctly (conservative by design).
+`extract_typed_document_text` returns **`(text, layout_stats)`** (mirroring `_ocr_pdf_bytes`), and the
+extraction/generation jobs persist `layout_stats` under `output_reference.layout` (plus
+`unreadable_pages` when any page failed) — the same per-page split/whole/AI-classified breakdown the
+knowledge job records. The transient `Layout: …` progress step is overwritten by the next step, so
+without this the column-split decisions left no durable trace; regeneration discards the stats (its
+source file is optional context, and it has no batch-shaped `output_reference`).
 
 **Chapter is required on every MCQ creation path (upload / generation / manual add) and is propagated
 to every produced `MCQQuestion.chapter`** — exams hold multiple chapters now, so chapter tagging is
@@ -1086,12 +1099,13 @@ still answers from scope).
   pre-answer routing; sentinel-tail metadata parsing per `app/ai/agents/streaming.py`; non-stream
   endpoint retained as fallback — the frontend retries a stream that failed before any answer text
   once via the plain `ask` endpoint),
-  `GET /api/student/tutor/history?session_id=` (one session) or `?exam_id=` (this student's full
-  tutor conversation for that exam, merged across sessions via `service.get_history_by_exam` — mirrors
-  the video tutor's per-video history and is what `StudentTutor.tsx` loads on mount/exam-switch to
-  restore the chat instead of starting blank; it also resumes the most recent session id from the
-  loaded history so follow-up questions keep in-session backend context, `TutorChatMessageOut` carries
-  `session_id` for this).
+  `GET /api/student/tutor/history?session_id=` (one session) or `?exam_id=` (merged across sessions
+  via `service.get_history_by_exam` — retained for API compatibility; the UI now works per-session),
+  **`GET /api/student/tutor/sessions?exam_id=`** (`service.list_sessions` — the ChatGPT-style sidebar
+  list: sessions with ≥1 message, newest activity first, `title` = the session's first question,
+  plus `message_count`/`last_message_at`; empty sessions are hidden), and
+  **`DELETE /api/student/tutor/sessions/{session_id}`** (`service.delete_session`, ownership-checked,
+  messages cascade via the DB FK).
 - **Tables** (migration `014_chatbots`): `tutor_chat_sessions`, `tutor_chat_messages` (mirrors
   `video_chat_messages`).
 - **Frontend:** `pages/student/StudentTutor.tsx` (full-page chat, route `/student/tutor`, 4th student
@@ -1316,10 +1330,19 @@ old behavior (all enrolled exams merged). Defaults to the first enrolled exam, l
 - **Video Tutor:** watch video, view summary+timeline, ask AI questions.
 - **AI Tutor** (`pages/student/StudentTutor.tsx`, route `/student/tutor`): exam-wide, personalized
   notes/book tutor (§13.1). Full-page chat over the shared selected exam (above), topic auto-selected;
-  activity-aware. Reopening the page restores the prior conversation for that exam (see §13.1).
+  activity-aware. **ChatGPT-style sessions:** a toggleable sidebar (static column on desktop, overlay
+  drawer on mobile) lists the exam's past chats (first-question title + date + count) from
+  `GET /tutor/sessions`, with switch, per-session delete (confirm), and a "नयाँ च्याट" button
+  (new chat = `sessionId null`; the backend creates the session on the first ask). Reopening the page
+  opens the MOST RECENT session (per-session history via `?session_id=`, no longer the merged exam
+  history).
 - **Subjective Test:** view/download question paper, upload answer sheet, quality feedback, reupload
   up to 2x, see result + checked PDF immediately. A **feedback chatbot** (§12.1) explains the checked
-  result (marks/improvement/missing points) — read-only, never re-checks the sheet.
+  result (marks/improvement/missing points) — read-only, never re-checks the sheet. **Result layout:**
+  on desktop the chat is a toggleable RIGHT PANEL — closed by default (results full-width); opening it
+  splits the page 65% results / 35% chat (sticky, own scroll) so the student reads feedback while
+  chatting; the header X closes it. On mobile the chat stays at the bottom of the results (single
+  column). One session per test sheet — no session sidebar here.
 - **Results:** MCQ attempts, subjective results, checked PDFs, video activity.
 - **Profile:** name, email, change password.
 
@@ -1708,7 +1731,8 @@ POST   /api/student/subjective/sheets/{sheet_id}/feedback-chat/{chat_id}/message
 POST   /api/admin/videos                  GET    /api/student/videos
 POST   /api/student/videos/{id}/ask       POST   /api/student/videos/{id}/ask/stream
 POST   /api/student/tutor/ask             GET    /api/student/tutor/history
-POST   /api/student/tutor/ask/stream
+POST   /api/student/tutor/ask/stream      GET    /api/student/tutor/sessions
+DELETE /api/student/tutor/sessions/{session_id}
 POST   /api/admin/skills/chat/start
 POST   /api/admin/skills/chat/{id}/message
 POST   /api/admin/skills/chat/{id}/approve

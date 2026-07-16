@@ -267,7 +267,11 @@ async def get_or_create_chat_session(
             return existing
     session = VideoChatSession(video_id=video_id, student_id=student_id)
     db.add(session)
-    await db.flush()
+    # COMMIT (not just flush) — same reason as tutor get_or_create_session: the
+    # stream endpoint resolves the session before returning its StreamingResponse,
+    # and get_db teardown rolls back a merely-flushed row before the generator
+    # persists the turn (FK violation on video_chat_messages otherwise).
+    await db.commit()
     return session
 
 

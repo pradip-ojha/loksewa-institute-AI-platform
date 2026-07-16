@@ -272,9 +272,16 @@ def balance_answer_positions(questions: list) -> None:
         _q_set(q, "correct_option_ids", [_OPTION_IDS[target]])
 
 
-def _extraction_output(saved: int, skipped: list[str], total_returned: int, batch_id) -> dict:
+def _extraction_output(
+    saved: int, skipped: list[str], total_returned: int, batch_id,
+    layout: dict | None = None,
+) -> dict:
     """Job output_reference so the admin can see how many questions were saved
-    vs. skipped (and why), instead of silently losing malformed entries."""
+    vs. skipped (and why), instead of silently losing malformed entries.
+
+    `layout` carries the per-page column-split breakdown from the OCR pass (CLAUDE.md §8),
+    mirroring what the knowledge job records — without it the slicing decisions are invisible
+    once the transient progress step is overwritten."""
     out: dict = {
         "batch_id": str(batch_id),
         "saved": saved,
@@ -283,6 +290,8 @@ def _extraction_output(saved: int, skipped: list[str], total_returned: int, batc
     }
     if skipped:
         out["skip_reasons"] = skipped[:20]
+    if layout:
+        out["layout"] = layout
     return out
 
 
@@ -610,7 +619,7 @@ class MCQExtractionAgent:
         # Layout-aware extraction (CLAUDE.md §8/§9): a clean-Unicode text layer is used
         # for free; scanned/Preeti pages are column-aware vision-OCR'd instead of feeding
         # the model ASCII garbage. Raises when nothing could be extracted (fail honestly).
-        document_text = await extract_typed_document_text(
+        document_text, layout_stats = await extract_typed_document_text(
             file_bytes, mime_type, _ocr_step,
             audit_ctx={
                 "agent_type": "PageLayoutClassifier",
@@ -675,7 +684,8 @@ class MCQExtractionAgent:
             await db.commit()
 
         await _job(progress=100, step="Extraction complete",
-                   output=_extraction_output(len(normalized), skipped, len(questions_data), batch.id))
+                   output=_extraction_output(len(normalized), skipped, len(questions_data), batch.id,
+                                             layout=layout_stats))
         return batch
 
     async def _get_skill(self, db: AsyncSession) -> str:
@@ -727,7 +737,7 @@ class MCQGenerationAgent:
         await _job(progress=20, step="Extracting text from content")
         # Layout-aware extraction — the file IS the requested source content, so a totally
         # unreadable file fails the job honestly (see extract_typed_document_text).
-        document_text = await extract_typed_document_text(
+        document_text, layout_stats = await extract_typed_document_text(
             file_bytes, mime_type, _ocr_step,
             audit_ctx={
                 "agent_type": "PageLayoutClassifier",
@@ -816,7 +826,8 @@ class MCQGenerationAgent:
             await db.commit()
 
         await _job(progress=100, step="Generation complete",
-                   output=_extraction_output(len(normalized), skipped, len(questions_data), batch.id))
+                   output=_extraction_output(len(normalized), skipped, len(questions_data), batch.id,
+                                             layout=layout_stats))
         return batch
 
     async def _detect_covered_topics(self, db: AsyncSession, document_text: str) -> tuple[list[str], list[str]]:
@@ -1014,7 +1025,7 @@ class MCQRegenerationAgent:
             # feedback+knowledge-only instead of failing the whole regeneration.
             try:
                 file_bytes = await asyncio.to_thread(get_r2().download_fileobj, file_meta[0])
-                document_text = (await extract_typed_document_text(
+                extracted, _layout = await extract_typed_document_text(
                     file_bytes, file_meta[1], _ocr_step,
                     audit_ctx={
                         "agent_type": "PageLayoutClassifier",
@@ -1022,7 +1033,8 @@ class MCQRegenerationAgent:
                         "entity_type": "mcq_review_batch",
                         "entity_id": self._batch_id,
                     },
-                ))[:20000]
+                )
+                document_text = extracted[:20000]
             except Exception as exc:
                 logger.warning(
                     "Regeneration: could not extract source document text (%s) — "

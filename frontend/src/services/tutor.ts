@@ -25,6 +25,14 @@ export interface TutorAskBody {
   chat_session_id?: string | null;
 }
 
+export interface TutorSessionItem {
+  id: string;
+  title: string;
+  message_count: number;
+  created_at: string;
+  last_message_at: string;
+}
+
 export interface TutorHistoryItem {
   id: string;
   session_id: string;
@@ -43,6 +51,11 @@ export const tutorService = {
     streamNdjson("/api/student/tutor/ask/stream", body, handlers, signal),
   getHistory: (sessionId: string): Promise<TutorHistoryItem[]> =>
     api.get("/api/student/tutor/history", { params: { session_id: sessionId } }).then((r) => r.data),
+  // ChatGPT-style session sidebar: list sessions for an exam / delete one.
+  getSessions: (examId: string): Promise<TutorSessionItem[]> =>
+    api.get("/api/student/tutor/sessions", { params: { exam_id: examId } }).then((r) => r.data),
+  deleteSession: (sessionId: string): Promise<void> =>
+    api.delete(`/api/student/tutor/sessions/${sessionId}`).then(() => undefined),
   // Full conversation for an exam, merged across sessions — used to restore the
   // chat when the AI Tutor page is reopened.
   getHistoryByExam: (examId: string): Promise<TutorHistoryItem[]> =>
