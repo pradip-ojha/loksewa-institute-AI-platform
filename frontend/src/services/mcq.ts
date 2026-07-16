@@ -119,7 +119,10 @@ export const mcqService = {
     return data;
   },
 
-  async listQuestions(params: { status?: string; topic?: string; subtopic?: string; complexity?: string; page?: number; per_page?: number }): Promise<PagedResult<MCQQuestion>> {
+  /** Sentinel chapter filter selecting questions with no chapter (backend UNASSIGNED_CHAPTER). */
+  UNASSIGNED_CHAPTER: "__unassigned__",
+
+  async listQuestions(params: { status?: string; topic?: string; subtopic?: string; complexity?: string; chapter?: string; page?: number; per_page?: number }): Promise<PagedResult<MCQQuestion>> {
     const { data } = await api.get("/api/admin/mcq/questions", { params });
     return data;
   },

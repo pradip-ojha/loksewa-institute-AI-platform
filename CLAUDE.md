@@ -406,8 +406,10 @@ topic match the chapter's chunks still return.
   one `document_type == model_qa` (top-3) — and merges, so a fetch always draws from both content shapes
   rather than letting them compete for one top_k. model_qa hits are surfaced distinctly
   (`[Model Q&A — प्रश्न: {question}]\n{answer}`) so the agent knows it is the model answer to exactly that
-  question. Best-effort (returns [] on failure → callers continue). MCQ generation's `_fetch_knowledge_by_type`
-  is a Postgres-only query and is deliberately NOT part of this — `model_qa` does not feed MCQ generation.
+  question. Best-effort (returns [] on failure → callers continue). **MCQ generation/regeneration do NOT
+  read the knowledge layer at all** (neither this dual retrieval nor the old Postgres chunk fetch): their
+  content comes from the SOURCE DOCUMENT, and approved **example questions** supply style/inspiration
+  (§9.2). So `model_qa` — and knowledge chunks generally — never feed MCQ generation.
 
 ---
 
@@ -420,8 +422,8 @@ Four workflows: (1) upload existing MCQ document, (2) generate from content, (3)
 Extract: question text, options, correct option, explanation. Correct-answer format varies
 (A/B/C/D, क/ख/ग/घ, 1/2/3/4, १/२/३/४) — detected then normalized internally to A/B/C/D. **Typed
 documents → Azure gpt-5 typed extraction** (`MCQExtractionAgent` uses `get_provider("text_extraction")`,
-spec §6.2), not gpt-5.5/Gemini. Upload fields: display name, **Exam**, **Chapter (required)**, PDF/Word
-file, topic (opt), subtopic (opt), custom extraction instruction.
+spec §6.2), not gpt-5.5/Gemini. Upload fields: display name, **Exam**, **Chapter (OPTIONAL — see the
+two-stage assignment below)**, PDF/Word file, topic (opt), subtopic (opt), custom extraction instruction.
 
 **MCQ document ingestion is LAYOUT-AWARE and OCR-ONLY, exactly like the Knowledge Layer** (all three
 paths — upload extraction, generation, regeneration — read the source file via
@@ -450,20 +452,77 @@ knowledge job records. The transient `Layout: …` progress step is overwritten 
 without this the column-split decisions left no durable trace; regeneration discards the stats (its
 source file is optional context, and it has no batch-shaped `output_reference`).
 
-**Chapter is required on every MCQ creation path (upload / generation / manual add) and is propagated
-to every produced `MCQQuestion.chapter`** — exams hold multiple chapters now, so chapter tagging is
-what makes per-chapter test sets (§10) possible. Topic detection + knowledge enrichment are scoped to
-the document's chapter (chapter primary; see §8).
+**Chapter is OPTIONAL on EXTRACTION (upload) only; still REQUIRED on generation + manual add.** Exams
+hold multiple chapters, so a full model exam paper spans them all — forcing one chapter per upload
+blocked that. Extraction now runs a **two-stage chapter→topic assignment** (both stages in
+`MCQExtractionAgent`; the OCR/page-slicing Step A is unchanged, §8):
+- **Stage B — extraction (chapter-only), CHUNKED + PARALLEL.** The glued OCR text is split into ≤40k
+  chunks by `_split_text_chunks` — cut at the **nearest line break** before the limit (never
+  mid-line; a single over-long line hard-cuts), so no fixed-40k truncation silently drops the tail of
+  a long paper. Each chunk is one extraction call (`asyncio.Semaphore(6)`, own short session for
+  audit, partial-success: a failed chunk is skipped + noted, all-failed raises). The extractor assigns
+  **only the chapter** per question (never topics): in **locked mode** (admin picked a chapter) the
+  chapter block is omitted and every question is stamped with `doc.chapter`; in **auto-detect mode**
+  (blank) `CHAPTER_ASSIGNMENT_BLOCK` injects the exam's flat chapter list and the model returns a
+  per-question `chapter` (explicitly allowed to be **null** for genuinely ambiguous questions — a null
+  is recovered later, a forced guess misfiles).
+- **Group by chapter** (Python): auto-mode chapters are validated against the real chapter list;
+  unknown/absent ⇒ the **null group**.
+- **Stage C — topic assignment, per chapter (parallel).** `MCQTopicAssignmentAgent`
+  (`ai/agents/mcq_topic_assignment_agent.py`, `get_provider("thinking")` = **gpt-5, NOT skill-tunable**,
+  absent from `_DEFAULT_SKILLS`) — each real chapter group gets a **scoped** call seeing ONLY that
+  chapter's topics (`video.service.get_chapter_tree(exam_id, chapter=…)`), so a cross-chapter topic is
+  structurally impossible; 25-question chunks run sequentially within a chapter, chapters run in
+  parallel (`Semaphore(6)`). The **null group** gets a **recovery** call over the FULL tree that may
+  assign chapter + topic — questions the busy extractor couldn't place often resolve when a dedicated
+  call sees only them + the whole tree. Batch alignment is by an echoed `Ref: R<n>` code
+  (`align_assignments`, mirroring `_align_replacements`): unknown/dup/missing ref ⇒ that question keeps
+  a null topic, never a mis-assignment. A Stage-C failure leaves the group null-topic (a real group's
+  chapter still stands), never a wrong label.
+- **Validation** (`video.service.resolve_syllabus_labels`, `locked_chapter=doc.chapter` in locked
+  mode): the AI only proposes; Python enforces official-or-null. Locked-mode fallback: a null Stage-C
+  topic falls back to the admin's validated `doc.topic`/`doc.subtopic` hint.
+- **Job output** (`output_reference`) adds `chapters_detected`, `questions_by_chapter`,
+  `unassigned_count` (plus the `layout` stats above) so the admin can verify auto-detection and spot
+  unfiled questions in the review batch. Unfiled questions are **never dropped** — they land in the
+  batch with a null chapter for manual tagging.
+
+Generation + manual-add keep chapter required and single (example questions scoped to that one chapter,
+§9.2; chapter primary). Every produced `MCQQuestion.chapter` is the per-question resolved value (locked
+⇒ the admin chapter; auto ⇒ the validated AI chapter or null).
 
 ### 9.2 MCQ Generation
-Inputs: uploaded content, objective syllabus, existing approved MCQs as style examples, custom
-instruction. Fields: display name, file, **Exam**, **Chapter (required)**, count, topic (opt),
-subtopic (opt), custom instruction.
+Inputs: the uploaded content (the SOLE source of question CONTENT) + approved **example questions** of
+those topics (style/inspiration — what a real Loksewa question looks like) + active MCQ skill + custom
+instruction. Fields: display name, file, **Exam**, **Chapter (required)**, count, topic (opt), subtopic
+(opt), custom instruction.
+**Generation does NOT read the knowledge layer and does NOT run a topic-detection call** (removed): the
+source document already carries the facts, so the old ~100-chunk Postgres enrichment + its gpt-5.5
+topic-detection pass were dropped — generation is now a SINGLE AI call. The high-value input is the
+example questions (`_fetch_example_questions` — approved MCQs scoped **chapter-first**, topic narrows,
+with fallback chapter+topic → chapter → exam; `_select_diverse` spreads them across easy/medium/hard so
+the model sees the full framing range). **Cold start:** a fresh exam with no approved bank yields no
+examples, so generation leans on the source + the prompt's DISTRACTOR DESIGN rules — quality compounds
+as the approved bank grows. The one accepted trade-off is a slightly less sharp numerical distractor
+(a note-sourced "older official figure"), small because the source usually has it and the examples
+teach the pattern.
 
 ### 9.3 Review Flow (extracted + generated)
 Admin: Accept / Reject (with feedback) / Edit / Delete. Bulk: Accept All / Reject All.
 Rejection → admin feedback → system regenerates only rejected → admin reviews again. Regeneration
-uses: source content + admin feedback + style examples + active MCQ skill.
+uses: source content + admin feedback + **example questions** (same `_fetch_example_questions` path as
+generation, chapter-scoped) + active MCQ skill. Like generation, regeneration reads **no** knowledge
+layer.
+**Edit** opens a full question editor (`QuestionEditModal` in `pages/admin/MCQ.tsx`, shared by the
+review batch AND the Question Bank) — text, options, correct answer, explanation, difficulty, and the
+`chapter → topic → subtopic` dependent dropdowns — wired to `PUT /admin/mcq/questions/{id}`. Every
+question card shows its **chapter** (a warning-tone "Unassigned chapter" chip when null), so the admin
+can VERIFY auto-detected chapters (§9.1) and FILE the questions the extractor left unassigned — without
+which a null-chapter question could never enter a chapter-scoped test set (§10). The Question Bank adds
+a **chapter filter** including an "Unassigned chapter" option (service `UNASSIGNED_CHAPTER` sentinel →
+`chapter IS NULL`) to find them. `update_question` applies chapter/topic/subtopic by
+`model_fields_set` (an EXPLICITLY-sent field is set even when blank → "" becomes NULL), so changing a
+question's chapter also clears its now-invalid topic/subtopic in the same edit.
 
 **Two-level feedback design (both stored, both regenerate, both train the agent):**
 - **Per-question** feedback → `mcq_questions.review_feedback`; rejecting one question regenerates
@@ -822,8 +881,16 @@ Celery job); history persisted.
   with that filter → chat agent → persists reply, caps history at `MAX_FEEDBACK_HISTORY=10`),
   `get_feedback_chat` (latest open chat for reload). A sheet
   that is still processing/needs-reupload/failed rejects chat (409 `not_checked`).
+  **Streaming variant** `post_feedback_question_stream` (mirrors `run_tutor_chain_stream` §13.1):
+  immediate `{"type":"ping"}` first, then the same pre-steps (selector + context build, non-streamed),
+  then NDJSON `meta`/`delta`/`done` events via `AnswerFeedbackChatAgent.answer_stream` (sentinel-tail
+  metadata per `app/ai/agents/streaming.py`; the tail carries only `follow_up_suggestions`). Both
+  messages of the turn are persisted together only AFTER the stream completes — a failed stream leaves
+  no half-written turn; the frontend retries once via the plain endpoint before showing an error.
 - **Endpoints** (`require_student`): `GET /api/student/subjective/sheets/{sheet_id}/feedback-chat`,
-  `POST .../feedback-chat/start`, `POST .../feedback-chat/{chat_id}/message`. Never expose raw
+  `POST .../feedback-chat/start`, `POST .../feedback-chat/{chat_id}/message`,
+  `POST .../feedback-chat/{chat_id}/message/stream` (NDJSON streaming variant; validates
+  ownership/status before streaming so auth failures stay real HTTP errors). Never expose raw
   `evaluation_data`.
 - **Tables** (migration `014_chatbots`): `subjective_feedback_chats`, `subjective_feedback_messages`.
 - **Frontend:** a collapsible "Ask about your result" panel in `StudentSubjectiveTests.tsx` result view
@@ -1143,9 +1210,9 @@ the 8 Video agents (`VideoTranscriptCleanerAgent`, `VideoTimelineAgent`,
 (`TutorTopicSelectorAgent`, `TutorAgent`, §13.1), plus the **4 Personalization summarizers**
 (`DailySummaryAgent`, `WeeklySummaryAgent`, `ChatSessionSummaryAgent`, `ExtendedSubjectiveSummaryAgent`,
 §Personalization).
-(`KnowledgeProcessingAgent`, `AnswerFeedbackSelectorAgent` and `SyllabusExtractionAgent` (§7
-syllabus-from-PDF import) exist but are intentionally NOT skill-tunable; there is no
-test-set-generation or analytics agent.)
+(`KnowledgeProcessingAgent`, `AnswerFeedbackSelectorAgent`, `SyllabusExtractionAgent` (§7
+syllabus-from-PDF import) and `MCQTopicAssignmentAgent` (§9.1 Stage-C topic assignment) exist but are
+intentionally NOT skill-tunable; there is no test-set-generation or analytics agent.)
 
 ### Skill Scopes
 Global agent skill / Objective chapter / Subjective chapter / Test-specific / Question-specific.
@@ -1728,6 +1795,7 @@ GET    /api/student/subjective/tests/{id}/result
 GET    /api/student/subjective/sheets/{sheet_id}/feedback-chat
 POST   /api/student/subjective/sheets/{sheet_id}/feedback-chat/start
 POST   /api/student/subjective/sheets/{sheet_id}/feedback-chat/{chat_id}/message
+POST   /api/student/subjective/sheets/{sheet_id}/feedback-chat/{chat_id}/message/stream
 POST   /api/admin/videos                  GET    /api/student/videos
 POST   /api/student/videos/{id}/ask       POST   /api/student/videos/{id}/ask/stream
 POST   /api/student/tutor/ask             GET    /api/student/tutor/history

@@ -67,17 +67,19 @@ async def upload_mcq_document(
     file: UploadFile = FastAPIFile(...),
     display_name: str = Form(...),
     exam_id: uuid.UUID = Form(...),
-    chapter: str = Form(...),
+    chapter: str = Form(""),
     topic: str = Form(""),
     subtopic: str = Form(""),
     custom_instruction: str = Form(""),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
+    # Chapter is OPTIONAL on extraction (CLAUDE.md §9.1): blank ⇒ the extractor assigns a
+    # chapter per question (for multi-chapter model papers), then per-chapter topic
+    # assignment. A chosen chapter LOCKS every extracted question to it. (Generation still
+    # requires a chapter — see below.)
     from app.modules.exams.service import get_exam_or_404
     await get_exam_or_404(db, exam_id)
-    if not chapter.strip():
-        raise AppException(422, "chapter_required", "Chapter is required.")
     file_record = await store_upload(
         file,
         context="mcq-documents",
@@ -91,7 +93,7 @@ async def upload_mcq_document(
         origin_type="uploaded_document",
         exam_id=exam_id,
         file_id=file_record.id,
-        chapter=chapter.strip(),
+        chapter=chapter.strip() or None,
         topic=topic or None,
         subtopic=subtopic or None,
         custom_instruction=custom_instruction or None,
@@ -365,6 +367,7 @@ async def list_questions(
     topic: str = Query(""),
     subtopic: str = Query(""),
     complexity: str = Query(""),
+    chapter: str = Query(""),
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -376,6 +379,7 @@ async def list_questions(
         topic=topic or None,
         subtopic=subtopic or None,
         complexity=complexity or None,
+        chapter=chapter or None,
         page=page,
         per_page=per_page,
     )
@@ -429,6 +433,7 @@ async def update_question(
     if not q:
         raise AppException(404, "not_found", "Question not found.")
 
+    fields_set = payload.model_fields_set
     if payload.question_text is not None:
         q.question_text = payload.question_text
     if payload.options is not None:
@@ -437,12 +442,16 @@ async def update_question(
         q.correct_option_ids = payload.correct_option_ids
     if payload.explanation is not None:
         q.explanation = payload.explanation
-    if payload.chapter is not None:
-        q.chapter = payload.chapter
-    if payload.topic is not None:
-        q.topic = payload.topic
-    if payload.subtopic is not None:
-        q.subtopic = payload.subtopic
+    # chapter/topic/subtopic: a field EXPLICITLY sent is applied even when blank, so an admin
+    # who changes a question's chapter can clear the now-invalid topic/subtopic in the same
+    # edit. "" ⇒ NULL — chapter is the primary test-set key (§10); an empty string would match
+    # no bucket yet not read as "unassigned". Callers that omit a field leave it untouched.
+    if "chapter" in fields_set:
+        q.chapter = payload.chapter or None
+    if "topic" in fields_set:
+        q.topic = payload.topic or None
+    if "subtopic" in fields_set:
+        q.subtopic = payload.subtopic or None
     if payload.complexity is not None:
         q.complexity = payload.complexity
 

@@ -23,6 +23,7 @@ import {
   EmptyState,
   Pagination,
   PageLoader,
+  Modal,
 } from "../../components/ui";
 
 type Tab = "upload" | "generate" | "batches" | "bank" | "manual";
@@ -38,6 +39,185 @@ function ComplexityBadge({ value }: { value: string }) {
     <Badge tone={COMPLEXITY_TONE[value] ?? "neutral"} className="capitalize">
       {value}
     </Badge>
+  );
+}
+
+/** Chapter › Topic › Subtopic line for a question. A missing chapter reads as a warning-tone
+ * "Unassigned" chip so the admin can spot auto-detect questions that still need filing (§9.1). */
+function QuestionTaxonomy({ question }: { question: MCQQuestion }) {
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs">
+      {question.chapter ? (
+        <Badge tone="neutral">{question.chapter}</Badge>
+      ) : (
+        <Badge tone="warning">Unassigned chapter</Badge>
+      )}
+      {question.topic && (
+        <span className="text-gray-400">
+          {question.topic}
+          {question.subtopic ? ` › ${question.subtopic}` : ""}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** Full question editor (text, options, correct answer, explanation, chapter/topic/subtopic
+ * dependent dropdowns, difficulty) wired to `updateQuestion`. Reused by the review batch and
+ * the question bank so an admin can fix an auto-detected/unassigned chapter (§9.1, §9.3). */
+function QuestionEditModal({
+  question,
+  chapters,
+  onClose,
+  onSaved,
+}: {
+  question: MCQQuestion;
+  chapters: ChapterNode[];
+  onClose: () => void;
+  onSaved: (q: MCQQuestion) => void;
+}) {
+  const [form, setForm] = useState({
+    question_text: question.question_text,
+    explanation: question.explanation ?? "",
+    chapter: question.chapter ?? "",
+    topic: question.topic ?? "",
+    subtopic: question.subtopic ?? "",
+    complexity: (question.complexity as "easy" | "medium" | "hard") ?? "medium",
+    correct_option_id: question.correct_option_ids[0] ?? "A",
+  });
+  const [options, setOptions] = useState<MCQOption[]>(question.options.map((o) => ({ ...o })));
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const chapterTopics = useMemo(() => chapters.find((c) => c.chapter === form.chapter)?.topics ?? [], [form.chapter, chapters]);
+  const topicSubtopics = useMemo(() => chapterTopics.find((t) => t.topic === form.topic)?.subtopics ?? [], [form.topic, chapterTopics]);
+
+  // Changing chapter resets topic/subtopic (they belong to the old chapter); changing topic
+  // resets subtopic. The backend applies the cleared values so no stale label survives.
+  const handleChapterChange = (value: string) => setForm((p) => ({ ...p, chapter: value, topic: "", subtopic: "" }));
+  const handleTopicChange = (value: string) => setForm((p) => ({ ...p, topic: value, subtopic: "" }));
+
+  async function save() {
+    if (!form.question_text.trim()) return setError("Question text is required.");
+    if (options.some((o) => !o.text.trim())) return setError("All options must have text.");
+    setLoading(true);
+    setError("");
+    try {
+      const updated = await mcqService.updateQuestion(question.id, {
+        question_text: form.question_text,
+        options,
+        correct_option_ids: [form.correct_option_id],
+        explanation: form.explanation,
+        chapter: form.chapter,
+        topic: form.topic,
+        subtopic: form.subtopic,
+        complexity: form.complexity,
+      });
+      onSaved(updated);
+      onClose();
+    } catch (err: any) {
+      setError(getErrorMessage(err, "Failed to save question."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Edit question"
+      size="lg"
+      closeOnBackdrop={false}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose} disabled={loading}>
+            Cancel
+          </Button>
+          <Button onClick={save} loading={loading}>
+            Save changes
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <FormField label="Question Text" required>
+          <Textarea rows={3} value={form.question_text} onChange={(e) => setForm((p) => ({ ...p, question_text: e.target.value }))} />
+        </FormField>
+        <div className="space-y-2">
+          <label className="block text-sm font-medium text-gray-700">
+            Options <span className="text-danger-500">*</span>
+          </label>
+          {options.map((opt, i) => (
+            <div key={opt.id} className="flex items-center gap-2">
+              <label className="flex cursor-pointer items-center gap-1.5">
+                <input
+                  type="radio"
+                  name="edit-correct"
+                  value={opt.id}
+                  checked={form.correct_option_id === opt.id}
+                  onChange={() => setForm((p) => ({ ...p, correct_option_id: opt.id }))}
+                />
+                <span className="w-6 text-sm font-medium text-gray-700">{opt.id}.</span>
+              </label>
+              <TextInput
+                value={opt.text}
+                onChange={(e) => {
+                  const updated = [...options];
+                  updated[i] = { ...opt, text: e.target.value };
+                  setOptions(updated);
+                }}
+                placeholder={`Option ${opt.id}`}
+              />
+            </div>
+          ))}
+          <p className="text-xs text-gray-500">Select the radio button next to the correct answer.</p>
+        </div>
+        <FormField label="Explanation">
+          <Textarea rows={2} value={form.explanation} onChange={(e) => setForm((p) => ({ ...p, explanation: e.target.value }))} />
+        </FormField>
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <FormField label="Difficulty">
+            <Select value={form.complexity} onChange={(e) => setForm((p) => ({ ...p, complexity: e.target.value as any }))}>
+              <option value="easy">Easy</option>
+              <option value="medium">Medium</option>
+              <option value="hard">Hard</option>
+            </Select>
+          </FormField>
+          <FormField label="Chapter">
+            <Select value={form.chapter} onChange={(e) => handleChapterChange(e.target.value)}>
+              <option value="">— Unassigned —</option>
+              {chapters.map((c) => (
+                <option key={c.chapter} value={c.chapter}>
+                  {c.chapter}
+                </option>
+              ))}
+            </Select>
+          </FormField>
+          <FormField label="Topic">
+            <Select value={form.topic} onChange={(e) => handleTopicChange(e.target.value)} disabled={chapterTopics.length === 0}>
+              <option value="">{chapterTopics.length > 0 ? "— None —" : form.chapter ? "No topics" : "Select chapter"}</option>
+              {chapterTopics.map((t) => (
+                <option key={t.topic} value={t.topic}>
+                  {t.topic}
+                </option>
+              ))}
+            </Select>
+          </FormField>
+          <FormField label="Subtopic">
+            <Select value={form.subtopic} onChange={(e) => setForm((p) => ({ ...p, subtopic: e.target.value }))} disabled={topicSubtopics.length === 0}>
+              <option value="">{topicSubtopics.length > 0 ? "— None —" : form.topic ? "No subtopics" : "Select topic"}</option>
+              {topicSubtopics.map((s) => (
+                <option key={s.id} value={s.subtopic}>
+                  {s.subtopic}
+                </option>
+              ))}
+            </Select>
+          </FormField>
+        </div>
+        {error && <Alert>{error}</Alert>}
+      </div>
+    </Modal>
   );
 }
 
@@ -61,7 +241,8 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
     if (!file) return setError("Please select a file.");
     if (!selectedExamId) return setError("Select an exam in the top bar first.");
     if (!form.display_name.trim()) return setError("Document name is required.");
-    if (!form.chapter) return setError("Chapter is required.");
+    // Chapter is OPTIONAL here: blank => the extractor auto-assigns a chapter per question
+    // (for multi-chapter model papers). A chosen chapter locks every question to it.
     setLoading(true);
     setError("");
     try {
@@ -69,7 +250,7 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
       fd.append("file", file);
       fd.append("display_name", form.display_name);
       fd.append("exam_id", selectedExamId);
-      fd.append("chapter", form.chapter);
+      if (form.chapter) fd.append("chapter", form.chapter);
       fd.append("topic", form.topic);
       fd.append("subtopic", form.subtopic);
       fd.append("custom_instruction", form.custom_instruction);
@@ -90,20 +271,24 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
       <FormField label="PDF or Word File" required>
         <input aria-label="PDF or Word File" type="file" accept=".pdf,.doc,.docx" className="w-full text-sm" onChange={(e) => setFile(e.target.files?.[0] || null)} />
       </FormField>
-      <FormField label="Chapter" required>
+      <FormField label="Chapter (optional)">
         <Select value={form.chapter} onChange={(e) => handleChapterChange(e.target.value)}>
-          <option value="">— Select chapter —</option>
+          <option value="">— Auto-detect from document —</option>
           {chapters.map((c) => (
             <option key={c.chapter} value={c.chapter}>
               {c.chapter}
             </option>
           ))}
         </Select>
+        <p className="mt-1 text-xs text-slate-500">
+          Leave blank for a multi-chapter model paper — the AI assigns each question's chapter,
+          then its topic. Pick a chapter to lock every question to it.
+        </p>
       </FormField>
       <div className="grid grid-cols-2 gap-3">
         <FormField label="Topic (optional)">
           <Select value={form.topic} onChange={(e) => handleTopicChange(e.target.value)} disabled={chapterTopics.length === 0}>
-            <option value="">{chapterTopics.length > 0 ? "— Auto-detect —" : form.chapter ? "No topics" : "Select chapter first"}</option>
+            <option value="">{chapterTopics.length > 0 ? "— Auto-detect —" : form.chapter ? "No topics" : "Auto-detect"}</option>
             {chapterTopics.map((t) => (
               <option key={t.topic} value={t.topic}>
                 {t.topic}
@@ -113,7 +298,7 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
         </FormField>
         <FormField label="Subtopic (optional)">
           <Select value={form.subtopic} onChange={(e) => setForm((p) => ({ ...p, subtopic: e.target.value }))} disabled={availableSubtopics.length === 0}>
-            <option value="">{availableSubtopics.length > 0 ? "— Auto-detect —" : form.topic ? "No subtopics" : "Select topic first"}</option>
+            <option value="">{availableSubtopics.length > 0 ? "— Auto-detect —" : form.topic ? "No subtopics" : "Auto-detect"}</option>
             {availableSubtopics.map((s) => (
               <option key={s.id} value={s.subtopic}>
                 {s.subtopic}
@@ -231,9 +416,10 @@ function GenerateTab({ onJobStart, chapters }: { onJobStart: (jobId: string, mod
 
 // ── Question Card ─────────────────────────────────────────────────────────────
 
-function QuestionCard({ question, batchId, onUpdate }: { question: MCQQuestion; batchId: string; onUpdate: (q: MCQQuestion) => void }) {
+function QuestionCard({ question, batchId, chapters, onUpdate }: { question: MCQQuestion; batchId: string; chapters: ChapterNode[]; onUpdate: (q: MCQQuestion) => void }) {
   const [rejectFeedback, setRejectFeedback] = useState("");
   const [showReject, setShowReject] = useState(false);
+  const [editing, setEditing] = useState(false);
   const [loading, setLoading] = useState(false);
 
   async function accept() {
@@ -292,22 +478,33 @@ function QuestionCard({ question, batchId, onUpdate }: { question: MCQQuestion; 
         </div>
       )}
 
-      {question.topic && (
-        <p className="mb-2 text-xs text-gray-400">
-          Topic: {question.topic}
-          {question.subtopic ? ` › ${question.subtopic}` : ""}
-        </p>
-      )}
+      <div className="mb-2">
+        <QuestionTaxonomy question={question} />
+      </div>
 
-      {question.status === "draft" && (
-        <div className="flex flex-wrap gap-2">
-          <Button size="xs" onClick={accept} loading={loading} icon={<Check className="h-3.5 w-3.5" />}>
-            Accept
-          </Button>
-          <Button size="xs" variant="secondary" className="text-danger-600" onClick={() => setShowReject(!showReject)}>
-            Reject
-          </Button>
-        </div>
+      <div className="flex flex-wrap gap-2">
+        {question.status === "draft" && (
+          <>
+            <Button size="xs" onClick={accept} loading={loading} icon={<Check className="h-3.5 w-3.5" />}>
+              Accept
+            </Button>
+            <Button size="xs" variant="secondary" className="text-danger-600" onClick={() => setShowReject(!showReject)}>
+              Reject
+            </Button>
+          </>
+        )}
+        <Button size="xs" variant="ghost" onClick={() => setEditing(true)}>
+          Edit
+        </Button>
+      </div>
+
+      {editing && (
+        <QuestionEditModal
+          question={question}
+          chapters={chapters}
+          onClose={() => setEditing(false)}
+          onSaved={onUpdate}
+        />
       )}
 
       {showReject && (
@@ -329,7 +526,7 @@ function QuestionCard({ question, batchId, onUpdate }: { question: MCQQuestion; 
 
 // ── Review Batch View ─────────────────────────────────────────────────────────
 
-function BatchReview({ batchId, onBack }: { batchId: string; onBack: () => void }) {
+function BatchReview({ batchId, chapters, onBack }: { batchId: string; chapters: ChapterNode[]; onBack: () => void }) {
   const [batch, setBatch] = useState<MCQBatchWithQuestions | null>(null);
   const [loading, setLoading] = useState(true);
   const [regenFeedback, setRegenFeedback] = useState("");
@@ -450,7 +647,7 @@ function BatchReview({ batchId, onBack }: { batchId: string; onBack: () => void 
 
       <div className="space-y-4">
         {batch.questions.map((q) => (
-          <QuestionCard key={q.id} question={q} batchId={batchId} onUpdate={handleQuestionUpdate} />
+          <QuestionCard key={q.id} question={q} batchId={batchId} chapters={chapters} onUpdate={handleQuestionUpdate} />
         ))}
       </div>
     </div>
@@ -501,9 +698,10 @@ function QuestionBankTab({ chapters }: { chapters: ChapterNode[] }) {
   const [questions, setQuestions] = useState<MCQQuestion[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
-  const [filters, setFilters] = useState({ status: "approved", topic: "", complexity: "" });
+  const [filters, setFilters] = useState({ status: "approved", topic: "", complexity: "", chapter: "" });
   const [loading, setLoading] = useState(true);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  const [editing, setEditing] = useState<MCQQuestion | null>(null);
 
   const allTopics = useMemo(() => chapters.flatMap((c) => c.topics), [chapters]);
 
@@ -535,6 +733,10 @@ function QuestionBankTab({ chapters }: { chapters: ChapterNode[] }) {
     load();
   }
 
+  function applyEdited(updated: MCQQuestion) {
+    setQuestions((prev) => prev.map((q) => (q.id === updated.id ? updated : q)));
+  }
+
   return (
     <div>
       <div className="mb-4 flex flex-wrap items-center gap-3">
@@ -543,6 +745,15 @@ function QuestionBankTab({ chapters }: { chapters: ChapterNode[] }) {
           <option value="approved">Approved</option>
           <option value="draft">Draft</option>
           <option value="rejected">Rejected</option>
+        </Select>
+        <Select aria-label="Filter by Chapter" className="w-56" value={filters.chapter} onChange={(e) => { setPage(1); setFilters((p) => ({ ...p, chapter: e.target.value })); }}>
+          <option value="">All Chapters</option>
+          <option value={mcqService.UNASSIGNED_CHAPTER}>Unassigned chapter</option>
+          {chapters.map((c) => (
+            <option key={c.chapter} value={c.chapter}>
+              {c.chapter}
+            </option>
+          ))}
         </Select>
         <Select aria-label="Filter by Difficulty" className="w-40" value={filters.complexity} onChange={(e) => setFilters((p) => ({ ...p, complexity: e.target.value }))}>
           <option value="">All Difficulty</option>
@@ -576,15 +787,13 @@ function QuestionBankTab({ chapters }: { chapters: ChapterNode[] }) {
                   <StatusBadge status={q.status} />
                 </div>
               </div>
-              {q.topic && (
-                <p className="mt-1 text-xs text-gray-400">
-                  {q.topic}
-                  {q.subtopic ? ` › ${q.subtopic}` : ""}
-                </p>
-              )}
+              <QuestionTaxonomy question={q} />
               <div className="mt-3 flex gap-2">
                 <Button size="xs" variant={q.status === "approved" ? "secondary" : "primary"} onClick={() => toggleApproval(q)}>
                   {q.status === "approved" ? "Unapprove" : "Approve"}
+                </Button>
+                <Button size="xs" variant="ghost" onClick={() => setEditing(q)}>
+                  Edit
                 </Button>
                 <Button size="xs" variant="secondary" className="text-danger-600" onClick={() => setConfirmDel(q.id)}>
                   Delete
@@ -596,6 +805,15 @@ function QuestionBankTab({ chapters }: { chapters: ChapterNode[] }) {
       )}
 
       {total > 20 && <Pagination className="mt-4" page={page} pageSize={20} total={total} onPage={setPage} />}
+
+      {editing && (
+        <QuestionEditModal
+          question={editing}
+          chapters={chapters}
+          onClose={() => setEditing(null)}
+          onSaved={applyEdited}
+        />
+      )}
 
       <ConfirmDialog
         open={!!confirmDel}
@@ -816,7 +1034,7 @@ export function AdminMCQ() {
           {tab === "upload" && <UploadTab onJobStart={handleJobStart} chapters={syllabusChapters} />}
           {tab === "generate" && <GenerateTab onJobStart={handleJobStart} chapters={syllabusChapters} />}
           {tab === "batches" && !reviewBatchId && <BatchesTab onOpenBatch={(id) => setReviewBatchId(id)} />}
-          {tab === "batches" && reviewBatchId && <BatchReview batchId={reviewBatchId} onBack={() => setReviewBatchId("")} />}
+          {tab === "batches" && reviewBatchId && <BatchReview batchId={reviewBatchId} chapters={syllabusChapters} onBack={() => setReviewBatchId("")} />}
           {tab === "bank" && <QuestionBankTab chapters={syllabusChapters} />}
           {tab === "manual" && <ManualAddTab onCreated={() => {}} chapters={syllabusChapters} />}
         </>

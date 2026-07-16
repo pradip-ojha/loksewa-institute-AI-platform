@@ -70,18 +70,28 @@ async def get_batch_questions(db: AsyncSession, batch_id: uuid.UUID) -> list[MCQ
     return result.scalars().all()
 
 
+#: Sentinel chapter filter value that selects questions with NO chapter (chapter IS NULL) —
+#: how the admin finds auto-detect questions the extractor couldn't file (CLAUDE.md §9.1).
+UNASSIGNED_CHAPTER = "__unassigned__"
+
+
 async def list_questions(
     db: AsyncSession,
     status: str | None = None,
     topic: str | None = None,
     subtopic: str | None = None,
     complexity: str | None = None,
+    chapter: str | None = None,
     page: int = 1,
     per_page: int = 20,
 ) -> tuple[list[MCQQuestion], int]:
     q = select(MCQQuestion)
     if status:
         q = q.where(MCQQuestion.status == status)
+    if chapter == UNASSIGNED_CHAPTER:
+        q = q.where(MCQQuestion.chapter.is_(None))
+    elif chapter:
+        q = q.where(MCQQuestion.chapter == chapter)
     if topic:
         q = q.where(MCQQuestion.topic == topic)
     if subtopic:
