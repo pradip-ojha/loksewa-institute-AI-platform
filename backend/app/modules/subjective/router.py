@@ -1,7 +1,9 @@
+import json
 import logging
 import uuid
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -474,3 +476,35 @@ async def feedback_chat_message(
         raise AppException(422, "empty_question", "Question cannot be empty.")
     result = await svc.post_feedback_question(db, sheet_id, chat_id, question, current_user.id)
     return FeedbackChatReplyOut(**result)
+
+
+@router.post("/student/subjective/sheets/{sheet_id}/feedback-chat/{chat_id}/message/stream")
+@limiter.limit(AI_CHAT_LIMIT)
+async def feedback_chat_message_stream(
+    request: Request,
+    sheet_id: uuid.UUID,
+    chat_id: uuid.UUID,
+    body: FeedbackChatMessageIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_student),
+):
+    """Streaming variant of the feedback-chat message endpoint. Returns NDJSON: a `meta`
+    event, then `delta` events as the reply streams, then a `done` event with follow-ups."""
+    question = (body.message or "").strip()
+    if not question:
+        raise AppException(422, "empty_question", "Question cannot be empty.")
+
+    # Validate ownership/status BEFORE streaming so auth failures are real HTTP errors.
+    await svc.load_feedback_turn(db, sheet_id, chat_id, current_user.id)
+
+    async def event_stream():
+        try:
+            async for event in svc.post_feedback_question_stream(
+                db, sheet_id=sheet_id, chat_id=chat_id, question=question, student_id=current_user.id,
+            ):
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+        except Exception as exc:  # noqa: BLE001 — surface as a stream error, never a half response
+            logger.exception("feedback chat stream failed: %s", exc)
+            yield json.dumps({"type": "error", "message": "उत्तर ल्याउन सकिएन।"}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")

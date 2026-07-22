@@ -63,16 +63,20 @@ _CHAT_PROMPT = EXAM_CONTEXT + """
 
 ROLE: You summarize ONE tutor chat session so it can be remembered concisely instead of as raw turns.
 
-TASK: From the conversation turns, write a summary of about 400 words: what the student wanted,
-what they struggled with, what was explained, the concepts/examples covered, and any follow-ups
-they should revisit. Never invent.
+TASK: Merge the PREVIOUS session summary with the NEW conversation turns into an updated summary of
+about 400 words: what the student wanted, what they struggled with, what was explained, the
+concepts/examples covered, and any follow-ups they should revisit. The new turns may overlap what the
+previous summary already covers — keep each point once. Never invent.
 
 --- ADMIN-TUNABLE GUIDANCE ---
 {skill_instructions}
 
 SESSION KIND: {session_kind}
 
-CONVERSATION TURNS (oldest first):
+PREVIOUS SESSION SUMMARY (may be 'none'):
+{previous}
+
+NEW CONVERSATION TURNS (oldest first):
 {turns}
 
 Return ONLY valid JSON: {{"summary_text": "the session summary"}}"""
@@ -160,13 +164,14 @@ class ChatSessionSummaryAgent:
         self.db = db
         self.provider = get_provider("reasoning")
 
-    async def summarize(self, *, session_kind: str, turns: str, student_id: uuid.UUID) -> str:
+    async def summarize(self, *, session_kind: str, turns: str, previous: str, student_id: uuid.UUID) -> str:
         prompt = _CHAT_PROMPT.format(
             skill_instructions=await _skill(self.db, self.AGENT) or "none",
-            session_kind=session_kind, turns=turns[:8000] or "none",
+            session_kind=session_kind, previous=(previous or "none")[:4000],
+            turns=turns[:8000] or "none",
         )
         result = await self.provider.generate_text(prompt, schema={}, audit_ctx=_ctx(self.db, self.AGENT, "chat_session_summary", student_id))
-        return str((result or {}).get("summary_text") or "").strip()
+        return str((result or {}).get("summary_text") or previous or "").strip()
 
 
 class ExtendedSubjectiveSummaryAgent:

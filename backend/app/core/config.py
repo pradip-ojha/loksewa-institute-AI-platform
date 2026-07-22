@@ -119,6 +119,17 @@ class Settings(BaseSettings):
     # limit is enforced across multiple API processes. Empty → in-process memory storage.
     RATELIMIT_STORAGE_URI: str = ""
 
+    # Pipeline debug dumps (0 = off, 1 = write step-by-step files to backend/debug_dumps/)
+    MCQ_DEBUG_DUMP: int = 0
+    KNOWLEDGE_DEBUG_DUMP: int = 0
+    # Max output tokens for the MCQ vision extraction call (one per page/region).
+    # 0 (default) = don't set max_completion_tokens — use the Azure deployment's default.
+    # Reasoning/thinking models consume internal thinking tokens from this budget, so setting
+    # it too low causes the model to return null content (no tokens left for output). Only
+    # set this if the deployment's default is too low and you see "finish_reason=length" errors.
+    # When set, use a high value: 16384 or the deployment's maximum.
+    MCQ_VISION_MAX_TOKENS: int = 0
+
     # Seed defaults
     DEFAULT_ADMIN_EMAIL: str = "admin@neurafix.ai"
     DEFAULT_ADMIN_PASSWORD: str = "Admin@123"

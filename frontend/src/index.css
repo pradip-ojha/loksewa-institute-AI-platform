@@ -25,8 +25,8 @@
     min-height: 100vh;
   }
   ::selection {
-    background-color: #cbd9ee;
-    color: #152238;
+    background-color: #bfdbfe;
+    color: #132a52;
   }
   /* Devanagari / Nepali text gets the dedicated font with good fallbacks */
   :lang(ne),

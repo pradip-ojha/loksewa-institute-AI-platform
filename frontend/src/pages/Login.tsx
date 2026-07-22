@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
-import { Mail, Lock, LogIn, GraduationCap } from "lucide-react";
+import { Mail, Lock, LogIn } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { Button, FormField, TextInput, Alert } from "../components/ui";
 
@@ -33,7 +33,7 @@ export function Login() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gray-50 px-4">
+    <div className="flex min-h-screen items-center justify-center bg-gradient-to-b from-brand-50/60 to-gray-50 px-4">
       <motion.div
         initial={{ opacity: 0, y: 8 }}
         animate={{ opacity: 1, y: 0 }}
@@ -41,11 +41,11 @@ export function Login() {
         className="w-full max-w-sm"
       >
         <div className="mb-6 text-center">
-          <div className="mx-auto mb-3 flex h-11 w-11 items-center justify-center rounded-md bg-brand-600">
-            <GraduationCap className="h-6 w-6 text-white" />
-          </div>
-          <h1 className="text-xl font-semibold text-gray-900">NeuraFix AI</h1>
-          <p className="mt-0.5 text-sm text-gray-500">Kirtipur Valley Institute</p>
+          <img src="/logo.png" alt="NeuraFix Loksewa" className="mx-auto mb-3 h-14 w-14 object-contain" />
+          <h1 className="text-xl font-semibold tracking-tight text-gray-900">
+            NeuraFix <span className="text-brand-600">Loksewa</span>
+          </h1>
+          <p className="mt-1 text-sm text-gray-500 font-deva">लोकसेवा तयारीको स्मार्ट साथी</p>
         </div>
 
         <form onSubmit={handleSubmit} className="rounded-lg border border-gray-200 bg-white p-8 shadow-card">

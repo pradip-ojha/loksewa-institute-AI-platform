@@ -511,13 +511,12 @@ async def start_feedback_chat(db: AsyncSession, sheet_id: uuid.UUID, student_id:
     return {"chat_id": chat.id, "messages": [{"role": "assistant", "content": _FEEDBACK_GREETING}]}
 
 
-async def post_feedback_question(
-    db: AsyncSession, sheet_id: uuid.UUID, chat_id: uuid.UUID, question: str, student_id: uuid.UUID,
-) -> dict:
-    """Persist the student turn, run the feedback agent against the stored evaluation
-    context, persist the reply, and return the full transcript + follow-up suggestions."""
-    from app.ai.agents.answer_feedback_chat_agent import AnswerFeedbackChatAgent
-
+async def load_feedback_turn(
+    db: AsyncSession, sheet_id: uuid.UUID, chat_id: uuid.UUID, student_id: uuid.UUID,
+) -> tuple[StudentAnswerSheet, SubjectiveFeedbackChat]:
+    """Ownership + status validation for a feedback-chat turn, shared by the JSON and
+    streaming endpoints (the streaming router calls it BEFORE returning its
+    StreamingResponse so auth/status failures surface as normal HTTP errors)."""
     sheet = await get_sheet(db, sheet_id)
     if not sheet or sheet.student_id != student_id:
         raise AppException(404, "not_found", "Answer sheet not found.")
@@ -526,44 +525,66 @@ async def post_feedback_question(
     chat = await _load_feedback_chat(db, chat_id)
     if not chat or chat.sheet_id != sheet_id or chat.student_id != student_id:
         raise AppException(404, "chat_not_found", "Feedback chat not found.")
+    return sheet, chat
+
+
+async def _prepare_feedback_turn(db: AsyncSession, sheet: StudentAnswerSheet, chat_id: uuid.UUID, question: str) -> dict:
+    """Pre-answer routing shared by the JSON and streaming turn paths: history from the
+    prior transcript, then the cheap selector (§12.1) narrows which questions' heavy
+    grading detail the evaluation context ships."""
+    from app.ai.agents.answer_feedback_selector_agent import AnswerFeedbackSelectorAgent
 
     prior = await _feedback_messages(db, chat_id)
     history = "\n".join(
         f"{'STUDENT' if m.role == 'student' else 'TUTOR'}: {m.content}"
         for m in prior[-MAX_FEEDBACK_HISTORY:]
     )
-
-    db.add(SubjectiveFeedbackMessage(chat_id=chat_id, role="student", content=question))
-    await db.flush()
-
-    # A cheap selector (§12.1) first picks which question(s) the student's message is
-    # about, so build_feedback_context only ships those questions' heavy grading detail
-    # instead of every question's on every turn. Fail-open: broad/unsure → full context.
-    from app.ai.agents.answer_feedback_selector_agent import AnswerFeedbackSelectorAgent
     q_index = await _build_question_index(db, sheet)
     selection = await AnswerFeedbackSelectorAgent(db).select(
         question=question, question_index=q_index, history=history, sheet_id=sheet.id,
     )
     include = None if selection["needs_all"] else set(selection["question_numbers"])
     context = await build_feedback_context(db, sheet, include_qnums=include)
-    agent = AnswerFeedbackChatAgent(db)
-    result = await agent.answer(
-        question=question, evaluation_context=context, history=history, sheet_id=sheet.id,
-    )
+    return {"prior": prior, "history": history, "context": context}
 
-    db.add(SubjectiveFeedbackMessage(chat_id=chat_id, role="assistant", content=result["reply"]))
-    await db.commit()
 
-    # Personalization: roll this turn into the chat-session summary (best-effort).
+def _enqueue_feedback_summary(student_id: uuid.UUID, chat_id: uuid.UUID, history: str, question: str, reply: str) -> None:
+    """Personalization: roll this turn into the chat-session summary (best-effort)."""
     try:
         from app.core.celery_client import get_celery
-        turns = f"{history}\nSTUDENT: {question}\nTUTOR: {result['reply']}"[:8000]
+        turns = f"{history}\nSTUDENT: {question}\nTUTOR: {reply}"[:8000]
         get_celery().send_task(
             "workers.tasks.personalization_tasks.pers_update_chat",
             args=[str(student_id), "subjective_feedback", str(chat_id), turns], queue="kvi_ai_default",
         )
     except Exception:  # noqa: BLE001
         pass
+
+
+async def post_feedback_question(
+    db: AsyncSession, sheet_id: uuid.UUID, chat_id: uuid.UUID, question: str, student_id: uuid.UUID,
+) -> dict:
+    """Persist the student turn, run the feedback agent against the stored evaluation
+    context, persist the reply, and return the full transcript + follow-up suggestions."""
+    from app.ai.agents.answer_feedback_chat_agent import AnswerFeedbackChatAgent
+
+    sheet, _chat = await load_feedback_turn(db, sheet_id, chat_id, student_id)
+
+    prep = await _prepare_feedback_turn(db, sheet, chat_id, question)
+    prior, history = prep["prior"], prep["history"]
+
+    db.add(SubjectiveFeedbackMessage(chat_id=chat_id, role="student", content=question))
+    await db.flush()
+
+    agent = AnswerFeedbackChatAgent(db)
+    result = await agent.answer(
+        question=question, evaluation_context=prep["context"], history=history, sheet_id=sheet.id,
+    )
+
+    db.add(SubjectiveFeedbackMessage(chat_id=chat_id, role="assistant", content=result["reply"]))
+    await db.commit()
+
+    _enqueue_feedback_summary(student_id, chat_id, history, question, result["reply"])
 
     messages = [{"role": m.role, "content": m.content} for m in prior]
     messages.append({"role": "student", "content": question})
@@ -572,6 +593,53 @@ async def post_feedback_question(
         "chat_id": chat_id,
         "messages": messages,
         "follow_up_suggestions": result["follow_up_suggestions"],
+    }
+
+
+async def post_feedback_question_stream(
+    db: AsyncSession, *, sheet_id: uuid.UUID, chat_id: uuid.UUID, question: str, student_id: uuid.UUID,
+):
+    """Streaming variant of ``post_feedback_question``. Yields NDJSON-ready event dicts:
+    a ``ping`` first (first byte before any AI work — the selector + context build can be
+    silent seconds), a ``meta`` event, ``delta`` events as the reply streams, then a
+    ``done`` event with follow-ups once the turn is persisted. Both messages of the turn
+    are persisted together AFTER the stream completes, so a failed stream leaves no
+    half-written turn (the frontend retries via the non-stream endpoint)."""
+    from app.ai.agents.answer_feedback_chat_agent import AnswerFeedbackChatAgent
+
+    yield {"type": "ping"}
+
+    # Re-load inside the generator: the router validated before streaming, but its
+    # get_db dependency teardown may have expired those ORM instances by now.
+    sheet, chat = await load_feedback_turn(db, sheet_id, chat_id, student_id)
+
+    prep = await _prepare_feedback_turn(db, sheet, chat.id, question)
+
+    yield {"type": "meta", "chat_id": str(chat.id)}
+
+    meta_sink: dict = {}
+    parts: list[str] = []
+    async for delta in AnswerFeedbackChatAgent(db).answer_stream(
+        question=question, evaluation_context=prep["context"], history=prep["history"],
+        sheet_id=sheet.id, meta_sink=meta_sink,
+    ):
+        parts.append(delta)
+        yield {"type": "delta", "text": delta}
+
+    reply = "".join(parts).strip()
+    if not reply:
+        yield {"type": "error", "message": "feedback chat returned no reply"}
+        return
+
+    db.add(SubjectiveFeedbackMessage(chat_id=chat.id, role="student", content=question))
+    db.add(SubjectiveFeedbackMessage(chat_id=chat.id, role="assistant", content=reply))
+    await db.commit()
+
+    _enqueue_feedback_summary(student_id, chat.id, prep["history"], question, reply)
+
+    yield {
+        "type": "done",
+        "follow_up_suggestions": meta_sink.get("follow_up_suggestions", []),
     }
 
 

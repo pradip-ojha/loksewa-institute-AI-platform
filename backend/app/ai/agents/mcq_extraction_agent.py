@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import unicodedata
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -148,6 +149,287 @@ Return ONLY valid JSON matching this exact structure:
   "extraction_notes": "..."
 }}"""
 
+# ── Vision-first extraction prompts ───────────────────────────────────────────────────
+# These replace the OCR→text→EXTRACTION_PROMPT pipeline for MCQ upload.  The model reads
+# the actual page image directly so visual answer cues (highlights, colours, circles,
+# ticks) are never lost in OCR text conversion.  Generation/regeneration are unchanged.
+
+MCQ_INLINE_VISION_PROMPT = """You are a document scanner performing two sequential tasks on this MCQ page image.
+
+━━━ TASK 1 — OCR (READ the printed text) ━━━
+Copy exactly what is printed on the page. Commit to your best reading of every character.
+
+⛔ DURING READING — these are forbidden:
+- Rewording or paraphrasing — even if the printed wording seems unusual or non-standard.
+- Substituting a more familiar or standard word for what is actually printed. If an option reads
+  "युराल सागर", write "युराल सागर" — NOT "लाल सागर" or any other alternative you know.
+- Using your knowledge of Loksewa subjects, Nepali history, geography, law, or banking to
+  "complete", "correct", or "improve" any text. Your training knowledge is irrelevant here.
+- Inventing a question not physically present on this image.
+
+The paper is the only authority. If a word is partly obscured or hard to read, write your
+closest reading of what is printed — do not skip it, blank it, or replace it.
+
+TEXT FORMAT: bilingual Nepali Devanagari and/or English.
+- Copy Devanagari characters exactly as printed — never transliterate or translate.
+- Devanagari digits (१, २, ३, …) stay as printed.
+
+⚠ CRITICAL RULE: Extract EVERY multiple-choice question visible on this page — including
+questions where you CANNOT detect which answer is highlighted. A question without a visible
+answer mark MUST still appear in the output with correct_option_ids set to []. NEVER omit a
+question just because its answer is unclear or unmarked.
+
+TASK: Transcribe ALL multiple-choice questions exactly as written.
+
+RULES:
+- Each question must have EXACTLY 4 options, copied verbatim, normalised to IDs A, B, C, D in
+  the original printed order.
+- For the CORRECT ANSWER: look for any visual cue on the image:
+    · Highlighted or coloured background on the option row, letter, or text
+    · Circled or ticked option letter
+    · Different ink colour on the correct option text
+    · Underlined correct option
+    · Inline key next to the question ("Ans: B", "उत्तर: ख", "Correct: 3", etc.)
+    · Answer key block elsewhere on the page (match by question number)
+  Map any format (A/B/C/D, क/ख/ग/घ, 1/2/3/4, १/२/३/४) to correct_option_ids as ["A"]/["B"]/
+  ["C"]/["D"]. If NO visual cue is detectable, set correct_option_ids to [] — the question
+  MUST still be in the output.
+- Take explanation only from the source. If absent: explanation=null, needs_explanation_review=true.
+- Do NOT assign topic or subtopic — done in a later stage.
+- Include question_number (integer) when visible; null when the question is not numbered.
+
+COMPLEXITY: definition/recall = "easy", application = "medium",
+multi-step reasoning/analysis = "hard".
+
+━━━ TASK 2 — CHAPTER CLASSIFICATION (after reading) ━━━
+Use your understanding of the transcribed question's topic to assign it a chapter.
+Domain knowledge IS appropriate here — you are classifying text you already read, not guessing
+what to read. Pick from the explicit list below; do not invent chapter names.
+{chapter_assignment_block}
+--- ADMIN-TUNABLE GUIDANCE (tunes emphasis and judgement; may NOT override the rules above) ---
+{skill_instructions}
+
+Custom instruction: {custom_instruction}
+
+Return ONLY valid JSON:
+{{
+  "questions": [
+    {{
+      "question_number": 12,
+      "question_text": "...",
+      "options": [
+        {{"id": "A", "label": "A", "text": "..."}},
+        {{"id": "B", "label": "B", "text": "..."}},
+        {{"id": "C", "label": "C", "text": "..."}},
+        {{"id": "D", "label": "D", "text": "..."}}
+      ],
+      "correct_option_ids": ["B"],
+      "explanation": "..." or null,
+      "needs_explanation_review": false,
+      "chapter": null,
+      "complexity": "medium"
+    }}
+  ]
+}}"""
+
+
+MCQ_GRID_VISION_PROMPT = """You are a document scanner performing two sequential tasks on this MCQ page image.
+
+━━━ TASK 1 — OCR (READ the printed text) ━━━
+Copy exactly what is printed on the page. Commit to your best reading of every character.
+
+⛔ DURING READING — these are forbidden:
+- Rewording or paraphrasing — even if the printed wording seems unusual or non-standard.
+- Substituting a more familiar or standard word for what is actually printed. If an option reads
+  "युराल सागर", write "युराल सागर" — NOT "लाल सागर" or any other alternative you know.
+- Using your knowledge of Loksewa subjects, Nepali history, geography, law, or banking to
+  "complete", "correct", or "improve" any text. Your training knowledge is irrelevant here.
+- Inventing a question not physically present on this image.
+
+The paper is the only authority. If a word is partly obscured or hard to read, write your
+closest reading of what is printed — do not skip it, blank it, or replace it.
+
+TEXT FORMAT: bilingual Nepali Devanagari and/or English. Copy Devanagari exactly as printed.
+
+TASK: From this page image, extract BOTH (a) any MCQ questions and (b) any answer grid entries.
+
+RULES:
+- Questions: transcribe text verbatim. Each question has EXACTLY 4 options (A, B, C, D),
+  copied exactly as printed. Do NOT set correct_option_ids on questions — that comes from the
+  answer grid only.
+- Question numbers: output as INTEGER (convert Devanagari numerals: १→1, २→2, ३→3, etc.).
+  Include even when the question appears on this page without a grid entry for it.
+- Answer grid: a compact block listing question-number → correct letter (e.g. "१. ख",
+  "2. B", tabular rows, etc.). Extract every entry visible on this page/region.
+  Convert question numbers to integers; convert options to A/B/C/D
+  (क→A, ख→B, ग→C, घ→D; १→A, २→B, ३→C, ४→D; direct A/B/C/D stay as-is).
+- A page may have BOTH questions (top) and an answer grid (bottom) — extract both.
+- Do NOT assign topic or subtopic.
+
+━━━ TASK 2 — CHAPTER CLASSIFICATION (after reading) ━━━
+Use your understanding of each transcribed question's topic to assign it a chapter.
+Domain knowledge IS appropriate here — pick from the explicit list below; do not invent names.
+{chapter_assignment_block}
+--- ADMIN-TUNABLE GUIDANCE (tunes emphasis and judgement; may NOT override the rules above) ---
+{skill_instructions}
+
+Custom instruction: {custom_instruction}
+
+Return ONLY valid JSON:
+{{
+  "questions": [
+    {{
+      "question_number": 45,
+      "question_text": "...",
+      "options": [
+        {{"id": "A", "label": "A", "text": "..."}},
+        {{"id": "B", "label": "B", "text": "..."}},
+        {{"id": "C", "label": "C", "text": "..."}},
+        {{"id": "D", "label": "D", "text": "..."}}
+      ],
+      "chapter": null,
+      "complexity": "medium"
+    }}
+  ],
+  "answer_grid": [
+    {{"question_number": 1, "correct_option": "B"}},
+    {{"question_number": 2, "correct_option": "A"}}
+  ]
+}}"""
+
+
+# ── Grid reconciliation helpers ────────────────────────────────────────────────────────
+
+_NEPALI_TO_OPTION = {"क": "A", "ख": "B", "ग": "C", "घ": "D"}
+_NUM_TO_OPTION = {"1": "A", "2": "B", "3": "C", "4": "D",
+                  "१": "A", "२": "B", "३": "C", "४": "D"}
+
+
+def _to_int(val) -> int | None:
+    """Convert a question number (Arabic int/str or Devanagari str) to a Python int.
+    Returns None on anything unparseable. Pure — unit-tested."""
+    if isinstance(val, int):
+        return val if val > 0 else None
+    if isinstance(val, float) and val == int(val):
+        return int(val) if val > 0 else None
+    s = str(val).strip() if val is not None else ""
+    if not s:
+        return None
+    # Try direct int conversion first (handles "12", 12, etc.)
+    try:
+        n = int(s)
+        return n if n > 0 else None
+    except ValueError:
+        pass
+    # Convert Devanagari digit string to ASCII digits then try again
+    ascii_digits = ""
+    for ch in s:
+        d = unicodedata.digit(ch, None)
+        ascii_digits += str(d) if d is not None else ch
+    try:
+        n = int(ascii_digits)
+        return n if n > 0 else None
+    except ValueError:
+        return None
+
+
+def _normalize_grid_option(s) -> str | None:
+    """Normalise a grid answer to A/B/C/D. Accepts A/B/C/D, क/ख/ग/घ, 1/2/3/4, १/२/३/४."""
+    if not isinstance(s, str):
+        return None
+    s = s.strip().upper()
+    if s in ("A", "B", "C", "D"):
+        return s
+    lower = s.lower()
+    if lower in _NEPALI_TO_OPTION:
+        return _NEPALI_TO_OPTION[lower]
+    if s in _NUM_TO_OPTION:
+        return _NUM_TO_OPTION[s]
+    return None
+
+
+def _reconcile_grid_blocks(page_results: list[dict]) -> tuple[list[dict], int]:
+    """State-machine reconciliation: matches answer grid entries to question blocks.
+
+    PRIMARY signal for block boundary: the answer grid itself — after a grid is seen, any
+    new question starts a new block (q-number resets are a secondary consequence, not the
+    trigger). Handles multi-page grids (entries accumulate across regions until a new
+    question appears) and pages that carry both questions (top) and a grid (bottom).
+
+    Returns (questions, blocks_with_grid_count) where questions has correct_option_ids set
+    from the matching grid, and unmatched questions keep correct_option_ids=[]. Pure —
+    unit-tested.
+    """
+    COLLECTING = "collecting"
+    AFTER_GRID = "after_grid"
+
+    state = COLLECTING
+    current_questions: list[dict] = []
+    current_grids: list[dict] = []
+    all_questions: list[dict] = []
+    blocks_with_grid = 0
+
+    def flush() -> None:
+        nonlocal blocks_with_grid
+        if not current_questions:
+            return
+        grid_map: dict[int, str] = {}
+        for entry in current_grids:
+            qn = _to_int(entry.get("question_number"))
+            opt = _normalize_grid_option(entry.get("correct_option"))
+            if qn is not None and opt is not None:
+                grid_map[qn] = opt
+        if grid_map:
+            blocks_with_grid += 1
+        for q in current_questions:
+            qn = _to_int(q.get("question_number"))
+            if qn is not None and qn in grid_map:
+                q["correct_option_ids"] = [grid_map[qn]]
+            else:
+                q.setdefault("correct_option_ids", [])
+        all_questions.extend(current_questions)
+
+    for pr in page_results:
+        # Process questions FIRST (they appear at the top of the page).
+        for q in pr.get("questions") or []:
+            if state == AFTER_GRID:
+                # A new question after seeing a grid → flush the completed block.
+                flush()
+                current_questions = []
+                current_grids = []
+                state = COLLECTING
+            current_questions.append(q)
+
+        # Process answer grid entries (they appear at the bottom, after questions).
+        grid_entries = pr.get("answer_grid") or []
+        if grid_entries:
+            current_grids.extend(grid_entries)
+            state = AFTER_GRID
+
+    flush()  # final block (handles single-pair docs and the last block of multi-pair docs)
+    return all_questions, blocks_with_grid
+
+
+async def _prepare_mcq_pdf_bytes(file_bytes: bytes, mime_type: str) -> tuple[bytes, bool]:
+    """Prepare file bytes for vision rendering.
+
+    Returns (pdf_bytes, is_image):
+    - PDF  → (original bytes, False)
+    - DOCX → (LibreOffice-converted PDF bytes, False).  Always converts even for valid-unicode
+             DOCX so LibreOffice's rendering preserves highlighting/colours for inline mode.
+    - Image (jpg/png/webp/…) → (original bytes, True).  Caller will wrap as a single region.
+    """
+    mime = (mime_type or "").lower()
+    if "pdf" in mime:
+        return file_bytes, False
+    if any(x in mime for x in ("word", "docx", "msword", "officedocument")):
+        from app.ai.agents.knowledge_processing_agent import _docx_to_pdf_bytes
+        pdf = await asyncio.to_thread(_docx_to_pdf_bytes, file_bytes)
+        return pdf, False
+    # Treat everything else (jpg, png, webp, tiff, …) as a single image region.
+    return file_bytes, True
+
+
 def _extract_question_text(q_data: dict) -> str:
     """Return question text regardless of which key the AI used."""
     for key in ("question_text", "question", "q", "text", "stem", "question_stem", "problem"):
@@ -219,12 +501,17 @@ def _align_replacements(
     return matched, skipped
 
 
-def _normalize_question(q_data: object) -> tuple[dict | None, str | None]:
+def _normalize_question(q_data: object, *, require_correct: bool = True) -> tuple[dict | None, str | None]:
     """Validate and normalize one question entry.
 
     Returns (fields, None) when usable, or (None, reason) when it must be
     skipped. The reason is surfaced to the admin via the job's output_reference
     so skipped questions are visible, not silently dropped.
+
+    `require_correct=False` is used for vision extraction: the model may not detect the
+    highlighted answer on every question (e.g. very light yellow highlight), so questions
+    with correct_option_ids=[] are still saved — the admin can assign the answer via the
+    Question Bank editor.  Generation/regeneration always require a correct answer.
     """
     if not isinstance(q_data, dict):
         return None, "entry was not an object"
@@ -235,7 +522,9 @@ def _normalize_question(q_data: object) -> tuple[dict | None, str | None]:
     if len(options) < 4:
         return None, f"only {len(options)} option(s) after normalization"
     correct = q_data.get("correct_option_ids") or []
-    if not isinstance(correct, list) or not correct:
+    if not isinstance(correct, list):
+        correct = []
+    if require_correct and not correct:
         return None, "missing correct answer"
     complexity = q_data.get("complexity", "medium")
     if complexity not in _VALID_COMPLEXITY:
@@ -254,12 +543,12 @@ def _normalize_question(q_data: object) -> tuple[dict | None, str | None]:
     }, None
 
 
-def _normalize_batch(questions_data: list) -> tuple[list[dict], list[str]]:
+def _normalize_batch(questions_data: list, *, require_correct: bool = True) -> tuple[list[dict], list[str]]:
     """Split a raw question list into (usable fields, skip reasons)."""
     normalized: list[dict] = []
     skipped: list[str] = []
     for q_data in questions_data:
-        fields, reason = _normalize_question(q_data)
+        fields, reason = _normalize_question(q_data, require_correct=require_correct)
         if fields is None:
             skipped.append(reason or "invalid")
         else:
@@ -337,20 +626,23 @@ def _extraction_output(
     chapters_detected: list[str] | None = None,
     questions_by_chapter: dict[str, int] | None = None,
     unassigned_count: int | None = None,
+    answer_format: str = "inline",
+    grid_blocks_detected: int | None = None,
+    unmatched_count: int | None = None,
 ) -> dict:
     """Job output_reference so the admin can see how many questions were saved
     vs. skipped (and why), instead of silently losing malformed entries.
 
-    `layout` carries the per-page column-split breakdown from the OCR pass (CLAUDE.md §8),
-    mirroring what the knowledge job records — without it the slicing decisions are invisible
-    once the transient progress step is overwritten. `chapters_detected` /
-    `questions_by_chapter` / `unassigned_count` (extraction only) surface the auto-detect
-    chapter distribution so the admin can verify assignment and spot unfiled questions."""
+    `layout` carries the per-page column-split breakdown from the vision pass (CLAUDE.md §8).
+    `chapters_detected` / `questions_by_chapter` / `unassigned_count` surface the auto-detect
+    chapter distribution so the admin can verify assignment and spot unfiled questions.
+    `grid_blocks_detected` / `unmatched_count` are set in separate_grid mode."""
     out: dict = {
         "batch_id": str(batch_id),
         "saved": saved,
         "skipped": len(skipped),
         "total_returned": total_returned,
+        "answer_format": answer_format,
     }
     if skipped:
         out["skip_reasons"] = skipped[:20]
@@ -362,6 +654,10 @@ def _extraction_output(
         out["questions_by_chapter"] = questions_by_chapter
     if unassigned_count is not None:
         out["unassigned_count"] = unassigned_count
+    if grid_blocks_detected is not None:
+        out["grid_blocks_detected"] = grid_blocks_detected
+    if unmatched_count is not None:
+        out["unmatched_count"] = unmatched_count
     return out
 
 
@@ -651,8 +947,8 @@ class MCQExtractionAgent:
         self.provider = get_provider("text_extraction")
 
     async def process(self) -> MCQReviewBatch:
-        from app.ai.agents.knowledge_processing_agent import extract_typed_document_text
         from app.core.database import AsyncSessionLocal
+        from app.core.debug_dump import dump_bytes, dump_json, open_dump
         from app.integrations.r2_client import get_r2
         from app.modules.files.models import File
         from app.modules.video.service import get_chapter_tree
@@ -662,10 +958,7 @@ class MCQExtractionAgent:
             async with AsyncSessionLocal() as db:
                 await update_job(db, self.job_id, **kw)
 
-        async def _ocr_step(progress: int, msg: str) -> None:
-            await _job(progress=progress, step=msg)
-
-        await _job(progress=5, step="Downloading source document")
+        await _job(progress=5, step="Preparing source document")
 
         # LOAD: file record (short session) → snapshot the scalars we need.
         async with AsyncSessionLocal() as db:
@@ -678,40 +971,117 @@ class MCQExtractionAgent:
 
         file_bytes = await asyncio.to_thread(get_r2().download_fileobj, r2_key)
 
-        await _job(progress=20, step="Extracting text from document")
-        # Layout-aware extraction (CLAUDE.md §8/§9): a clean-Unicode text layer is used
-        # for free; scanned/Preeti pages are column-aware vision-OCR'd instead of feeding
-        # the model ASCII garbage. Raises when nothing could be extracted (fail honestly).
-        document_text, layout_stats = await extract_typed_document_text(
-            file_bytes, mime_type, _ocr_step,
-            audit_ctx={
-                "agent_type": "PageLayoutClassifier",
-                "task_type": "page_layout_classification",
-                "entity_type": "mcq_document",
-                "entity_id": self.document.id,
-            },
-        )
+        # Open debug dump directory (None when MCQ_DEBUG_DUMP != 1).
+        dump_dir = open_dump("mcq", str(self.job_id), self.document.display_name or str(self.document.id))
+        dump_json(dump_dir, "00_meta.json", {
+            "job_id": str(self.job_id),
+            "document_id": str(self.document.id),
+            "display_name": self.document.display_name,
+            "exam_id": str(self.document.exam_id),
+            "answer_format": (self.document.answer_format or "inline").strip(),
+            "locked_chapter": (self.document.chapter or "").strip() or None,
+            "locked_topic": self.document.topic,
+            "locked_subtopic": self.document.subtopic,
+            "mime_type": mime_type,
+            "file_size_bytes": len(file_bytes),
+            "custom_instruction": self.document.custom_instruction,
+        })
+
+        # ── Vision-first pipeline: page PNGs → vision model sees original images ──────────
+        # The vision model reads the RENDERED page image so visual answer cues (highlighted
+        # backgrounds, coloured options, circled letters) are never lost. DOCX is always
+        # converted to PDF via LibreOffice even when valid-Unicode, because the PDF render
+        # preserves colour/highlight for inline mode. Images are used as a single region.
+        await _job(progress=15, step="Preparing document for vision extraction")
+        pdf_bytes, is_image = await _prepare_mcq_pdf_bytes(file_bytes, mime_type)
+
+        dump_json(dump_dir, "01_file_prep.json", {
+            "is_image": is_image,
+            "path": "image_direct" if is_image else (
+                "docx_converted_to_pdf" if mime_type in (
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "application/msword",
+                ) else "pdf_passthrough"
+            ),
+            "prepared_size_bytes": len(pdf_bytes),
+        })
+
+        if is_image:
+            units: list[tuple[int, int, bytes]] = [(0, 0, pdf_bytes)]
+            layout_stats: dict | None = None
+        else:
+            import fitz  # PyMuPDF
+            from app.ai.agents.page_layout_classifier import resolve_pdf_layouts
+            from app.processing.page_layout import render_regions_for_decisions
+            n_pages = fitz.open(stream=pdf_bytes, filetype="pdf").page_count
+            await _job(progress=20, step="Detecting column layout")
+            decisions, layout_stats = await resolve_pdf_layouts(
+                pdf_bytes, list(range(n_pages)),
+                audit_ctx={
+                    "agent_type": "PageLayoutClassifier",
+                    "task_type": "page_layout_classification",
+                    "entity_type": "mcq_document",
+                    "entity_id": self.document.id,
+                },
+            )
+            dump_json(dump_dir, "02_layout_decisions.json", [
+                {"page_index": page_i, "gutter_x": gutter_x}
+                for page_i, gutter_x in decisions
+            ])
+            dump_json(dump_dir, "02_layout_stats.json", layout_stats)
+            units = await asyncio.to_thread(render_regions_for_decisions, pdf_bytes, decisions, dpi=300)
+
+        # Dump each rendered region PNG.
+        for page_idx, region_idx, png in units:
+            dump_bytes(dump_dir, f"03_regions/page{page_idx}_region{region_idx}.png", png)
 
         # Chapter is optional (CLAUDE.md §9.1): a chosen chapter LOCKS every question to it;
         # blank ⇒ the extractor assigns chapter per question, then per-chapter topic stage.
         locked_chapter = (self.document.chapter or "").strip() or None
 
-        await _job(progress=33, step="Retrieving active skill + syllabus")
+        await _job(progress=30, step="Retrieving active skill + syllabus")
         async with AsyncSessionLocal() as db:
             skill_instructions = await self._get_skill(db)
             (full_tree_text, valid_topics, valid_subtopics,
              valid_chapters, topic_to_chapter) = await get_chapter_tree(db, self.document.exam_id)
 
-        # ── Stage B: extraction per ≤40k chunk, IN PARALLEL (chapter-only, no topics) ──────
-        chunks = _split_text_chunks(document_text)
+        answer_format = (self.document.answer_format or "inline").strip()
         chapter_block = (
             "" if locked_chapter
             else CHAPTER_ASSIGNMENT_BLOCK.format(chapter_list=_build_chapter_list(valid_chapters))
         )
-        await _job(progress=45, step=f"Extracting MCQs with AI ({len(chunks)} chunk(s))")
-        normalized, skipped, total_returned = await self._extract_chunks(
-            chunks, skill_instructions, chapter_block
+
+        # ── Stage B: one vision call per page/region, IN PARALLEL (chapter-only) ──────────
+        await _job(progress=40, step=f"Extracting MCQs with AI ({len(units)} region(s))")
+        page_results, extraction_skipped = await self._extract_regions_vision(
+            units, answer_format, skill_instructions, chapter_block, dump_dir=dump_dir,
         )
+
+        # ── Flatten questions and reconcile grid answers ───────────────────────────────────
+        grid_blocks_detected: int | None = None
+        grid_unmatched: int = 0
+        if answer_format == "separate_grid":
+            all_questions, grid_blocks_detected = _reconcile_grid_blocks(page_results)
+            grid_unmatched = sum(1 for q in all_questions if not q.get("correct_option_ids"))
+        else:
+            all_questions = []
+            for pr in page_results:
+                all_questions.extend(pr.get("questions") or [])
+
+        dump_json(dump_dir, "05_questions_flat.json", {
+            "answer_format": answer_format,
+            "total_questions": len(all_questions),
+            "grid_blocks_detected": grid_blocks_detected,
+            "grid_unmatched": grid_unmatched if answer_format == "separate_grid" else None,
+            "questions": all_questions,
+        })
+
+        total_returned = len(all_questions)
+        # require_correct=False: the vision model may not detect the highlighted answer on every
+        # question (light yellow, complex marking). Questions with no detected answer are saved
+        # with correct_option_ids=[] so the admin can assign via the Question Bank editor.
+        normalized, skipped = _normalize_batch(all_questions, require_correct=False)
+        skipped.extend(extraction_skipped)
 
         # ── Resolve chapter per question + group (chapter is PRIMARY) ──────────────────────
         # locked ⇒ everything under the locked chapter; auto ⇒ the AI chapter validated
@@ -726,6 +1096,17 @@ class MCQExtractionAgent:
                 key = ai_ch if (ai_ch and ai_ch in valid_chapters) else None
             groups.setdefault(key, []).append(f)
 
+        dump_json(dump_dir, "06_chapter_groups.json", {
+            "locked_chapter": locked_chapter,
+            "groups": {
+                str(ch) if ch else "__null__": {
+                    "count": len(qs),
+                    "sample_questions": [q.get("question_text", "")[:80] for q in qs[:3]],
+                }
+                for ch, qs in groups.items()
+            },
+        })
+
         # ── Stage C: assign topic/subtopic per chapter (parallel), recover the null group ──
         await _job(progress=70, step="Assigning topics within each chapter")
         await self._assign_topics(
@@ -733,6 +1114,18 @@ class MCQExtractionAgent:
             valid_topics=valid_topics, valid_subtopics=valid_subtopics,
             valid_chapters=valid_chapters, topic_to_chapter=topic_to_chapter,
         )
+
+        dump_json(dump_dir, "07_final_questions.json", [
+            {
+                "q": q.get("question_text", "")[:100],
+                "chapter": q.get("chapter"),
+                "topic": q.get("topic"),
+                "subtopic": q.get("subtopic"),
+                "complexity": q.get("complexity"),
+                "correct_option_ids": q.get("correct_option_ids"),
+            }
+            for q in normalized
+        ])
 
         # ── Chapter distribution for the job output ────────────────────────────────────────
         by_chapter: dict[str, int] = {}
@@ -770,14 +1163,19 @@ class MCQExtractionAgent:
             doc.question_count = len(normalized)
             await db.commit()
 
-        await _job(progress=100, step="Extraction complete",
-                   output=_extraction_output(
-                       len(normalized), skipped, total_returned, batch.id,
-                       layout=layout_stats,
-                       chapters_detected=sorted(by_chapter.keys()),
-                       questions_by_chapter=by_chapter,
-                       unassigned_count=unassigned,
-                   ))
+        out_ref = _extraction_output(
+            len(normalized), skipped, total_returned, batch.id,
+            layout=layout_stats,
+            chapters_detected=sorted(by_chapter.keys()),
+            questions_by_chapter=by_chapter,
+            unassigned_count=unassigned,
+            answer_format=answer_format,
+            grid_blocks_detected=grid_blocks_detected,
+            unmatched_count=grid_unmatched if answer_format == "separate_grid" else None,
+        )
+        dump_json(dump_dir, "08_output_reference.json", out_ref)
+
+        await _job(progress=100, step="Extraction complete", output=out_ref)
         return batch
 
     async def _extract_chunks(
@@ -831,6 +1229,101 @@ class MCQExtractionAgent:
         if failures:
             skipped.append(f"{failures} chunk(s) failed extraction and were skipped")
         return normalized, skipped, len(questions_data)
+
+    async def _extract_regions_vision(
+        self,
+        units: list[tuple[int, int, bytes]],
+        answer_format: str,
+        skill_instructions: str,
+        chapter_block: str,
+        *,
+        dump_dir=None,
+    ) -> tuple[list[dict], list[str]]:
+        """Run one vision call per (page_idx, region_idx, png_bytes) unit IN PARALLEL
+        (Semaphore(6), each on its own short session for audit). Partial success: a failing
+        region logs a warning and contributes nothing; ALL regions failing raises.
+
+        Returns (page_results_ordered, extraction_skipped) where page_results_ordered is a
+        list of {"page_idx", "region_idx", "questions", "answer_grid"} dicts in document order
+        (same ordering as `units`), and extraction_skipped contains human-readable skip reasons
+        to surface in the job output_reference."""
+        from app.core.database import AsyncSessionLocal
+        from app.core.config import settings as _cfg
+        from app.core.debug_dump import dump_json, dump_text as _dump_text
+
+        if not units:
+            return [], []
+
+        vision_max_tokens: int = _cfg.MCQ_VISION_MAX_TOKENS
+        prompt_template = MCQ_GRID_VISION_PROMPT if answer_format == "separate_grid" else MCQ_INLINE_VISION_PROMPT
+        prompt = prompt_template.format(
+            chapter_assignment_block=chapter_block,
+            skill_instructions=skill_instructions,
+            custom_instruction=self.document.custom_instruction or "none",
+        )
+        _dump_text(dump_dir, "04_vision_prompt.txt", prompt)
+
+        sem = asyncio.Semaphore(6)
+        failures = 0
+
+        async def _one(idx: int, unit: tuple[int, int, bytes]) -> dict | None:
+            nonlocal failures
+            page_idx, region_idx, png_bytes = unit
+            async with sem:
+                async with AsyncSessionLocal() as db:
+                    audit_ctx = {
+                        "db": db, "agent_type": "MCQExtractionAgent",
+                        "task_type": "mcq_extraction",
+                        "entity_type": "mcq_document", "entity_id": self.document.id,
+                    }
+                    try:
+                        result = await self.provider.generate_with_image(
+                            prompt, png_bytes, schema={}, audit_ctx=audit_ctx,
+                            max_tokens=vision_max_tokens,
+                        )
+                        if not isinstance(result, dict):
+                            raise AIResponseError("model response was not a JSON object")
+                        parsed = {
+                            "page_idx": page_idx,
+                            "region_idx": region_idx,
+                            "questions": result.get("questions") or [],
+                            "answer_grid": result.get("answer_grid") or [],
+                        }
+                        dump_json(
+                            dump_dir,
+                            f"04_vision/page{page_idx}_region{region_idx}.json",
+                            {
+                                "page_idx": page_idx,
+                                "region_idx": region_idx,
+                                "questions_count": len(parsed["questions"]),
+                                "answer_grid_count": len(parsed["answer_grid"]),
+                                "raw_response": result,
+                            },
+                        )
+                        return parsed
+                    except Exception as exc:  # noqa: BLE001
+                        failures += 1
+                        dump_json(
+                            dump_dir,
+                            f"04_vision/page{page_idx}_region{region_idx}_FAILED.json",
+                            {"page_idx": page_idx, "region_idx": region_idx, "error": str(exc)},
+                        )
+                        logger.warning(
+                            "Vision extraction unit %d (page=%d, region=%d) failed: %s",
+                            idx, page_idx, region_idx, exc,
+                        )
+                        return None
+
+        raw = await asyncio.gather(*[_one(i, u) for i, u in enumerate(units)])
+
+        if failures == len(units):
+            raise RuntimeError("Vision extraction failed on every region of the document")
+
+        page_results = [r for r in raw if r is not None]
+        skipped: list[str] = []
+        if failures:
+            skipped.append(f"{failures} region(s) failed vision extraction and were skipped")
+        return page_results, skipped
 
     async def _assign_topics(
         self, groups: dict, *, locked_chapter: str | None, full_tree_text: str,

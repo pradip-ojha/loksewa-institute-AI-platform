@@ -10,19 +10,19 @@ export default {
         // Single cool neutral system: every `gray-*` renders as slate.
         // Rule: always write `gray-*`, never `slate-*`.
         gray: colors.slate,
-        // Brand — deep desaturated blue ("enterprise navy"). Primary action = 600.
+        // Brand — vivid logo blue ("NeuraFix blue"). Primary action = 600.
         brand: {
-          50: "#f4f6fb",
-          100: "#e7edf7",
-          200: "#cbd9ee",
-          300: "#9fbade",
-          400: "#6b93c9",
-          500: "#3e6cb0", // links, icons, active-state text
-          600: "#2b5597", // PRIMARY action (buttons, focus border)
-          700: "#254a80", // hover on primary
-          800: "#223f69", // active/pressed
-          900: "#1e3354",
-          950: "#152238",
+          50: "#eff6ff",
+          100: "#dbeafe",
+          200: "#bfdbfe",
+          300: "#93c5fd",
+          400: "#60a5fa",
+          500: "#3b82f6", // icons/accents only — below AA for small text on white
+          600: "#2b6fe4", // PRIMARY action (white text = 4.67:1 AA — don't lighten)
+          700: "#2160cd", // hover on primary
+          800: "#1d4fa8", // active/pressed
+          900: "#1c4184",
+          950: "#132a52",
         },
         // Muted semantic ramps — desaturated so badges/alerts read professional.
         success: { 50: "#f2f9f4", 100: "#ddf0e2", 500: "#3d9a63", 600: "#2e7d4f", 700: "#276841" },

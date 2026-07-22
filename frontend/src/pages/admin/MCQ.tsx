@@ -225,7 +225,7 @@ function QuestionEditModal({
 
 function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batchMode: "extract") => void; chapters: ChapterNode[] }) {
   const { selectedExamId } = useExam();
-  const [form, setForm] = useState({ display_name: "", chapter: "", topic: "", subtopic: "", custom_instruction: "" });
+  const [form, setForm] = useState({ display_name: "", chapter: "", topic: "", subtopic: "", custom_instruction: "", answer_format: "inline" });
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -254,6 +254,7 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
       fd.append("topic", form.topic);
       fd.append("subtopic", form.subtopic);
       fd.append("custom_instruction", form.custom_instruction);
+      fd.append("answer_format", form.answer_format);
       const result = await mcqService.uploadDocument(fd);
       onJobStart(result.job_id, "extract");
     } catch (err: any) {
@@ -270,6 +271,17 @@ function UploadTab({ onJobStart, chapters }: { onJobStart: (jobId: string, batch
       </FormField>
       <FormField label="PDF or Word File" required>
         <input aria-label="PDF or Word File" type="file" accept=".pdf,.doc,.docx" className="w-full text-sm" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+      </FormField>
+      <FormField label="Answer Format" required>
+        <Select value={form.answer_format} onChange={(e) => setForm((p) => ({ ...p, answer_format: e.target.value }))}>
+          <option value="inline">Inline — correct option marked on each question (highlight, circle, tick, colour)</option>
+          <option value="separate_grid">Separate answer grid — compact answer key listed after the questions</option>
+        </Select>
+        <p className="mt-1 text-xs text-slate-500">
+          {form.answer_format === "separate_grid"
+            ? "Questions and their answer grid are matched by question number. Multiple question sets (with restarting numbering) in one file are handled automatically."
+            : "The AI detects the correct option from any visual marking on the original page image."}
+        </p>
       </FormField>
       <FormField label="Chapter (optional)">
         <Select value={form.chapter} onChange={(e) => handleChapterChange(e.target.value)}>

@@ -21,7 +21,7 @@ class AIModelProvider(ABC):
         """Generate structured JSON from prompt + file content."""
 
     @abstractmethod
-    async def generate_with_image(self, prompt: str, image_bytes: bytes, schema: dict | None = None, audit_ctx: dict | None = None) -> dict:
+    async def generate_with_image(self, prompt: str, image_bytes: bytes, schema: dict | None = None, audit_ctx: dict | None = None, max_tokens: int | None = None) -> dict:
         """Generate structured JSON from prompt + image bytes."""
 
     @abstractmethod

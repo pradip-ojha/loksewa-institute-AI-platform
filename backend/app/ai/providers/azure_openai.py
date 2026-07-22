@@ -60,8 +60,38 @@ def _response_text(response) -> str:
     choices = getattr(response, "choices", None)
     if not choices:
         raise AIResponseError("model returned no choices")
-    content = choices[0].message.content
-    return (content or "").strip()
+    choice = choices[0]
+    finish_reason = getattr(choice, "finish_reason", None)
+    content = getattr(choice.message, "content", None)
+
+    # Diagnose null/empty content before attempting JSON parse.
+    if not content or not content.strip():
+        refusal = getattr(choice.message, "refusal", None)
+        if finish_reason == "content_filter":
+            raise AIResponseError("Azure content filter blocked the response for this image")
+        if refusal:
+            raise AIResponseError(f"model refused to respond: {str(refusal)[:200]}")
+        if finish_reason == "length":
+            # Reasoning models consume thinking tokens from max_completion_tokens, leaving
+            # nothing for output. Unset MCQ_VISION_MAX_TOKENS (set to 0) or raise it.
+            raise AIResponseError(
+                "output truncated at max_completion_tokens — model produced no content. "
+                "Set MCQ_VISION_MAX_TOKENS=0 in .env to remove the cap, or raise it to 16384+"
+            )
+        raise AIResponseError(
+            f"model returned empty content (finish_reason={finish_reason!r}); "
+            "if this recurs, check Azure deployment logs for quota or availability issues"
+        )
+
+    if finish_reason == "length":
+        # Got some content but it was cut off. In json_object mode Azure forces the JSON
+        # closed by collapsing open arrays — the response may silently lose questions.
+        # Raising here is better than silently returning truncated data.
+        raise AIResponseError(
+            "output truncated at max_completion_tokens — raise MCQ_VISION_MAX_TOKENS "
+            "or split the page into smaller regions before re-uploading"
+        )
+    return content.strip()
 
 
 def _parse_json(text: str, *, agent_type: str | None, task_type: str | None) -> dict:
@@ -302,7 +332,7 @@ class AzureOpenAIProvider(AIModelProvider):
             return _parse_json(text, agent_type=(audit_ctx or {}).get("agent_type"), task_type=(audit_ctx or {}).get("task_type"))
         return {"text": text}
 
-    async def generate_with_image(self, prompt: str, image_bytes: bytes, schema: dict | None = None, audit_ctx: dict | None = None) -> dict:
+    async def generate_with_image(self, prompt: str, image_bytes: bytes, schema: dict | None = None, audit_ctx: dict | None = None, max_tokens: int | None = None) -> dict:
         client = _get_client(self.api_version)
         b64 = base64.b64encode(image_bytes).decode()
         # Label the data URL by the actual bytes — PNG (lossless, used for OCR page/column
@@ -311,6 +341,8 @@ class AzureOpenAIProvider(AIModelProvider):
         kwargs: dict = {}
         if schema is not None:
             kwargs["response_format"] = {"type": "json_object"}
+        if max_tokens:  # 0 or None → don't set; let Azure use the deployment default
+            kwargs["max_completion_tokens"] = max_tokens
 
         content = [
             {"type": "text", "text": prompt},

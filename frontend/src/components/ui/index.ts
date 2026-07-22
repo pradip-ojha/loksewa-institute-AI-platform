@@ -1,5 +1,6 @@
-// ── Design conventions (enterprise light theme) ──────────────────────────────
-// Brand: one deep blue. Primary action = brand-600; links/icons/active = brand-500/700.
+// ── Design conventions (light theme) ─────────────────────────────────────────
+// Brand: one vivid blue (logo-matched, #2b6fe4). Primary action = brand-600; hover 700;
+// links/small readable text = brand-600/700; icons/decorative accents = brand-500; soft tints 50/100.
 // Neutrals: `gray-*` only (aliased to slate in tailwind.config.js). Never `slate-*`.
 // Surfaces: white + `border border-gray-200` (1px). Shadow only on modals/toasts/menus (shadow-pop).
 // Radius: controls `rounded-md`, cards/tables/modals `rounded-lg`, badges `rounded-full`.

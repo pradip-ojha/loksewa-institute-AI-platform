@@ -526,12 +526,14 @@ async def _persist_qa_turn(
     await db.commit()
 
     # Personalization: roll this turn into the video chat-session summary (best-effort).
+    # Include the recent session history (like the tutor/feedback chats) so the rolling
+    # summary merge sees the surrounding conversation, not just this single turn.
     try:
         from app.core.celery_client import get_celery
+        turns = f"{prep['history_text']}\nSTUDENT: {question}\nTUTOR: {answer}"[:8000]
         get_celery().send_task(
             "workers.tasks.personalization_tasks.pers_update_chat",
-            args=[str(session.student_id), "video", str(session.id),
-                  f"STUDENT: {question}\nTUTOR: {answer}"[:8000]],
+            args=[str(session.student_id), "video", str(session.id), turns],
             queue="kvi_ai_default",
         )
     except Exception:  # noqa: BLE001

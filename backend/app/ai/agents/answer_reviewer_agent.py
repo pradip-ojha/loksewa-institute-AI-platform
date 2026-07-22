@@ -33,6 +33,10 @@ HARD RULES (never violate):
 - Keep each section's "note" and make sure it clearly states BOTH what the student did well here
   (to keep) AND what is missing/wrong to improve, in the answer's language, plain text. Tighten
   vague notes ("needs improvement") into specific good-vs-improve wording consistent with the marks.
+- Rewrite any vague "missing_points" entry into a complete, ACTIONABLE instruction in the answer's
+  language: one short sentence saying exactly WHAT to add/do and WHERE in the answer (e.g.
+  "…को परिभाषापछि एउटा व्यावहारिक उदाहरण थप्नुहोस्।"), never a bare topic name or "अपूर्ण छ"-style
+  vagueness. Do NOT add new points — only sharpen the existing ones.
 - Prune annotation_targets to ONLY specific wrong written items (wrong sentence/formula/step/
   number/keyword, contradiction, irrelevant line). Drop targets for missing points / weak
   explanation / structure / general advice. NEVER invent new targets; keep each target_text exactly.
@@ -49,6 +53,9 @@ other fields stay PLAIN TEXT: "comment_text" (≤ ~8 words), "target_text", "evi
 
 --- ADMIN-TUNABLE GUIDANCE (refines emphasis only; never overrides the HARD RULES above) ---
 {skill_instructions}
+
+ADMIN CUSTOM CHECKING INSTRUCTION (highest priority after the HARD RULES; may be 'none'):
+{custom_instruction}
 
 MAX MARKS PER QUESTION:
 {full_marks_block}
@@ -86,6 +93,7 @@ class AnswerReviewerAgent:
 
     async def review(
         self, *, evaluation: dict, full_marks_by_qid: dict[str, int], sheet_id: uuid.UUID,
+        custom_instruction: str | None = None,
     ) -> dict:
         import json
 
@@ -99,6 +107,7 @@ class AnswerReviewerAgent:
             full_marks_block=full_marks_block,
             evaluation_json=evaluation_json,
             skill_instructions=await self._get_skill(),
+            custom_instruction=custom_instruction or "none",
         )
         audit_ctx = {
             "db": self.db,

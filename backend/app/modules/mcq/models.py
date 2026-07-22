@@ -20,6 +20,7 @@ class MCQDocument(Base):
     topic: Mapped[str | None] = mapped_column(String(500), nullable=True)
     subtopic: Mapped[str | None] = mapped_column(String(500), nullable=True)
     custom_instruction: Mapped[str | None] = mapped_column(Text, nullable=True)
+    answer_format: Mapped[str] = mapped_column(String(20), nullable=False, default="inline")
     processing_status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
     question_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)

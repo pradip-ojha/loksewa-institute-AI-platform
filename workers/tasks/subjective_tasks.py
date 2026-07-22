@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 # Keep the checked PDF uncrowded (CLAUDE.md §12).
 MAX_TARGETS_PER_QUESTION = 3
 MAX_TARGETS_PER_PAGE = 6
+# Raise the circled question total ~2 inches above the answer's end (as a fraction of
+# page height — pixel space survives downscaling) so a total sitting exactly where the
+# NEXT question starts can't be misread as belonging to it. Capped inside the answer's
+# own region for short answers.
+MARK_RAISE_RATIO = 0.17
 # How many per-(question,page) vision locator calls run concurrently. Each call also
 # borrows one short-lived DB session for audit, so keep this within DB pool headroom.
 LOCATOR_CONCURRENCY = 6
@@ -631,6 +636,7 @@ def check_answer_sheet(self, job_id: str, sheet_id: str) -> None:
         async with AsyncSessionLocal() as db:
             reviewed = await AnswerReviewerAgent(db).review(
                 evaluation=clamped_initial, full_marks_by_qid=full_marks_by_qid, sheet_id=sid,
+                custom_instruction=custom_instruction,
             )
         review_notes = reviewed.get("review_notes")
         final_eval, awarded, possible = svc.clamp_marks(reviewed, questions)
@@ -1139,7 +1145,8 @@ def _add_marks_and_banner(commands_by_page, final_eval, regions_by_q, page_map, 
         x, y, w, h = region["question_bbox"]
         mark_text = f"{_fmt(qres.get('awarded_marks', 0))}/{_fmt(qres.get('max_marks', 0))}"
         mx = min(int(page.width * 0.88), int(x + w - 10))
-        my = int(y + h - 6)
+        raise_px = min(int(page.height * MARK_RAISE_RATIO), int(h * 0.6))
+        my = int(y + h - max(6, raise_px))
         if region["page"] == first_page and my < 90:   # don't collide with the total banner
             my = 96
         # Don't let the question total overlap a section mark/tick already on this page.

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft, FileCheck2, FileText, Upload, ExternalLink, AlertTriangle, Loader2, CheckCircle2,
-  GraduationCap, Send, MessageCircleQuestion, X,
+  MessageCircleQuestion, X,
 } from "lucide-react";
 import { JobStatusPoller } from "../../components/JobStatusPoller";
 import type { JobState } from "../../components/JobStatusPoller";
@@ -12,6 +12,7 @@ import { getErrorMessage } from "../../utils/error";
 import { PageHeader, Card, Button, Badge, StatusBadge, EmptyState, Skeleton, Alert } from "../../components/ui";
 import { RichText } from "../../components/content/RichText";
 import { SectionBreakdown } from "../../components/content/LearningContent";
+import { ChatTurnView, ChatInput, SuggestionChips, useAutoScrollEnd } from "../../components/chat";
 
 type View = "list" | "detail" | "result";
 
@@ -282,10 +283,10 @@ function ResultView({ testId, onBack }: { testId: string; onBack: () => void }) 
       : null;
   const tone = pct == null ? "brand" : pct >= 60 ? "success" : pct >= 40 ? "warning" : "danger";
   const toneGrad: Record<string, string> = {
-    success: "bg-success-600",
-    warning: "bg-warning-600",
-    danger: "bg-danger-600",
-    brand: "bg-brand-600",
+    success: "bg-gradient-to-br from-success-500 to-success-600",
+    warning: "bg-gradient-to-br from-warning-500 to-warning-600",
+    danger: "bg-gradient-to-br from-danger-500 to-danger-600",
+    brand: "bg-gradient-to-br from-brand-600 to-brand-700",
   };
 
   return (
@@ -327,8 +328,8 @@ function ResultView({ testId, onBack }: { testId: string; onBack: () => void }) 
               default so results get the full width). Mobile: normal column flow — the
               chat panel naturally sits at the bottom, as before. */}
           <div className="lg:flex lg:items-start lg:gap-4">
-            <div className={`min-w-0 ${chatOpen ? "lg:w-[65%]" : "lg:w-full"}`}>
-              <div className={`my-4 overflow-hidden rounded-lg ${toneGrad[tone]} p-6 text-center text-white`}>
+            <div className={`min-w-0 ${chatOpen ? "lg:w-[60%]" : "lg:w-full"}`}>
+              <div className={`my-4 overflow-hidden rounded-2xl ${toneGrad[tone]} p-6 text-center text-white shadow-card`}>
                 <p className="text-sm font-medium text-white/80">Total Marks</p>
                 <p className="mt-1 text-4xl font-bold tracking-tight">
                   {result.total_marks_awarded}
@@ -399,7 +400,7 @@ function ResultView({ testId, onBack }: { testId: string; onBack: () => void }) 
             </div>
 
             {chatOpen && result.sheet_id && (
-              <div className="mt-4 lg:sticky lg:top-4 lg:mt-4 lg:w-[35%] lg:flex-shrink-0">
+              <div className="mt-4 lg:sticky lg:top-4 lg:mt-4 lg:w-[40%] lg:flex-shrink-0">
                 <FeedbackChat sheetId={result.sheet_id} onClose={() => setChatOpen(false)} />
               </div>
             )}
@@ -434,7 +435,11 @@ function FeedbackChat({ sheetId, onClose }: { sheetId: string; onClose: () => vo
   const [busy, setBusy] = useState(false);
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState("");
-  const endRef = useRef<HTMLDivElement>(null);
+  const endRef = useAutoScrollEnd(turns, "nearest");
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Abort an in-flight stream when the panel is closed/unmounted.
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   const toTurns = (msgs: FeedbackChatMessage[]): FeedbackTurn[] => {
     // Pair each student message with the assistant reply that follows it. The
@@ -481,10 +486,6 @@ function FeedbackChat({ sheetId, onClose }: { sheetId: string; onClose: () => vo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sheetId]);
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }, [turns]);
-
   async function ask(q: string) {
     const text = q.trim();
     if (!text || busy || !chatId) return;
@@ -492,19 +493,66 @@ function FeedbackChat({ sheetId, onClose }: { sheetId: string; onClose: () => vo
     setBusy(true);
     const idx = turns.length;
     setTurns((t) => [...t, { question: text, loading: true }]);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    let streamed = false;
+    let failedMsg: string | null = null;
     try {
-      const res = await subjectiveTestsService.sendFeedbackMessage(sheetId, chatId, text);
-      const reply = res.messages[res.messages.length - 1];
-      setTurns((t) =>
-        t.map((turn, i) =>
-          i === idx
-            ? { ...turn, loading: false, answer: reply?.content ?? "", followUps: res.follow_up_suggestions }
-            : turn,
-        ),
+      await subjectiveTestsService.sendFeedbackMessageStream(
+        sheetId,
+        chatId,
+        text,
+        {
+          onDelta: (delta) => {
+            // First delta clears the loading dots; subsequent deltas append live.
+            streamed = true;
+            setTurns((t) =>
+              t.map((turn, i) =>
+                i === idx ? { ...turn, loading: false, answer: (turn.answer ?? "") + delta } : turn,
+              ),
+            );
+          },
+          onDone: (done) => {
+            setTurns((t) =>
+              t.map((turn, i) =>
+                i === idx
+                  ? { ...turn, loading: false, answer: turn.answer ?? "", followUps: done.follow_up_suggestions ?? [] }
+                  : turn,
+              ),
+            );
+          },
+          onError: (message) => {
+            failedMsg = message;
+          },
+        },
+        controller.signal,
       );
-    } catch (err) {
-      setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, error: getErrorMessage(err, "उत्तर ल्याउन सकिएन।") } : turn)));
+      // Stream failed before any reply text arrived → retry once via the plain
+      // (non-stream) endpoint before surfacing the error.
+      if (failedMsg !== null) {
+        if (!streamed && !controller.signal.aborted) {
+          try {
+            const res = await subjectiveTestsService.sendFeedbackMessage(sheetId, chatId, text);
+            const reply = res.messages[res.messages.length - 1];
+            setTurns((t) =>
+              t.map((turn, i) =>
+                i === idx
+                  ? { ...turn, loading: false, answer: reply?.content ?? "", followUps: res.follow_up_suggestions }
+                  : turn,
+              ),
+            );
+            failedMsg = null;
+          } catch (err) {
+            failedMsg = getErrorMessage(err, failedMsg ?? undefined);
+          }
+        }
+        if (failedMsg !== null) {
+          const message = failedMsg;
+          setTurns((t) => t.map((turn, i) => (i === idx ? { ...turn, loading: false, error: message } : turn)));
+        }
+      }
     } finally {
+      if (abortRef.current === controller) abortRef.current = null;
       setBusy(false);
     }
   }
@@ -534,90 +582,32 @@ function FeedbackChat({ sheetId, onClose }: { sheetId: string; onClose: () => vo
           <Alert>{startError}</Alert>
         ) : (
           <>
-            <div className="min-h-[20vh] space-y-4 lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:pr-1">
+            <div className="max-h-[60vh] min-h-[20vh] space-y-4 overflow-y-auto scrollbar-thin lg:max-h-none lg:min-h-0 lg:flex-1 lg:pr-1">
               {turns.map((turn, i) => (
-                <div key={i} className="space-y-2">
-                  {turn.question && (
-                    <div className="flex justify-end">
-                      <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-brand-600 px-4 py-2 text-sm text-white shadow-sm font-deva">
-                        {turn.question}
-                      </div>
-                    </div>
-                  )}
-                  <div className="flex items-start gap-2">
-                    <div className="mt-0.5 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-brand-100 text-brand-700">
-                      <GraduationCap className="h-4 w-4" />
-                    </div>
-                    <div className="max-w-[88%] rounded-2xl rounded-tl-sm bg-white p-4 shadow-sm ring-1 ring-gray-100">
-                      {turn.loading && (
-                        <div className="flex items-center gap-1 py-1" aria-label="सोच्दै">
-                          <span className="h-2 w-2 animate-bounce rounded-full bg-brand-300 [animation-delay:-0.3s]" />
-                          <span className="h-2 w-2 animate-bounce rounded-full bg-brand-300 [animation-delay:-0.15s]" />
-                          <span className="h-2 w-2 animate-bounce rounded-full bg-brand-300" />
-                        </div>
-                      )}
-                      {turn.error && <p className="text-sm text-danger-600">{turn.error}</p>}
-                      {turn.answer !== undefined && (
-                        <>
-                          <RichText size="sm">{turn.answer}</RichText>
-                          {turn.followUps && turn.followUps.length > 0 && (
-                            <div className="mt-3 border-t border-gray-100 pt-3">
-                              <p className="mb-1.5 text-xs font-medium text-gray-400">सम्भावित प्रश्न</p>
-                              <div className="flex flex-wrap gap-2">
-                                {turn.followUps.map((f, j) => (
-                                  <button
-                                    key={j}
-                                    onClick={() => ask(f)}
-                                    className="rounded-full bg-gray-100 px-3 py-1 text-xs text-gray-700 transition-colors hover:bg-gray-200 font-deva"
-                                  >
-                                    {f}
-                                  </button>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  </div>
-                </div>
+                <ChatTurnView
+                  key={i}
+                  question={turn.question}
+                  answer={turn.answer}
+                  loading={turn.loading}
+                  error={turn.error}
+                  followUps={turn.followUps}
+                  onFollowUp={ask}
+                />
               ))}
 
               {turns.filter((t) => t.question).length === 0 && (
-                <div className="flex flex-wrap gap-2">
-                  {FEEDBACK_STARTERS.map((s, i) => (
-                    <button
-                      key={i}
-                      onClick={() => ask(s)}
-                      className="rounded-full bg-white px-3 py-1.5 text-xs text-brand-700 shadow-sm ring-1 ring-brand-100 transition-colors hover:bg-brand-50 font-deva"
-                    >
-                      {s}
-                    </button>
-                  ))}
-                </div>
+                <SuggestionChips items={FEEDBACK_STARTERS} onSelect={ask} tone="brand" />
               )}
               <div ref={endRef} />
             </div>
 
-            <form
-              onSubmit={(e) => { e.preventDefault(); void ask(question); }}
-              className="mt-4 flex items-center gap-2 rounded-full bg-gray-50 p-1.5 ring-1 ring-gray-200"
-            >
-              <input
-                value={question}
-                onChange={(e) => setQuestion(e.target.value)}
-                placeholder="प्रश्न सोध्नुहोस्…"
-                className="flex-1 rounded-full border-0 bg-transparent px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-0 font-deva"
-              />
-              <button
-                type="submit"
-                disabled={busy || !question.trim() || !chatId}
-                className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-brand-600 text-white transition-colors hover:bg-brand-700 disabled:opacity-40"
-                aria-label="Send"
-              >
-                <Send className="h-4 w-4" />
-              </button>
-            </form>
+            <ChatInput
+              value={question}
+              onChange={setQuestion}
+              onSubmit={() => void ask(question)}
+              disabled={busy || !chatId}
+              variant="embedded"
+            />
           </>
         )}
       </div>

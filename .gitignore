@@ -21,6 +21,11 @@ celerybeat.pid
 .env.*
 !.env.example
 
+# ── Pipeline debug dumps (MCQ_DEBUG_DUMP=1 / KNOWLEDGE_DEBUG_DUMP=1) ─────
+# Keep the root folder in git (.gitkeep) but ignore actual dump files.
+backend/debug_dumps/mcq/
+backend/debug_dumps/knowledge/
+
 # ── Editor / OS ───────────────────────────────────────────────────────────
 .idea/
 .vscode/

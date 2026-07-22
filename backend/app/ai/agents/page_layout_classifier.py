@@ -28,28 +28,25 @@ logger = logging.getLogger(__name__)
 
 CLASSIFY_CONCURRENCY = 6   # platform-wide AI fan-out convention
 
-LAYOUT_CLASSIFY_PROMPT = """You are a page-layout classifier. Look at this page image and decide whether the BODY text is laid out in ONE column or TWO side-by-side columns.
-- "two_column" means two parallel vertical blocks of running text: the left column is read top-to-bottom first, then the right column.
-- A table, a centered heading, a title/cover page, a figure, a form, or an indented list is NOT two columns.
-- If two_column, give the x-position of the vertical whitespace gutter between the columns, normalized 0-1000 (left page edge = 0, right page edge = 1000).
-Return ONLY valid JSON: {"layout": "single_column" | "two_column", "gutter_x": <integer 0-1000 or null>}"""
+LAYOUT_CLASSIFY_PROMPT = """Look at this page image. Is the main body text arranged in TWO side-by-side columns?
 
-# AI-provided gutters outside this range are more plausibly a wide indent/margin than a
-# real column boundary — never split on them (matches WIDE_BAND in page_layout.py).
-_AI_GUTTER_RANGE = (0.30, 0.70)
+Two columns means: two independent blocks of running text sitting left and right of each other, where you read the entire left block top-to-bottom before continuing in the right block.
+
+These are NOT two columns:
+- A numbered list of questions with indented options (even if options look like two groups)
+- A table or grid
+- A title, heading, or centered text
+- A single block of text with wide margins
+
+Return ONLY valid JSON: {"layout": "single_column"} or {"layout": "two_column"}"""
 
 
 def _parse_classification(result: dict) -> dict | None:
-    """Validate the model payload. Returns {"layout": ..., "gutter_x": int|None} or None."""
+    """Validate the model payload. Returns {"layout": ...} or None."""
     layout = result.get("layout")
     if layout not in ("single_column", "two_column"):
         return None
-    gutter_x = result.get("gutter_x")
-    if gutter_x is not None:
-        if not isinstance(gutter_x, (int, float)) or not (0 <= gutter_x <= 1000):
-            return None
-        gutter_x = int(gutter_x)
-    return {"layout": layout, "gutter_x": gutter_x}
+    return {"layout": layout}
 
 
 async def classify_page_layout(
@@ -93,19 +90,15 @@ async def classify_page_layout(
 def _resolve_ai_gutter(layout: PageLayout, classification: dict | None) -> float | None:
     """Turn an AI classification into a render decision for one ambiguous page.
 
-    Prefer the deterministic candidate gutter (a measured whitespace column — pixel-accurate,
-    guaranteed not to cut glyphs); the AI's gutter_x is used only when no candidate exists
-    and it lands in a plausible range. No usable coordinate → whole (never guess 0.5)."""
+    The AI only confirms/denies — the split coordinate MUST come from the deterministic
+    detector (a measured ink-free whitespace column, pixel-accurate, guaranteed not to cut
+    glyphs). If the deterministic detector found no gutter, we render whole even when the
+    AI says "two_column" — a false split scrambles reading order, a missed split only
+    lowers fidelity."""
     if classification is None or classification["layout"] != "two_column":
         return None
-    if layout.verdict.gutter_frac is not None:
-        return layout.verdict.gutter_frac
-    gutter_x = classification.get("gutter_x")
-    if gutter_x is not None:
-        frac = gutter_x / 1000.0
-        if _AI_GUTTER_RANGE[0] <= frac <= _AI_GUTTER_RANGE[1]:
-            return frac
-    return None
+    # Only split when the deterministic pass already located a clear gutter.
+    return layout.verdict.gutter_frac  # None → whole (safe default)
 
 
 async def resolve_pdf_layouts(

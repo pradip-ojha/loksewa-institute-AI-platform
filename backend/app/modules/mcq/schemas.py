@@ -119,6 +119,7 @@ class MCQDocumentOut(BaseModel):
     chapter: str | None
     topic: str | None
     subtopic: str | None
+    answer_format: str
     processing_status: str
     question_count: int
     created_at: datetime

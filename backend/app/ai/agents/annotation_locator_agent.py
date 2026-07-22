@@ -50,7 +50,7 @@ return the natural underline path UNDER it, echoing back its number as "target_i
 {targets_block}
 
 (B) CORRECT POINTS TO TICK — each item has an [index]. Find where the student's evidence text sits;
-return a tight box around it plus a tick point just left of its FIRST line, echoing "section_index":
+return a tight box around it plus a tick point ON the MIDDLE of its FIRST line, echoing "section_index":
 {sections_block}
 
 RULES:
@@ -58,7 +58,7 @@ RULES:
   target text, comment, or section label back — just the index. This keeps the response short and
   avoids it being cut off before the JSON is complete.
 - Underline path = MULTIPLE ordered points [y, x] following the real (slanted/curved) baseline UNDER the wrong text, left to right (4–8 points, not just two endpoints). If text wraps to a second line, give multiple paths.
-- "tick_point" = a single [y, x] in blank space just left of the FIRST line of the correct evidence (where a ✓ goes), NOT on top of the writing.
+- "tick_point" = a single [y, x] ON the FIRST line of the correct evidence, at the line's horizontal MIDDLE — a teacher's ✓ goes on the good text itself, never off in the left margin.
 - "evidence_box" / "target_text_box" = a tight [ymin, xmin, ymax, xmax] box around the located text.
 - "read_text" = ONLY the FIRST FEW WORDS (at most ~6 words) you actually SEE inside the box you returned — just enough to verify the location, NOT the whole line. Transcribe them as written; if what you see differs from the requested text, still transcribe what you see. KEEP IT SHORT.
 - Put comment boxes in margins or blank space — never over the student's writing.

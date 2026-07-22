@@ -49,6 +49,11 @@ ABSOLUTE RULES (never violate):
   student's own words; do not require the model answer's exact wording.
 - Do not over-penalise spelling/grammar unless meaning is unclear. Mark blank/irrelevant answers honestly.
 - Keep feedback concise and useful; list key missing points separately.
+- Every "missing_points" entry must be a complete, ACTIONABLE instruction in the answer's language
+  (Nepali for Nepali answers): one short sentence telling the student exactly WHAT to add or do and
+  WHERE in the answer — e.g. "बैंकको परिभाषापछि नेपालको एउटा व्यावहारिक उदाहरण थप्नुहोस्।" — never a
+  bare topic name ("उदाहरण", "निष्कर्ष") or a vague phrase ("अपूर्ण छ", "थप लेख्नुहोस्"). The student
+  should be able to act on each point without asking what it means.
 
 FEEDBACK FORMATTING (the "feedback" and "overall_summary" fields ONLY):
 - Write them as short, clean GitHub-flavored MARKDOWN: **bold** the verdict / what went well or wrong,
@@ -115,7 +120,7 @@ Return ONLY valid JSON in exactly this structure (one entry per question):
       "awarded_marks": 6,
       "max_marks": 10,
       "feedback": "Concise feedback as short markdown (bold the verdict, bullet improvements).",
-      "missing_points": ["..."],
+      "missing_points": ["One actionable instruction per entry — what to add/do and where, in the answer's language."],
       "confidence": 0.8,
       "sections": [
         {{"section": "Definition", "max_marks": 2, "awarded_marks": 2, "status": "correct",

@@ -75,7 +75,10 @@ def build_common_conf(redis_url: str, *, task_timeout_seconds: int) -> dict:
         "task_serializer": "json",
         "accept_content": ["json"],
         "result_serializer": "json",
-        "timezone": "UTC",
+        # Beat crontab schedules are interpreted in this timezone, so the "nightly"
+        # personalization beats (00:20 compress, 01:00 weekly) fire at actual Nepali
+        # night instead of ~6 AM NPT. Internal timestamps stay UTC (enable_utc).
+        "timezone": "Asia/Kathmandu",
         "enable_utc": True,
         # ── Status / acks ────────────────────────────────────────────────
         "task_track_started": True,

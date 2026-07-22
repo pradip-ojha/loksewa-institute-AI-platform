@@ -1,4 +1,5 @@
 import api, { UPLOAD_TIMEOUT } from "./api";
+import { streamNdjson, type StreamHandlers } from "./stream";
 
 export interface JobRef {
   id: string;
@@ -188,4 +189,17 @@ export const subjectiveTestsService = {
     api
       .post(`/api/student/subjective/sheets/${sheetId}/feedback-chat/${chatId}/message`, { message }, { timeout: 120_000 })
       .then((r) => r.data),
+  sendFeedbackMessageStream: (
+    sheetId: string,
+    chatId: string,
+    message: string,
+    handlers: StreamHandlers,
+    signal?: AbortSignal,
+  ): Promise<void> =>
+    streamNdjson(
+      `/api/student/subjective/sheets/${sheetId}/feedback-chat/${chatId}/message/stream`,
+      { message },
+      handlers,
+      signal,
+    ),
 };

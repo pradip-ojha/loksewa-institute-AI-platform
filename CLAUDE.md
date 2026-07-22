@@ -1,4 +1,4 @@
-# CLAUDE.md — NeuraFix AI Production Platform
+# CLAUDE.md — NeuraFix Loksewa Production Platform
 
 ## 0. Critical Instruction
 
@@ -16,8 +16,13 @@ behavior.
 
 ## 1. Project
 
-**NeuraFix AI — Kirtipur Valley Institute AI Learning Platform.** A multi-exam, personalized
-Loksewa learning platform. Systems:
+**NeuraFix Loksewa — AI Learning Platform.** A multi-exam, personalized
+Loksewa learning platform (product name **NeuraFix Loksewa**; the frontend brands with the company
+logo `frontend/public/logo.png` and a light logo-blue theme — `brand-600 #2b6fe4`, retuned in
+`frontend/tailwind.config.js`; the old "Kirtipur Valley Institute" name is fully removed from the UI).
+The internal infrastructure IDs keep their original prefixes (R2 bucket `kritipur-valley-demo-bucket`,
+Pinecone index `kritipur-valley-demo-index`, Celery `kvi_ai_*` queues) — those are deploy/config
+identifiers, not user-facing branding. Systems:
 1. **MCQ** — extraction, generation, approval, question bank, admin test sets
 2. **Subjective** — answer-sheet checking, marks, feedback, checked PDF
 3. **Video Tutor** — transcript, timeline, slide labels, summary, Q&A
@@ -419,53 +424,70 @@ Four workflows: (1) upload existing MCQ document, (2) generate from content, (3)
 (4) admin creates test sets. Students do NOT generate tests.
 
 ### 9.1 Existing MCQ Upload
-Extract: question text, options, correct option, explanation. Correct-answer format varies
-(A/B/C/D, क/ख/ग/घ, 1/2/3/4, १/२/३/४) — detected then normalized internally to A/B/C/D. **Typed
-documents → Azure gpt-5 typed extraction** (`MCQExtractionAgent` uses `get_provider("text_extraction")`,
-spec §6.2), not gpt-5.5/Gemini. Upload fields: display name, **Exam**, **Chapter (OPTIONAL — see the
-two-stage assignment below)**, PDF/Word file, topic (opt), subtopic (opt), custom extraction instruction.
+Extract: question text, options, correct option, explanation. Upload fields: display name, **Exam**,
+**Answer Format**, **Chapter (OPTIONAL — see the two-stage assignment below)**, PDF/Word/image file,
+topic (opt), subtopic (opt), custom extraction instruction.
 
-**MCQ document ingestion is LAYOUT-AWARE and OCR-ONLY, exactly like the Knowledge Layer** (all three
-paths — upload extraction, generation, regeneration — read the source file via
-`knowledge_processing_agent.extract_typed_document_text(file_bytes, mime, step_cb)`). Page selection
-goes through the SHARED `_needs_vision()`, so MCQ honours **`FORCE_OCR_ALL_PAGES`** (§8) rather than
-carrying its own rule: with it True (the default) **EVERY PDF page is column-aware vision-OCR'd**
-(gpt-5 typed vision through the §8 hybrid layout detector) and **the PDF text layer is never trusted**.
-This is deliberate — a page-level text check CANNOT be relied on to spot legacy Preeti: the corpus is
-largely Preeti/Kantipur-typed, and `_classify_page_text` returns `valid_unicode` on the mere PRESENCE
-of one Devanagari character (`_has_devanagari` is an `any()` over the U+0900–U+097F block), so a Preeti
-body under a single Unicode Devanagari heading/page-number would "parse" and pass ASCII garbage
-straight to the model. OCR'ing every page removes that class of silent failure. `_assemble_page_texts`
-enforces it: **a page that was OCR'd always uses its OCR text**, and an OCR failure SKIPS the page —
-never backfilled from the raw text layer. Flipping `FORCE_OCR_ALL_PAGES` to False restores the
-cost-saving path (only garbage/legacy/empty pages OCR'd, clean `valid_unicode` pages keep their free
-text layer) — and re-exposes the `any()` weakness above, so it is not the default.
-DOCX: whole-text classify → LibreOffice→PDF→OCR when not clean Unicode (same as §8) — this branch
-still trusts the classification, so a Preeti DOCX carrying a Unicode heading is the one residual
-exposure (upload such papers as PDF). A document from which NO text can be extracted **fails the job
-honestly** (extraction + generation; regeneration degrades to feedback+knowledge-only since its source
-file is optional context); partial page failures continue with a `Warning: N page(s) unreadable` step.
-`extract_typed_document_text` returns **`(text, layout_stats)`** (mirroring `_ocr_pdf_bytes`), and the
-extraction/generation jobs persist `layout_stats` under `output_reference.layout` (plus
-`unreadable_pages` when any page failed) — the same per-page split/whole/AI-classified breakdown the
-knowledge job records. The transient `Layout: …` progress step is overwritten by the next step, so
-without this the column-split decisions left no durable trace; regeneration discards the stats (its
-source file is optional context, and it has no batch-shaped `output_reference`).
+**Vision-first extraction pipeline (MCQExtractionAgent only — generation and regeneration are
+unchanged).** Existing MCQ papers often mark correct options with a HIGHLIGHTED BACKGROUND or COLOUR
+alone — no text annotation — which is invisible to an OCR→text→extraction pipeline. To handle this,
+extraction now sends the original RENDERED PAGE IMAGE directly to the vision model, which reasons about
+the visual cues (highlight colour, circled/ticked letter, different ink colour, underlined option, inline
+key "Ans: B") in a SINGLE call that does both OCR and answer detection. **The PDF text layer is never
+used for extraction.** Generation and regeneration still call `extract_typed_document_text()` (they need
+source text content, not answer detection — unchanged).
+
+**Two answer format modes (admin declares at upload; stored as `mcq_documents.answer_format`):**
+- **`inline`** — correct option is visually marked directly on each question (highlight, circle, tick,
+  colour). `MCQ_INLINE_VISION_PROMPT`: the model reads the image, extracts every question, and
+  detects the correct option from any visual cue on the page. Sets `correct_option_ids` directly.
+- **`separate_grid`** — a compact answer grid follows the question block (e.g. "1. B  2. A  3. C…").
+  `MCQ_GRID_VISION_PROMPT`: the model extracts questions WITHOUT answer ids AND extracts any answer
+  grid entries visible on that page/region. Python `_reconcile_grid_blocks()` then matches entries to
+  questions by question number.
+
+**Pipeline:**
+```
+file → _prepare_mcq_pdf_bytes() → resolve_pdf_layouts() + render_regions_for_decisions()
+     → [(page_idx, region_idx, png_bytes)]
+     → _extract_regions_vision() — parallel, Semaphore(6), one vision call per region
+     → per-region {questions, answer_grid}
+     → [separate_grid] _reconcile_grid_blocks() — state-machine merge
+     → [inline]        flatten questions directly
+     → Stage C topic assignment (unchanged)
+     → SAVE (unchanged)
+```
+
+**File preparation (`_prepare_mcq_pdf_bytes`):** PDF → used as-is. DOCX → ALWAYS converted to PDF via
+LibreOffice (even valid-Unicode), because LibreOffice's render preserves colour/highlight in the PDF —
+needed for inline mode. Image files (jpg/png/etc.) → used as a single region directly (skip layout
+detection). Generation and regeneration call `extract_typed_document_text()` as before.
+
+**Layout detection:** reuses the SAME `resolve_pdf_layouts()` + `render_regions_for_decisions()`
+infrastructure as the Knowledge Layer (§8): each page rendered to 300-DPI PNG, column-split pages
+split into left+right regions, each region a separate vision call (`asyncio.Semaphore(6)`).
+Layout stats are persisted in `output_reference.layout`.
+
+**Grid reconciliation state machine (`_reconcile_grid_blocks`):** PRIMARY block-boundary signal is the
+ANSWER GRID (not question-number resets). State: `COLLECTING → AFTER_GRID`. Questions processed first
+(top of page); grid entries processed after (bottom of page, after questions). When a question arrives
+while in AFTER_GRID, the current block is flushed (questions matched to their grid), then the new
+question starts a fresh block. Multi-page grids accumulate naturally (multiple regions with grid entries
+but no questions stay in AFTER_GRID). A page with both questions and a grid closes the block after the
+questions join it. Returns `(questions, blocks_with_grid_count)`. Questions with no grid match keep
+`correct_option_ids=[]` (counted in `output_reference.unmatched_count`).
 
 **Chapter is OPTIONAL on EXTRACTION (upload) only; still REQUIRED on generation + manual add.** Exams
 hold multiple chapters, so a full model exam paper spans them all — forcing one chapter per upload
-blocked that. Extraction now runs a **two-stage chapter→topic assignment** (both stages in
-`MCQExtractionAgent`; the OCR/page-slicing Step A is unchanged, §8):
-- **Stage B — extraction (chapter-only), CHUNKED + PARALLEL.** The glued OCR text is split into ≤40k
-  chunks by `_split_text_chunks` — cut at the **nearest line break** before the limit (never
-  mid-line; a single over-long line hard-cuts), so no fixed-40k truncation silently drops the tail of
-  a long paper. Each chunk is one extraction call (`asyncio.Semaphore(6)`, own short session for
-  audit, partial-success: a failed chunk is skipped + noted, all-failed raises). The extractor assigns
-  **only the chapter** per question (never topics): in **locked mode** (admin picked a chapter) the
-  chapter block is omitted and every question is stamped with `doc.chapter`; in **auto-detect mode**
-  (blank) `CHAPTER_ASSIGNMENT_BLOCK` injects the exam's flat chapter list and the model returns a
-  per-question `chapter` (explicitly allowed to be **null** for genuinely ambiguous questions — a null
-  is recovered later, a forced guess misfiles).
+blocked that. Extraction runs a **two-stage chapter→topic assignment** (both stages in
+`MCQExtractionAgent`; the vision/rendering Step A is above):
+- **Stage B — extraction (chapter-only), per-region IN PARALLEL.** Each rendered region is one vision
+  call (`asyncio.Semaphore(6)`, own short session for audit, partial-success: a failed region is skipped
+  + noted, all-failed raises). The vision prompt assigns **only the chapter** per question (never topics):
+  in **locked mode** (admin picked a chapter) the chapter block is omitted and every question is stamped
+  with `doc.chapter`; in **auto-detect mode** (blank) `CHAPTER_ASSIGNMENT_BLOCK` injects the exam's flat
+  chapter list and the model returns a per-question `chapter` (explicitly allowed to be **null** for
+  genuinely ambiguous questions — a null is recovered later, a forced guess misfiles).
 - **Group by chapter** (Python): auto-mode chapters are validated against the real chapter list;
   unknown/absent ⇒ the **null group**.
 - **Stage C — topic assignment, per chapter (parallel).** `MCQTopicAssignmentAgent`
@@ -482,9 +504,9 @@ blocked that. Extraction now runs a **two-stage chapter→topic assignment** (bo
 - **Validation** (`video.service.resolve_syllabus_labels`, `locked_chapter=doc.chapter` in locked
   mode): the AI only proposes; Python enforces official-or-null. Locked-mode fallback: a null Stage-C
   topic falls back to the admin's validated `doc.topic`/`doc.subtopic` hint.
-- **Job output** (`output_reference`) adds `chapters_detected`, `questions_by_chapter`,
-  `unassigned_count` (plus the `layout` stats above) so the admin can verify auto-detection and spot
-  unfiled questions in the review batch. Unfiled questions are **never dropped** — they land in the
+- **Job output** (`output_reference`) adds `answer_format`, `chapters_detected`,
+  `questions_by_chapter`, `unassigned_count`, `layout`, and for `separate_grid` mode:
+  `grid_blocks_detected` + `unmatched_count`. Unfiled questions are **never dropped** — they land in the
   batch with a null chapter for manual tagging.
 
 Generation + manual-add keep chapter required and single (example questions scoped to that one chapter,
@@ -729,12 +751,12 @@ Student uploads handwritten answer-sheet PDF/image
 → Question-level extraction (Gemini vision, structure-aware + prev/next-page hints): per-question text + question bbox + page size + continuation
 → Backend assembles whole-question answers across pages
 → Load admin test config + LOCKED checking skills (NO large notes re-sent — skill already distilled them)
-→ Checker (GPT-5.5): WHAT is wrong + SECTION-WISE breakdown (per criterion: awarded/max/status/evidence + a student-facing `note` that names what was good (keep) vs what to improve) → marks (capped) + feedback + missing points + annotation targets (wrong text) + positive sections (ticks)
+→ Checker (GPT-5.5): WHAT is wrong + SECTION-WISE breakdown (per criterion: awarded/max/status/evidence + a student-facing `note` that names what was good (keep) vs what to improve) → marks (capped) + feedback + missing points (each an ACTIONABLE "what to add/do and where" instruction in the answer's language — never a bare topic name) + annotation targets (wrong text) + positive sections (ticks)
 → Reviewer pass (2nd GPT-5.5): fairness, enforce max marks, keep section sums consistent, prune annotation targets
 → **PROGRESSIVE FEEDBACK SPLIT (spec §6.5):** the moment the reviewer pass is persisted the sheet flips to `feedback_ready` — the student sees **marks + section-wise feedback immediately** and the feedback chatbot unlocks, WHILE annotation continues in the background ("PDF is being annotated" indicator)
-→ Per question ONE Gemini vision Locator call per question/page on a CROP of the answer region (one jittered retry per call): underline paths for wrong items + evidence box for each fully-correct section (tick placed beside that line) + a `read_text` echo of what it saw at each spot — all geometry in Gemini's NATIVE normalized-0-1000 [y,x] convention, denormalized in code with a per-item scale-sanity detector. Positive sections routed to the page their evidence sits on (matched via per-page extraction text)
+→ Per question ONE Gemini vision Locator call per question/page on a CROP of the answer region (one jittered retry per call): underline paths for wrong items + evidence box for each fully-correct section (tick placed ON that line — a tick means THIS text is good) + a `read_text` echo of what it saw at each spot — all geometry in Gemini's NATIVE normalized-0-1000 [y,x] convention, denormalized in code with a per-item scale-sanity detector. Positive sections routed to the page their evidence sits on (matched via per-page extraction text)
 → Validator decides WHETHER geometry is safe (smooth / soft-mark / feedback-only for underlines; ticks are SKIP-ON-MISS — only where evidence confidently located, never margin-dumped) + two deterministic ground-truth guards: an INK-PRESENCE check (a mark whose claimed spot is blank paper is demoted) and the read_text echo match (mismatch caps confidence / skips the tick)
-→ Human-like renderer draws checked PDF (curved baseline underlines, HarfBuzz-shaped Nepali red-pen comments, teacher-scale ticks, ONE circled question total at the END of each answer, sheet-total banner) → R2; sheet flips to `checked` and the checked-PDF link appears
+→ Human-like renderer draws checked PDF (curved baseline underlines, HarfBuzz-shaped Nepali red-pen comments, teacher-scale ticks, ONE circled question total per answer raised ~2 in above the answer's end — `MARK_RAISE_RATIO` — so it can't be misread as the next question's, sheet-total banner) → R2; sheet flips to `checked` and the checked-PDF link appears
 → **Annotation is best-effort:** a failure in this background phase NEVER loses the feedback — the sheet still settles to `checked` (results stand, PDF simply unavailable). The stuck-job reaper settles an orphaned `feedback_ready` sheet to `checked`, never `failed`.
 ```
 
@@ -815,10 +837,15 @@ an **ink-presence check** (Otsu mask; an underline/soft-mark/tick whose claimed 
 < 1.5% dark pixels is a location miss → demoted with a persisted `reason`) and the **read_text
 echo match** (fuzzy n-gram similarity vs the requested text via `processing/text_match.py`;
 score < 0.35 caps confidence below the exact-underline threshold; ticks skip outright). Ticks are
-placed **BESIDE the evidence line, never on the writing** (the model's `tick_point` when it lands
-plausibly left of the first line, else a computed left-margin spot; tick size `base*1.8`). Comment
-boxes are sized by real HarfBuzz shaping (`text_render.measure_text`) and never silently vanish —
-last resort anchors at the bottom of the question region. The **Renderer**
+placed **ON the evidence's first line** — the tick's meaning is "THIS text is good", so it goes on
+the good text itself, never off in the left margin (the model's `tick_point` when it lands on the
+first line, else the line's computed CENTER; tick size `base*3.6`). Comment boxes are sized by real
+HarfBuzz shaping (`text_render.measure_text`) and placed by a **range-bounded, ink-aware search**
+around the underlined target (`COMMENT_RANGE_RATIO` = 15% of page height, `COMMENT_INK_MAX`):
+candidate spots (model's box / right / below / above / left of the target) are clamped into the
+range band and scored against the page ink mask — first uncrowded spot wins; all crowded → the
+least-inked IN-RANGE spot (a comment never drifts far from its underline; the question-region-bottom
+anchor remains only for no-geometry feedback_only plans — a comment never silently vanishes). The **Renderer**
 (`processing/annotation.py`) draws the validated plan human-like (Catmull-Rom curved underline with
 jitter + slight stroke variation; hand-style comments/marks; uncrowded).
 
@@ -990,10 +1017,12 @@ kvi_ai_subjective`):
   changes which items are marked or the on-page command order →
   geometry **validator** (`processing/annotation_geometry.validate_question_plan`, fed the page PNG
   for the ink-presence checks; underline safety ladder + ink/echo ground-truth guards + ticks
-  skip-on-miss, placed BESIDE located evidence only when confident (`TICK_CONF_MIN`), never
-  margin-dumped) → human-like **renderer** (`processing/annotation`, HarfBuzz Nepali via
-  `processing/text_render`; real-pen-scale ticks (`base*1.8`) + ONE circled question total at the
-  answer's END (last page) + sheet-total banner — no per-section fractions on PDF) + assemble
+  skip-on-miss, placed ON the located evidence line only when confident (`TICK_CONF_MIN`); comment
+  boxes via the range-bounded ink-aware search above) → human-like **renderer**
+  (`processing/annotation`, HarfBuzz Nepali via
+  `processing/text_render`; real-pen-scale ticks (`base*3.6`) + ONE circled question total per
+  answer on its last page, raised ~2 in above the answer's end (`MARK_RAISE_RATIO=0.17` of page
+  height, capped at 60% of the answer region) + sheet-total banner — no per-section fractions on PDF) + assemble
   checked PDF (`pdf_tools.build_pdf_from_images`) → upload `answer-sheets/checked/`.
   `service.clamp_marks` hard-caps each question + clamps section sums (`_clamp_sections`) after
   BOTH passes, and records **`clamp_notes`** in the evaluation whenever a result question matched no
@@ -1278,7 +1307,10 @@ agent prompts (`ai/agents/personalization_agents.py`).
 - **Rolling daily summary** (`student_daily_summaries`, ONE row/student, ≈400w) — that day's chats + activities.
 - **Weekly summary** (`student_weekly_summaries`, one row/student/week, ≈400w) — performance + key questions;
   refreshed **every night** (not just Mondays).
-- **Chat-session summary** (`chat_session_summaries`, ≈400w, one/session across tutor/video/subjective-feedback).
+- **Chat-session summary** (`chat_session_summaries`, ≈400w, one/session across tutor/video/subjective-feedback)
+  — a TRUE ROLLING merge: `ChatSessionSummaryAgent` receives the PREVIOUS session summary and merges the
+  new turns into it (callers only send a bounded window of recent turns — video includes its recent
+  session history like tutor/feedback — so the previous summary is what carries earlier session content).
 - **Extended subjective summary** (`extended_subjective_summaries`, ONE/student, ≈800w) — richer rolling
   summary of subjective-mock mistake KINDS + questions asked; updated immediately after each subjective test.
 
@@ -1295,7 +1327,10 @@ agent prompts (`ai/agents/personalization_agents.py`).
 
 The summarizers (`ai/agents/personalization_agents.py`, `get_provider("reasoning")`, skill-tunable,
 `audit_ctx` `entity_type="student"`) only DISTILL given data — they never invent. All updates are
-best-effort: a personalization failure NEVER breaks a submit/check/chat.
+best-effort: a personalization failure NEVER breaks a submit/check/chat. **Empty-output guards:** the
+daily/chat/extended agents fall back to the PREVIOUS text when the model returns no `summary_text`, and
+`generate_weekly_for_student` skips the weekly/intro write on an empty result — a malformed-but-parsed
+AI response can never blank an existing summary.
 
 ### Context builders (consumed by the tutors — spec §4.3; wired in §13/§13.1/§12.1)
 - **Main tutor** → `build_main_tutor_context` (intro + daily + weekly + recent chat summaries).
@@ -1355,6 +1390,13 @@ tables. All endpoints `require_admin`.
 **Sidebar:** Dashboard | Exams | Syllabus | Knowledge Layer | MCQ System | MCQ Tests | Video Tutor |
 Subjective Tests | Skill Layer | Students | Analytics | Settings
 
+**Responsive shell (`layouts/AdminLayout.tsx`):** the sidebar is a static `w-60` column on `lg`
+(`hidden lg:flex`) and a hamburger-triggered overlay drawer below `lg` (scrim + drawer live inside a
+`lg:hidden` wrapper so a resize past the breakpoint can never strand the scrim; the drawer also closes
+on route change). Sidebar body is factored into `SidebarContent`; each link is the shared
+`layouts/SidebarLink.tsx` (also used by the student sidebar). The logo/name is the `components/BrandLogo`
+mark ("NeuraFix Loksewa").
+
 **Active-exam selector** in the top bar (persisted): the universal scope for every admin workspace —
 Knowledge/MCQ/MCQ-Tests/Video/Subjective uploads and the Syllabus editor all operate within it
 (`ExamContext`, `pages/admin/Exams.tsx`, `services/exams.ts`). **Exams** page = create/list/archive/
@@ -1377,7 +1419,20 @@ is intentionally not shown on the dashboard, §15.)
 
 ---
 
-## 17. Student Interface (Mobile-First)
+## 17. Student Interface (Mobile-First, desktop-capable)
+
+**Responsive shell (`layouts/StudentLayout.tsx`):** mobile-first but no longer phone-only — on `lg` a
+static left sidebar appears (`BrandLogo` + exam selector + `SidebarLink` nav incl. Subjective Tests +
+profile/logout footer) and the mobile top header + bottom tab bar become `lg:hidden` (content shifts
+`lg:pl-64`, capped `max-w-5xl`). The bottom nav's framer-motion `layoutId="student-tab-indicator"` stays
+unique — the desktop sidebar uses plain active classes (never duplicate that layoutId).
+
+**Shared chat components (`components/chat/`):** the AI Tutor, Video Tutor Q&A, and subjective feedback
+chats share ONE bubble/input/chip language — `ChatTurnView` (student + assistant bubbles, with
+`beforeAnswer`/`afterAnswer` slots for the tutor topic pill and video segment chips), `ChatInput`
+(`floating` variant clears the mobile bottom nav via `lg:bottom-4`; `embedded` variant for the subjective
+card), `ChatEmptyState`, `SuggestionChips`, `TypingDots`, `useAutoScrollEnd`. Replaces the previously
+triplicated ad-hoc markup.
 
 **Shared exam selector (`StudentExamContext`, `frontend/src/context/StudentExamContext.tsx`).**
 Mirrors the admin `ExamContext` (§16) but sourced from `examsService.myExams()` (enrolled exams only)
@@ -1577,7 +1632,8 @@ analytics / reaper / keepalive→ kvi_ai_default
 
 **Beat schedule** (`celery_app.py`): keepalive (4 min), reaper (2 min), **personalization nightly
 compress** (`crontab 00:20`), **personalization weekly** summary+intro refresh (`crontab 01:00` — runs
-every night so the weekly summaries stay current).
+every night so the weekly summaries stay current). Celery `timezone` is **`Asia/Kathmandu`**
+(`celery_config.py`; `enable_utc` stays on), so the crontab beats fire at actual Nepali night, not ~6 AM NPT.
 
 ### Job Types
 knowledge_processing, syllabus_extraction (syllabus-from-PDF import → chapter/topic/subtopic tree),
@@ -1651,7 +1707,8 @@ language, pinecone_vector_id, quality_status, metadata (JSONB)
 
 ### MCQ
 `mcq_documents`: id, display_name, origin_type, file_id, chapter (migration `017`), topic, subtopic,
-custom_instruction, processing_status, question_count, created_by, created_at
+custom_instruction, answer_format VARCHAR(20) DEFAULT 'inline' (migration `025`; `inline`|`separate_grid`),
+processing_status, question_count, created_by, created_at
 `mcq_review_batches`: id, document_id, batch_type, status, total_questions, accepted_count,
 rejected_count, rejection_feedback, job_id, created_by, created_at
 `mcq_questions`: id, source_document_id, review_batch_id, origin_type, question_text, options (JSONB),

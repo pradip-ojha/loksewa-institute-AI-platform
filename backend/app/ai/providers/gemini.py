@@ -515,6 +515,7 @@ class GeminiProvider(AIModelProvider):
 
     async def generate_with_image(self, prompt: str, image_bytes: bytes,
                                   schema: dict | None = None, audit_ctx: dict | None = None,
+                                  max_tokens: int | None = None,
                                   list_key: str | None = None) -> dict:
         return await self._vision(prompt, image_bytes, "image/png", schema, audit_ctx, list_key=list_key)
 

@@ -151,15 +151,18 @@ async def summarize_chat_session(
     roll the day's activity into the daily summary."""
     try:
         from app.ai.agents.personalization_agents import ChatSessionSummaryAgent
-        summary = await ChatSessionSummaryAgent(db).summarize(
-            session_kind=session_kind, turns=turns, student_id=student_id,
-        )
         row = (await db.execute(
             select(ChatSessionSummary).where(
                 ChatSessionSummary.session_kind == session_kind,
                 ChatSessionSummary.session_id == session_id,
             )
         )).scalar_one_or_none()
+        # The callers send only a bounded window of recent turns, so the previous
+        # summary is what carries the session's earlier content — a true rolling merge.
+        summary = await ChatSessionSummaryAgent(db).summarize(
+            session_kind=session_kind, turns=turns,
+            previous=row.summary_text if row else "", student_id=student_id,
+        )
         if row is None:
             db.add(ChatSessionSummary(
                 student_id=student_id, session_kind=session_kind, session_id=session_id,
@@ -262,22 +265,25 @@ async def generate_weekly_for_student(db: AsyncSession, student_id: uuid.UUID) -
         result = await WeeklySummaryAgent(db).summarize(
             prev_intro=profile.intro_text, events=events, student_id=student_id,
         )
-        # Upsert this week's row.
-        existing = (await db.execute(
-            select(StudentWeeklySummary).where(
-                StudentWeeklySummary.student_id == student_id,
-                StudentWeeklySummary.week_start == ws,
-            )
-        )).scalar_one_or_none()
-        if existing is None:
-            db.add(StudentWeeklySummary(
-                student_id=student_id, week_start=ws,
-                summary_text=result["summary_text"], key_questions=result["key_questions"],
-            ))
-        else:
-            existing.summary_text = result["summary_text"]
-            existing.key_questions = result["key_questions"]
-        profile.intro_text = result["intro_text"]
+        # Upsert this week's row — but never let a malformed AI response (parsed JSON
+        # missing summary_text → "") blank an existing summary/intro; keep the old text.
+        if result["summary_text"]:
+            existing = (await db.execute(
+                select(StudentWeeklySummary).where(
+                    StudentWeeklySummary.student_id == student_id,
+                    StudentWeeklySummary.week_start == ws,
+                )
+            )).scalar_one_or_none()
+            if existing is None:
+                db.add(StudentWeeklySummary(
+                    student_id=student_id, week_start=ws,
+                    summary_text=result["summary_text"], key_questions=result["key_questions"],
+                ))
+            else:
+                existing.summary_text = result["summary_text"]
+                existing.key_questions = result["key_questions"]
+        if result["intro_text"]:
+            profile.intro_text = result["intro_text"]
         await db.commit()
     except Exception as exc:
         logger.warning("generate_weekly_for_student failed (continuing): %s", exc)

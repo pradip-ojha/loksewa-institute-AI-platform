@@ -82,8 +82,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="NeuraFix AI API",
-    description="AI learning platform API for Kirtipur Valley Institute",
+    title="NeuraFix Loksewa API",
+    description="AI-powered Loksewa exam preparation platform API",
     version="1.0.0",
     lifespan=lifespan,
 )

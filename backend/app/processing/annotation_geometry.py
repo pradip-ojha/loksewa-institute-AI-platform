@@ -13,6 +13,13 @@ Behaviour ladder (per target):
   • both unreliable             → no exact mark; question-area feedback only ("feedback_only")
   • confidence too low / garbage→ "rejected"
 
+Comment boxes are placed by a RANGE-BOUNDED, ink-aware search around the underlined
+target (`_safe_comment_box`): candidate spots within `COMMENT_RANGE_RATIO` of the
+target are scored against the page's ink mask and the first uncrowded one wins; when
+everything in range is crowded the least-inked in-range spot is used — a comment is
+never anchored far from its underline. Positive-section ticks are skip-on-miss and
+placed ON the evidence text (center of its first line), never dumped into a margin.
+
 Output is consumed by `annotation.py` (the renderer) and persisted in
 `pdf_annotations.locator_plan` for audit.
 """
@@ -36,6 +43,13 @@ INK_MIN_FRACTION = 0.015
 # the box it returned) and the text it was asked to find; below this the location is
 # treated as unverified and the confidence is capped under CONFIDENCE_MIN.
 ECHO_MATCH_MIN = 0.35
+# Comment placement search range: how far (vertically, as a fraction of page height)
+# a comment box may sit from its underlined target — ~1.75 in on an A4 page. A comment
+# far from its underline reads as belonging to some other line, so beyond this we
+# never go; if everything in range is crowded we take the least-inked in-range spot.
+COMMENT_RANGE_RATIO = 0.15
+# A candidate comment spot whose ink fraction is below this counts as "uncrowded".
+COMMENT_INK_MAX = 0.04
 
 
 def _num(v) -> float | None:
@@ -202,30 +216,59 @@ def _comment_dims(comment_text: str, w: int, h: int) -> tuple[int, int]:
 
 
 def _safe_comment_box(raw, target_box: list[int] | None, page_size, comment_text: str,
-                      question_bbox=None) -> list[int] | None:
-    """Validate the suggested comment box; relocate to the right margin (or just below
-    the target, or — last resort — the bottom of the question region) if it would sit
-    on top of the student's writing. Returns None only for an empty comment."""
+                      question_bbox=None, ink_mask=None) -> list[int] | None:
+    """Place the comment NEAR its underlined target: candidate spots (model's box,
+    right of / below / above / left of the target) are all clamped into a vertical
+    band `COMMENT_RANGE_RATIO` around the target, then scored against the page's ink
+    mask — the first uncrowded spot wins; if everything in range is crowded, the
+    least-inked in-range spot is used (a comment never drifts far from its underline).
+    Without a target box (feedback-only plans) it anchors at the bottom of the
+    question region. Returns None only for an empty comment."""
     if not (comment_text or "").strip():
         return None
     w, h = page_size
     box = _box4(raw, w, h)
     cw, ch = _comment_dims(comment_text, w, h)
-    if box and (not target_box or _boxes_overlap(box, target_box) < 0.15):
-        return box
-    # Relocate: prefer the right margin aligned with the target's vertical position.
+
     if target_box:
         tx1, ty1, tx2, ty2 = target_box
-        if (w - tx2) > (cw + 24):                       # room on the right
-            x1 = min(w - cw - 8, tx2 + 16)
-            y1 = int(_clamp(ty1, 4, h - ch - 4))
-            return [x1, y1, x1 + cw, y1 + ch]
-        if (h - ty2) > (ch + 16):                        # room just below
-            x1 = int(_clamp(tx1, 4, w - cw - 4))
-            y1 = min(h - ch - 4, ty2 + 12)
-            return [x1, y1, x1 + cw, y1 + ch]
-    # Last resort: anchor at the bottom of the question's answer region (question-area
-    # feedback, CLAUDE.md §12) — a comment must never silently vanish.
+        rng = int(h * COMMENT_RANGE_RATIO)
+        # Allowed band for the comment's TOP edge — prefer the range around the target,
+        # but always keep the box on the page.
+        band_lo = max(4, min(ty1 - rng, h - ch - 4))
+        band_hi = max(band_lo, min(ty2 + rng, h - ch - 4))
+
+        def _cand(x1v: float, y1v: float) -> list[int]:
+            x1c = int(_clamp(x1v, 4, max(4, w - cw - 4)))
+            y1c = int(_clamp(y1v, band_lo, band_hi))
+            return [x1c, y1c, x1c + cw, y1c + ch]
+
+        candidates: list[list[int]] = []
+        if box:                                          # the model's own suggestion
+            candidates.append(_cand(box[0], box[1]))
+        if (w - tx2) > (cw + 24):                        # right margin, target-aligned
+            candidates.append(_cand(min(w - cw - 8, tx2 + 16), ty1))
+        candidates.append(_cand(tx1, ty2 + 12))          # just below the target
+        candidates.append(_cand(tx1, ty1 - ch - 12))     # just above the target
+        if tx1 > (cw + 24):                              # left margin beside the target
+            candidates.append(_cand(tx1 - cw - 16, ty1))
+
+        # Never sit on the wrong text itself (unless literally nothing else fits).
+        usable = [c for c in candidates if _boxes_overlap(c, target_box) < 0.15]
+        if not usable:
+            usable = candidates
+        if ink_mask is None:
+            return usable[0]
+        scored = [(_ink_fraction_in_box(ink_mask, c), i, c) for i, c in enumerate(usable)]
+        for ink, _, cand in scored:
+            if ink < COMMENT_INK_MAX:
+                return cand                              # first uncrowded spot in range
+        return min(scored)[2]                            # all crowded → least-inked in range
+
+    # No target geometry (feedback-only): anchor at the bottom of the question's answer
+    # region (question-area feedback, CLAUDE.md §12) — a comment must never silently vanish.
+    if box:
+        return box
     if isinstance(question_bbox, (list, tuple)) and len(question_bbox) >= 4:
         try:
             qx, qy, qw, qh = (float(v) for v in question_bbox[:4])
@@ -235,11 +278,7 @@ def _safe_comment_box(raw, target_box: list[int] | None, page_size, comment_text
         qx, qy, qw, qh = 8.0, 8.0, float(w) - 16, float(h) - 16
     x1 = int(_clamp(qx + 8, 4, max(4, w - cw - 4)))
     y1 = int(_clamp(qy + qh + 8, 4, max(4, h - ch - 4)))
-    cand = [x1, y1, x1 + cw, y1 + ch]
-    if target_box and _boxes_overlap(cand, target_box) >= 0.15:
-        y1 = int(_clamp(target_box[3] + 8, 4, max(4, h - ch - 4)))
-        cand = [x1, y1, x1 + cw, y1 + ch]
-    return cand
+    return [x1, y1, x1 + cw, y1 + ch]
 
 
 def validate_and_smooth(locator_result: dict, page_size, question_bbox=None, ink_mask=None) -> dict:
@@ -284,7 +323,7 @@ def validate_and_smooth(locator_result: dict, page_size, question_bbox=None, ink
 
     comment_box = _safe_comment_box(
         locator_result.get("comment_box"), target_box, (w, h), comment_text,
-        question_bbox=question_bbox,
+        question_bbox=question_bbox, ink_mask=ink_mask,
     )
 
     # Too little confidence to draw anything precise.
@@ -358,16 +397,16 @@ def validate_and_smooth(locator_result: dict, page_size, question_bbox=None, ink
 
 
 def _validate_section(sec: dict, w: int, h: int, ink_mask=None) -> dict | None:
-    """Place one positive section's tick BESIDE the located correct line — never on
-    top of the student's writing.
+    """Place one positive section's tick ON the located correct text — the tick's whole
+    meaning is "THIS text is good", so it belongs on the evidence line, not off in the
+    left margin where it reads as detached.
 
     A tick is drawn ONLY when the locator confidently found the student's evidence
     (a valid `evidence_box` and confidence ≥ `TICK_CONF_MIN`, containing actual ink,
     with a passing `read_text` echo when available). Otherwise we return None so the
-    caller skips it — we never dump a tick into a blank margin at a guessed spot.
-    Placement: the model's own `tick_point` when it sits plausibly left of the
-    evidence's first line (it was asked for exactly that); else computed in the left
-    margin beside the first line, like a teacher's pen tick beside a good point."""
+    caller skips it — we never dump a tick at a guessed spot.
+    Placement: the model's own `tick_point` when it lands ON the evidence's first line
+    (it was asked for exactly that); else computed at the CENTER of the first line."""
     conf = _num(sec.get("confidence")) or 0.0
     evid = _box4(sec.get("evidence_box"), w, h)
     if not evid or conf < TICK_CONF_MIN:
@@ -387,13 +426,13 @@ def _validate_section(sec: dict, w: int, h: int, ink_mask=None) -> dict | None:
     # reads as a tick on the correct point rather than mid-paragraph.
     line_est = min(max(24.0, h * 0.022), float(y2 - y1))
 
-    # Prefer the model's tick_point when it lands where it was asked to: just left of
-    # (or at the very start of) the first line of the evidence.
+    # Prefer the model's tick_point when it lands where it was asked to: ON the first
+    # line of the evidence (a teacher ticks the good text itself).
     raw_pt = sec.get("tick_point")
     if isinstance(raw_pt, (list, tuple)) and len(raw_pt) >= 2:
         px, py = _num(raw_pt[0]), _num(raw_pt[1])
         if (px is not None and py is not None
-                and (x1 - 3 * line_est) <= px <= (x1 + line_est)
+                and x1 <= px <= x2
                 and y1 <= py <= (y1 + 1.5 * line_est)
                 and 0 <= px <= w and 0 <= py <= h):
             return {
@@ -404,20 +443,17 @@ def _validate_section(sec: dict, w: int, h: int, ink_mask=None) -> dict | None:
                 "source": "model",
             }
 
-    # Computed fallback: left margin beside the first line. If the evidence starts at
-    # the page edge (no margin), sit at the start of the line instead — slightly over
-    # the line's first word still beats a tick mid-paragraph.
-    yc = _clamp(y1 + line_est / 2, 8, h - 8)
-    if x1 >= 40:
-        tx = max(line_est * 0.6, x1 - line_est * 0.9)
-    else:
-        tx = x1 + line_est * 0.4
+    # Computed fallback: the CENTER of the evidence's first line — over the writing,
+    # where the tick unambiguously claims THIS text as good (never the left margin,
+    # where it reads as detached from the line it praises).
+    tx = _clamp((x1 + x2) / 2.0, 8, w - 8)
+    ty = _clamp(y1 + line_est * 0.5, 8, h - 8)
     return {
         "section": sec.get("section"),
-        "tick_point": [_clamp(tx, 8, w - 8), yc],
+        "tick_point": [tx, ty],
         "evidence_box": evid,
         "confidence": conf,
-        "source": "margin",
+        "source": "center",
     }
 
 

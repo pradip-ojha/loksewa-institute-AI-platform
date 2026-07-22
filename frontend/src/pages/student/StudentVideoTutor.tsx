@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ArrowLeft, Play, Sparkles, FileText, ListVideo, Lightbulb, GraduationCap,
-  Send, Video as VideoIcon, Headphones, BookOpen, Target, Notebook,
+  ArrowLeft, Play, Sparkles, FileText, ListVideo, Lightbulb,
+  Video as VideoIcon, Headphones, BookOpen, Target, Notebook,
 } from "lucide-react";
 import { videoTutorService } from "../../services/videoTutor";
 import type {
@@ -9,20 +9,21 @@ import type {
 } from "../../services/videoTutor";
 import { useStudentExam } from "../../context/StudentExamContext";
 import { getErrorMessage } from "../../utils/error";
-import { PageHeader, Card, Badge, EmptyState, Skeleton, Alert } from "../../components/ui";
+import { PageHeader, Card, Badge, EmptyState, Skeleton, Alert, Tabs } from "../../components/ui";
 import { RichText } from "../../components/content/RichText";
+import { ChatTurnView, ChatInput, ChatEmptyState, useAutoScrollEnd } from "../../components/chat";
 import {
   KeyPointsList, ExamPointCallout, TermsGlossary, PossibleQuestionsCard, ContentSectionTitle,
 } from "../../components/content/LearningContent";
 
 type PlayerTab = "summary" | "timeline" | "keypoints" | "practice" | "tutor";
 
-const TABS: { key: PlayerTab; label: string; icon: React.ReactNode }[] = [
-  { key: "summary", label: "सारांश", icon: <FileText className="h-4 w-4" /> },
-  { key: "timeline", label: "समयरेखा", icon: <ListVideo className="h-4 w-4" /> },
-  { key: "keypoints", label: "मुख्य बुँदा", icon: <Lightbulb className="h-4 w-4" /> },
-  { key: "practice", label: "अभ्यास", icon: <Target className="h-4 w-4" /> },
-  { key: "tutor", label: "AI Tutor", icon: <Sparkles className="h-4 w-4" /> },
+const TABS: { id: PlayerTab; label: string; icon: React.ReactNode }[] = [
+  { id: "summary", label: "सारांश", icon: <FileText className="h-4 w-4" /> },
+  { id: "timeline", label: "समयरेखा", icon: <ListVideo className="h-4 w-4" /> },
+  { id: "keypoints", label: "मुख्य बुँदा", icon: <Lightbulb className="h-4 w-4" /> },
+  { id: "practice", label: "अभ्यास", icon: <Target className="h-4 w-4" /> },
+  { id: "tutor", label: "AI Tutor", icon: <Sparkles className="h-4 w-4" /> },
 ];
 
 export function StudentVideoTutor() {
@@ -70,7 +71,7 @@ export function StudentVideoTutor() {
           description="नयाँ लेक्चर थपिएपछि यहाँ देखिनेछ।"
         />
       ) : (
-        <div className="space-y-3">
+        <div className="space-y-3 lg:grid lg:grid-cols-2 lg:gap-3 lg:space-y-0">
           {videos.map((v) => (
             <Card
               key={v.id}
@@ -138,7 +139,11 @@ function PlayerView({ videoId, onBack }: { videoId: string; onBack: () => void }
         /* ignore */
       }
     }
-    el.scrollIntoView({ behavior: "smooth", block: "start" });
+    // On desktop the player is sticky beside the content, so don't scroll-jump;
+    // on mobile it sits above, so bring it into view.
+    if (window.matchMedia("(max-width: 1023.98px)").matches) {
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
   }, []);
 
   function currentTime(): string | null {
@@ -171,48 +176,44 @@ function PlayerView({ videoId, onBack }: { videoId: string; onBack: () => void }
   const hasSummary = !!data.summary;
 
   return (
-    <div className="pb-24">
+    <div className="pb-24 lg:pb-8">
       {backBtn}
       <h1 className="mb-3 text-lg font-bold text-gray-900 font-deva">{data.display_name}</h1>
 
-      {data.media_url && (
-        <div className="mx-auto mb-4 max-w-2xl overflow-hidden rounded-2xl bg-black shadow-card">
-          {data.is_audio_only ? (
-            <audio
-              ref={mediaRef as React.RefObject<HTMLAudioElement>}
-              src={data.media_url}
-              controls
-              preload="metadata"
-              className="w-full"
-            />
-          ) : (
-            <video
-              ref={mediaRef as React.RefObject<HTMLVideoElement>}
-              src={data.media_url}
-              controls
-              preload="metadata"
-              className="mx-auto max-h-[45vh] w-full object-contain"
-            />
+      <div className="lg:grid lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] lg:items-start lg:gap-6">
+        {/* Media — sticky beside the content on desktop */}
+        <div className="lg:sticky lg:top-6">
+          {data.media_url && (
+            <div className="mx-auto mb-4 max-w-2xl overflow-hidden rounded-2xl bg-black shadow-card lg:mb-0 lg:max-w-none">
+              {data.is_audio_only ? (
+                <audio
+                  ref={mediaRef as React.RefObject<HTMLAudioElement>}
+                  src={data.media_url}
+                  controls
+                  preload="metadata"
+                  className="w-full"
+                />
+              ) : (
+                <video
+                  ref={mediaRef as React.RefObject<HTMLVideoElement>}
+                  src={data.media_url}
+                  controls
+                  preload="metadata"
+                  className="mx-auto max-h-[45vh] w-full object-contain lg:max-h-[70vh]"
+                />
+              )}
+            </div>
           )}
         </div>
-      )}
 
-      <div className="mb-4 flex gap-1 overflow-x-auto border-b border-gray-200 scrollbar-thin">
-        {TABS.map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setTab(t.key)}
-            className={`flex items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2.5 text-sm font-medium transition-colors ${
-              tab === t.key
-                ? "border-brand-600 text-brand-700"
-                : "border-transparent text-gray-500 hover:text-gray-800"
-            }`}
-          >
-            {t.icon}
-            {t.label}
-          </button>
-        ))}
-      </div>
+        {/* Tabs + panels */}
+        <div className="min-w-0">
+          <Tabs
+            items={TABS.map((t) => ({ id: t.id, label: t.label, icon: t.icon }))}
+            value={tab}
+            onChange={(id) => setTab(id as PlayerTab)}
+            className="mb-4 mt-4 lg:mt-0"
+          />
 
       {tab === "summary" && (
         <div className="space-y-3">
@@ -306,6 +307,8 @@ function PlayerView({ videoId, onBack }: { videoId: string; onBack: () => void }
       {tab === "tutor" && (
         <TutorTab videoId={videoId} getCurrentTime={currentTime} seekTo={seekTo} />
       )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -339,7 +342,7 @@ function TutorTab({
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [historyLoaded, setHistoryLoaded] = useState(false);
-  const endRef = useRef<HTMLDivElement>(null);
+  const endRef = useAutoScrollEnd(turns);
   // In-flight stream, aborted when the tab/player unmounts so a backgrounded answer
   // stops generating (saves Azure spend) and never setStates an unmounted component.
   const abortRef = useRef<AbortController | null>(null);
@@ -372,10 +375,6 @@ function TutorTab({
       cancelled = true;
     };
   }, [videoId]);
-
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [turns]);
 
   async function ask(q: string) {
     const text = q.trim();
@@ -465,119 +464,58 @@ function TutorTab({
     <div className="flex flex-col">
       <div className="min-h-[40vh] space-y-4">
         {historyLoaded && turns.length === 0 && (
-          <div className="rounded-lg border border-gray-200 bg-white p-5 text-center">
-            <div className="mx-auto mb-2 flex h-11 w-11 items-center justify-center rounded-full bg-brand-50 text-brand-600">
-              <Sparkles className="h-5 w-5" />
-            </div>
-            <p className="text-sm font-semibold text-gray-800">AI Tutor लाई सोध्नुहोस्</p>
-            <p className="mt-1 text-xs text-gray-500 font-deva">
-              लेक्चरबारे जे पनि सोध्नुहोस् — उत्तरसँगै सम्बन्धित भिडियो समय पनि देखाइन्छ।
-            </p>
-            <div className="mt-3 flex flex-wrap justify-center gap-2">
-              {STARTER_QUESTIONS.map((s, i) => (
-                <button
-                  key={i}
-                  onClick={() => ask(s)}
-                  className="rounded-full bg-white px-3 py-1.5 text-xs text-brand-700 shadow-sm ring-1 ring-brand-100 transition-colors hover:bg-brand-50 font-deva"
-                >
-                  {s}
-                </button>
-              ))}
-            </div>
-          </div>
+          <ChatEmptyState
+            icon={<Sparkles className="h-5 w-5" />}
+            title="AI Tutor लाई सोध्नुहोस्"
+            description="लेक्चरबारे जे पनि सोध्नुहोस् — उत्तरसँगै सम्बन्धित भिडियो समय पनि देखाइन्छ।"
+            starters={STARTER_QUESTIONS}
+            onAsk={ask}
+          />
         )}
 
         {turns.map((turn, i) => (
-          <div key={i} className="space-y-2">
-            {/* Student question — right aligned bubble */}
-            <div className="flex justify-end">
-              <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-brand-600 px-4 py-2 text-sm text-white shadow-sm font-deva">
-                {turn.question}
-              </div>
-            </div>
-
-            {/* Tutor answer — left aligned */}
-            <div className="flex items-start gap-2">
-              <div className="mt-0.5 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-brand-100 text-brand-700">
-                <GraduationCap className="h-4 w-4" />
-              </div>
-              <div className="max-w-[88%] rounded-2xl rounded-tl-sm bg-white p-4 shadow-sm ring-1 ring-gray-100">
-                {turn.loading && (
-                  <div className="flex items-center gap-1 py-1" aria-label="सोच्दै">
-                    <span className="h-2 w-2 animate-bounce rounded-full bg-brand-300 [animation-delay:-0.3s]" />
-                    <span className="h-2 w-2 animate-bounce rounded-full bg-brand-300 [animation-delay:-0.15s]" />
-                    <span className="h-2 w-2 animate-bounce rounded-full bg-brand-300" />
-                  </div>
-                )}
-                {turn.error && <p className="text-sm text-danger-600">{turn.error}</p>}
-                {turn.answer !== undefined && (
-                  <>
-                    <RichText size="sm">{turn.answer}</RichText>
-
-                    {turn.segments && turn.segments.length > 0 && (
-                      <div className="mt-3 border-t border-gray-100 pt-3">
-                        <p className="mb-1.5 text-xs font-medium text-gray-400">भिडियोमा हेर्नुहोस्</p>
-                        <div className="flex flex-wrap gap-2">
-                          {turn.segments.map((s) => (
-                            <button
-                              key={s.segment_id}
-                              onClick={() => seekTo(s.start_seconds)}
-                              title={s.label}
-                              className="group inline-flex items-center gap-1.5 rounded-full bg-brand-50 py-1 pl-1 pr-3 text-xs font-medium text-brand-700 ring-1 ring-brand-100 transition-colors hover:bg-brand-100"
-                            >
-                              <span className="flex h-5 w-5 items-center justify-center rounded-full bg-brand-600 text-white"><Play className="h-2.5 w-2.5" /></span>
-                              <span className="tabular-nums">{s.start_time}</span>
-                              <span className="max-w-[8rem] truncate text-brand-500 group-hover:text-brand-700 font-deva">· {s.label}</span>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {turn.followUps && turn.followUps.length > 0 && (
-                      <div className="mt-3 border-t border-gray-100 pt-3">
-                        <p className="mb-1.5 text-xs font-medium text-gray-400">सम्भावित प्रश्न</p>
-                        <div className="flex flex-wrap gap-2">
-                          {turn.followUps.map((f, j) => (
-                            <button
-                              key={j}
-                              onClick={() => ask(f)}
-                              className="rounded-full bg-gray-100 px-3 py-1 text-xs text-gray-700 transition-colors hover:bg-gray-200 font-deva"
-                            >
-                              {f}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-            </div>
-          </div>
+          <ChatTurnView
+            key={i}
+            question={turn.question}
+            answer={turn.answer}
+            loading={turn.loading}
+            error={turn.error}
+            followUps={turn.followUps}
+            onFollowUp={ask}
+            afterAnswer={
+              turn.segments && turn.segments.length > 0 ? (
+                <SegmentChips segments={turn.segments} onSeek={seekTo} />
+              ) : undefined
+            }
+          />
         ))}
         <div ref={endRef} />
       </div>
 
-      <form
-        onSubmit={(e) => { e.preventDefault(); void ask(question); }}
-        className="sticky bottom-[calc(4.5rem+env(safe-area-inset-bottom))] mt-4 flex items-center gap-2 rounded-full bg-white p-1.5 shadow-md ring-1 ring-gray-200"
-      >
-        <input
-          value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          placeholder="प्रश्न सोध्नुहोस्…"
-          className="flex-1 rounded-full border-0 bg-transparent px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-0 font-deva"
-        />
-        <button
-          type="submit"
-          disabled={busy || !question.trim()}
-          className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-brand-600 text-white transition-colors hover:bg-brand-700 disabled:opacity-40"
-          aria-label="Send"
-        >
-          <Send className="h-4 w-4" />
-        </button>
-      </form>
+      <ChatInput value={question} onChange={setQuestion} onSubmit={() => void ask(question)} disabled={busy} />
+    </div>
+  );
+}
+
+/** Seekable "watch in the video" chips shown under a tutor answer. */
+function SegmentChips({ segments, onSeek }: { segments: AskSelectedSegment[]; onSeek: (s: number) => void }) {
+  return (
+    <div className="mt-3 border-t border-gray-100 pt-3">
+      <p className="mb-1.5 text-xs font-medium text-gray-400">भिडियोमा हेर्नुहोस्</p>
+      <div className="flex flex-wrap gap-2">
+        {segments.map((s) => (
+          <button
+            key={s.segment_id}
+            onClick={() => onSeek(s.start_seconds)}
+            title={s.label}
+            className="group inline-flex items-center gap-1.5 rounded-full bg-brand-50 py-1 pl-1 pr-3 text-xs font-medium text-brand-700 ring-1 ring-brand-100 transition-colors hover:bg-brand-100"
+          >
+            <span className="flex h-5 w-5 items-center justify-center rounded-full bg-brand-600 text-white"><Play className="h-2.5 w-2.5" /></span>
+            <span className="tabular-nums">{s.start_time}</span>
+            <span className="max-w-[8rem] truncate text-brand-600 group-hover:text-brand-700 font-deva">· {s.label}</span>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

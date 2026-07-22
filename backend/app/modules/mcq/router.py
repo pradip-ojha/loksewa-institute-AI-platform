@@ -71,6 +71,7 @@ async def upload_mcq_document(
     topic: str = Form(""),
     subtopic: str = Form(""),
     custom_instruction: str = Form(""),
+    answer_format: str = Form("inline"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
@@ -88,6 +89,7 @@ async def upload_mcq_document(
         db=db,
     )
 
+    _valid_formats = {"inline", "separate_grid"}
     doc = MCQDocument(
         display_name=display_name,
         origin_type="uploaded_document",
@@ -97,6 +99,7 @@ async def upload_mcq_document(
         topic=topic or None,
         subtopic=subtopic or None,
         custom_instruction=custom_instruction or None,
+        answer_format=answer_format if answer_format in _valid_formats else "inline",
         processing_status="pending",
         created_by=current_user.id,
     )

@@ -21,7 +21,7 @@ from app.core.exceptions import AIResponseError
 
 logger = logging.getLogger(__name__)
 
-FEEDBACK_CHAT_PROMPT = EXAM_CONTEXT + """
+_FEEDBACK_BODY = EXAM_CONTEXT + """
 
 ROLE: You are a warm, encouraging Loksewa copy-checking tutor. The answer sheet has ALREADY
 been checked and marked by the examiner. The student is now asking follow-up questions about
@@ -60,12 +60,25 @@ RECENT CONVERSATION (oldest first; may be 'none'):
 
 STUDENT QUESTION:
 {question}
+"""
 
+_JSON_TAIL = """
 Return ONLY valid JSON in exactly this structure:
 {{
   "reply": "the student-facing answer as markdown",
   "follow_up_suggestions": ["short follow-up question the student might ask next", "..."]
 }}"""
+
+# Streaming variant: the reply is streamed live, so it is emitted as plain markdown
+# first, then a marker + a tiny JSON tail carries the metadata (parsed server-side).
+_STREAM_TAIL = """
+First output the student-facing reply as clean GitHub-flavored markdown (follow the FORMATTING rules
+above). Then, on a NEW LINE, output the exact marker <<<META>>> followed by a single-line JSON object:
+{{"follow_up_suggestions": ["short follow-up question the student might ask next", "..."]}}
+Write NOTHING after that JSON object, and NEVER use the <<<META>>> marker anywhere inside the reply."""
+
+FEEDBACK_CHAT_PROMPT = _FEEDBACK_BODY + _JSON_TAIL
+FEEDBACK_CHAT_STREAM_PROMPT = _FEEDBACK_BODY + _STREAM_TAIL
 
 
 class AnswerFeedbackChatAgent:
@@ -101,6 +114,31 @@ class AnswerFeedbackChatAgent:
             "reply": str(result["reply"]).strip(),
             "follow_up_suggestions": [str(s) for s in fu][:4] if isinstance(fu, list) else [],
         }
+
+    async def answer_stream(
+        self, *, question: str, evaluation_context: str, history: str, sheet_id: uuid.UUID,
+        meta_sink: dict,
+    ):
+        """Stream the reply markdown as plain-text deltas; the parsed metadata
+        (follow_up_suggestions) lands in ``meta_sink`` once the stream completes."""
+        from app.ai.agents.streaming import stream_answer_with_meta
+
+        skill = await self._get_skill()
+        prompt = FEEDBACK_CHAT_STREAM_PROMPT.format(
+            skill_instructions=skill or "none",
+            evaluation_context=evaluation_context[:40000],
+            history=history[:8000] or "none",
+            question=question[:2000],
+        )
+        audit_ctx = {
+            "db": self.db,
+            "agent_type": "AnswerFeedbackChatAgent",
+            "task_type": "answer_feedback_chat",
+            "entity_type": "student_answer_sheet",
+            "entity_id": sheet_id,
+        }
+        async for delta in stream_answer_with_meta(self.provider, prompt, audit_ctx, meta_sink):
+            yield delta
 
     async def _get_skill(self) -> str:
         try:
